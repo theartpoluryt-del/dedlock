@@ -1,4 +1,5 @@
 #include "shared.h"
+#include "offsets_runtime.h"
 
 void SetMenuOpen(bool open) {
     menuOpen = open;
@@ -20,7 +21,7 @@ namespace {
 bool ReadCurrentViewMatrix(Matrix4x4& matrix) {
     if (!clientBase) return false;
 
-    const uintptr_t camera = clientBase + 0x3799830;
+    const uintptr_t camera = clientBase + GetRuntimeOffsets().viewMatrixRva;
     const Matrix4x4 view = Read<Matrix4x4>(camera + 0x80);
     const Matrix4x4 projection = Read<Matrix4x4>(camera + 0xC0);
 
@@ -44,7 +45,7 @@ bool ReadCurrentViewMatrix(Matrix4x4& matrix) {
 
 bool ReadCameraWorldPosition(Vector3& position) {
     if (!clientBase) return false;
-    position = Read<Vector3>(clientBase + 0x3799830 + 0x28);
+    position = Read<Vector3>(clientBase + GetRuntimeOffsets().viewMatrixRva + 0x28);
     return std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z);
 }
 

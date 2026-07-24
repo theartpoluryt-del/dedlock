@@ -1,4 +1,5 @@
 #include "shared.h"
+#include "offsets_runtime.h"
 #include <fstream>
 #include <atomic>
 #include <MinHook.h>
@@ -173,6 +174,8 @@ DWORD WINAPI InitializeThread(LPVOID) {
     }
 
     if (!clientBase) return 0;
+
+    InitializeRuntimeOffsets(clientBase);
 
     AllocConsole();
     consoleAttached = true;
