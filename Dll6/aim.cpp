@@ -52,6 +52,23 @@ void ClearPendingSilentAngles() {
     pendingSilentAnglesReady = false;
 }
 
+bool silentFlickActive = false;
+LONG silentReturnX = 0;
+LONG silentReturnY = 0;
+
+void RestoreSilentFlick() {
+    if (!silentFlickActive) return;
+    INPUT input{};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_MOVE;
+    input.mi.dx = silentReturnX;
+    input.mi.dy = silentReturnY;
+    SendInput(1, &input, sizeof(INPUT));
+    silentFlickActive = false;
+    silentReturnX = 0;
+    silentReturnY = 0;
+}
+
 }
 
 static ID3D11Texture2D* cachedGameDepth = nullptr;
@@ -341,7 +358,19 @@ bool IsAimPointVisible(const PlayerData& player, float height, float screenX, fl
 }
 
 void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
-    if (!aimAssist || menuOpen || !(GetAsyncKeyState(VK_RBUTTON) & 0x8000) || !currentViewMatrixReady) return;
+    const bool leftButtonDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    const bool rightButtonDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+
+    if (silentFlickActive) {
+        if (!aimSilentMode || !leftButtonDown) RestoreSilentFlick();
+        if (!aimSilentMode || !leftButtonDown) return;
+        // Keep correcting toward the same target while the shot button is
+        // held. One relative mouse event is not enough for the game's input
+        // sensitivity; every correction is added to the return vector.
+    }
+
+    const bool aiming = aimSilentMode ? leftButtonDown : rightButtonDown;
+    if (!aimAssist || menuOpen || !aiming || !currentViewMatrixReady) return;
 
     const bool useDepthWallCheck = true;
     const ImVec2 size = ImGui::GetIO().DisplaySize;
@@ -405,8 +434,9 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
 
     const float targetX = bestAimScreen.x;
     const float targetY = bestAimScreen.y;
-    const LONG moveX = static_cast<LONG>((targetX - cx) / (aimSmooth < 1.0f ? 1.0f : aimSmooth));
-    const LONG moveY = static_cast<LONG>((targetY - cy) / (aimSmooth < 1.0f ? 1.0f : aimSmooth));
+    const float smooth = aimSilentMode ? 1.0f : (aimSmooth < 1.0f ? 1.0f : aimSmooth);
+    const LONG moveX = static_cast<LONG>((targetX - cx) / smooth);
+    const LONG moveY = static_cast<LONG>((targetY - cy) / smooth);
     if (moveX || moveY) {
         INPUT input{};
         input.type = INPUT_MOUSE;
@@ -414,6 +444,11 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         input.mi.dx = moveX;
         input.mi.dy = moveY;
         SendInput(1, &input, sizeof(INPUT));
+        if (aimSilentMode) {
+            silentReturnX -= moveX;
+            silentReturnY -= moveY;
+            silentFlickActive = true;
+        }
     }
 }
 
