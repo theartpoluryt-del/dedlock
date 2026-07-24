@@ -246,6 +246,11 @@ std::vector<PlayerData> GetPlayers() {
         if (drawBones) GetEntityBoneSkeleton(entity, player.bones);
         player.health = health;
         player.maxHealth = Read<int>(entity + Offsets::MaxHealth);
+        const uintptr_t controller = ResolveEntity(Read<uint32_t>(entity + Offsets::PawnController));
+        if (controller) {
+            const int liveMaxHealth = Read<int>(controller + Offsets::ControllerPlayerData + Offsets::PlayerDataHealthMax);
+            if (liveMaxHealth > 0 && liveMaxHealth < 100000) player.maxHealth = liveMaxHealth;
+        }
         player.team = team;
         player.heroName = ReadHeroName(entity);
         const float dx = pos.x - distanceOrigin.x;
