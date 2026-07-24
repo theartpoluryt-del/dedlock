@@ -377,10 +377,13 @@ DWORD WINAPI GlowApplyWorker(LPVOID) {
             pawns = heroPawns;
         }
         for (const uintptr_t pawn : pawns) {
+            const uint8_t localTeam = currentLocalPawn
+                ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
             const int health = Read<int>(pawn + Offsets::Health);
             const uint8_t lifeState = Read<uint8_t>(pawn + Offsets::LifeState);
             const uint8_t team = Read<uint8_t>(pawn + Offsets::Team);
-            if (health > 0 && lifeState == 0 && (team == 2 || team == 3)) {
+            if (health > 0 && lifeState == 0 && (team == 2 || team == 3) &&
+                pawn != currentLocalPawn && (localTeam == 0 || team != localTeam)) {
                 if (glowEnabled) {
                     ApplyHeroGlow(pawn);
                 } else {

@@ -716,8 +716,11 @@ void MonitorRemoteMeleeAnimations() {
         pawns = heroPawns;
     }
 
+    const uint8_t localTeam = Read<uint8_t>(currentLocalPawn + Offsets::Team);
     for (const uintptr_t pawn : pawns) {
-        if (!pawn || pawn == currentLocalPawn || Read<uint8_t>(pawn + Offsets::Team) != 3) continue;
+        const uint8_t team = Read<uint8_t>(pawn + Offsets::Team);
+        if (!pawn || pawn == currentLocalPawn || localTeam == 0 ||
+            (team != 2 && team != 3) || team == localTeam) continue;
 
         Vector3 position{};
         if (!GetEntityPosition(pawn, position)) continue;

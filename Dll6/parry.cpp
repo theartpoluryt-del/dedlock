@@ -33,6 +33,11 @@ void AutoParry(const std::vector<PlayerData>&) {
     };
     static std::unordered_map<uintptr_t, VelocitySample> velocitySamples;
     const ULONGLONG now = GetTickCount64();
+    const uint8_t localTeam = Read<uint8_t>(currentLocalPawn + Offsets::Team);
+    const auto isEnemy = [localTeam](uintptr_t pawn) {
+        const uint8_t team = Read<uint8_t>(pawn + Offsets::Team);
+        return (team == 2 || team == 3) && localTeam != 0 && team != localTeam;
+    };
     if (now - lastScan < 8) return;
     lastScan = now;
 
@@ -220,7 +225,7 @@ void AutoParry(const std::vector<PlayerData>&) {
             current.armedUntil = now + 500;
         enemyMotion[pawn] = current;
 
-        if (heuristicParryEnabled && Read<uint8_t>(pawn + Offsets::Team) == 3 && distance <= 400.0f &&
+        if (heuristicParryEnabled && isEnemy(pawn) && distance <= 400.0f &&
             current.armedUntil >= now && now - lastHeuristicParry >= 250) {
             INPUT input{};
             input.type = INPUT_KEYBOARD;
@@ -235,7 +240,7 @@ void AutoParry(const std::vector<PlayerData>&) {
             enemyMotion[pawn] = current;
             return;
         }
-        if (!disableStaleAbilityScan && Read<uint8_t>(pawn + Offsets::Team) == 3 && distance <= 180.0f &&
+        if (!disableStaleAbilityScan && isEnemy(pawn) && distance <= 180.0f &&
             now - lastPawnDiagnostic >= 1000) {
             const uintptr_t component = pawn + Offsets::AbilityComponent;
             // CNetworkUtlVectorBase layout in this client is {count, elements, capacity}.
@@ -270,10 +275,7 @@ void AutoParry(const std::vector<PlayerData>&) {
             }
             lastPawnDiagnostic = now;
         }
-        // GetPlayers() uses team 3 for enemies in this build. We keep scanning
-        // their ability list at every distance, then apply the melee range only
-        // when deciding whether to press the parry key.
-        if (Read<uint8_t>(pawn + Offsets::Team) != 3) continue;
+        if (!isEnemy(pawn)) continue;
 
         const uintptr_t identity = Read<uintptr_t>(pawn + 0x10);
         const uint32_t pawnHandle = identity ? Read<uint32_t>(identity + 0x10) : 0xFFFFFFFFu;

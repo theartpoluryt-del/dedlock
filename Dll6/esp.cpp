@@ -211,6 +211,7 @@ std::vector<PlayerData> GetPlayers() {
         // table every frame after the handle layout changed.
         currentLocalPawnHandle = 0xFFFFFFFFu;
     }
+    const uint8_t localTeam = currentLocalPawn ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
 
     for (const uintptr_t entity : pawns) {
         const int health = Read<int>(entity + Offsets::Health);
@@ -220,7 +221,8 @@ std::vector<PlayerData> GetPlayers() {
         if (lifeState != 0) continue;
 
         const uint8_t team = Read<uint8_t>(entity + Offsets::Team);
-        if (team != 3) continue;
+        if (team != 2 && team != 3) continue;
+        if (localTeam != 0 && team == localTeam) continue;
 
         Vector3 pos{};
         if (!GetEntityPosition(entity, pos)) continue;
