@@ -168,7 +168,6 @@
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="globals.cpp" />
-    <ClCompile Include="offsets_runtime.cpp" />
     <ClCompile Include="aim.cpp" />
     <ClCompile Include="parry.cpp" />
     <ClCompile Include="entities.cpp" />

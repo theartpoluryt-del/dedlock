@@ -1,5 +1,4 @@
 #include "shared.h"
-#include "offsets_runtime.h"
 
 // Temporary measurement mode: suppress verbose aim/parry diagnostics.
 #define printf(...) do { } while (0)
@@ -135,8 +134,7 @@ bool PhysicsTraceVisible(const Vector3& start, const Vector3& end) {
     using TraceFilterGroupFn = uint32_t(__fastcall*)(uintptr_t);
     using TraceFilterLayerFn = uint16_t(__fastcall*)(uintptr_t);
 
-    const auto& offsets = GetRuntimeOffsets();
-    const uintptr_t physics = Read<uintptr_t>(clientBase + offsets.traceContextRva);
+    const uintptr_t physics = Read<uintptr_t>(clientBase + PhysicsTraceContextRva);
     if (!physics) return false;
 
     alignas(16) uint8_t shape[64]{};
@@ -146,7 +144,7 @@ bool PhysicsTraceVisible(const Vector3& start, const Vector3& end) {
     // Native callers install the current CTraceFilter vtable before invoking
     // TraceShape. A zero vtable makes the wrapper return a clear ray even
     // though the remaining filter fields look valid.
-    *reinterpret_cast<uintptr_t*>(filter) = clientBase + offsets.traceFilterVtableRva;
+    *reinterpret_cast<uintptr_t*>(filter) = clientBase + TraceFilterVtableRva;
     *reinterpret_cast<uint64_t*>(filter + 8) = 0xC1001;
     *reinterpret_cast<uint32_t*>(filter + 32) = 0;
     *reinterpret_cast<int32_t*>(filter + 36) = -1;
@@ -160,10 +158,10 @@ bool PhysicsTraceVisible(const Vector3& start, const Vector3& end) {
 
     __try {
         auto initShape = reinterpret_cast<ShapeInitFn>(clientBase + PhysicsRayShapeInitRva);
-        auto initResult = reinterpret_cast<ResultInitFn>(clientBase + offsets.traceResultInitRva);
-        auto trace = reinterpret_cast<TraceFn>(clientBase + offsets.traceWrapperRva);
-        auto filterGroup = reinterpret_cast<TraceFilterGroupFn>(clientBase + offsets.traceGroupRva);
-        auto filterLayer = reinterpret_cast<TraceFilterLayerFn>(clientBase + offsets.traceLayerRva);
+        auto initResult = reinterpret_cast<ResultInitFn>(clientBase + TraceResultInitRva);
+        auto trace = reinterpret_cast<TraceFn>(clientBase + PhysicsTraceWrapperRva);
+        auto filterGroup = reinterpret_cast<TraceFilterGroupFn>(clientBase + TraceFilterGroupRva);
+        auto filterLayer = reinterpret_cast<TraceFilterLayerFn>(clientBase + TraceFilterLayerRva);
 
         *reinterpret_cast<uint32_t*>(filter + 32) = filterGroup(0);
         *reinterpret_cast<uint16_t*>(filter + 48) = filterLayer(0);
@@ -333,7 +331,7 @@ bool GetAimPointScreen(const PlayerData& player, float height, Vector2& screen) 
 bool IsAimPointVisible(const PlayerData& player, float height, float screenX, float screenY) {
     const Vector3 aimPoint{ player.pos.x, player.pos.y, player.pos.z + height };
     if (!clientBase || !currentLocalPositionReady) return false;
-    if (!Read<uintptr_t>(clientBase + GetRuntimeOffsets().traceContextRva)) return false;
+    if (!Read<uintptr_t>(clientBase + PhysicsTraceContextRva)) return false;
     Vector3 traceStart = currentLocalPosition;
     traceStart.z += 64.0f;
     // TraceShape's bool is a hit flag, not a success flag. PhysicsTraceVisible
