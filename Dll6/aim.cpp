@@ -361,17 +361,18 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     float bestDistance = aimFov * aimFov;
     size_t visibleTargets = 0;
     size_t testedTargets = 0;
-    float targetHeights[3] = { 42.0f, 54.0f, 66.0f };
-    int targetHeightCount = 3;
-    if (aimTargetMode == AimTargetMode::Head) {
-        targetHeights[0] = 66.0f;
-        targetHeightCount = 1;
-    } else if (aimTargetMode == AimTargetMode::Body) {
-        targetHeights[0] = 54.0f;
-        targetHeightCount = 1;
-    }
 
     for (const auto& player : players) {
+        const float modelHeight = player.modelHeight > 20.0f ? player.modelHeight : 80.0f;
+        float targetHeights[3] = { modelHeight * 0.45f, modelHeight * 0.60f, modelHeight * 0.90f };
+        int targetHeightCount = 3;
+        if (aimTargetMode == AimTargetMode::Head) {
+            targetHeights[0] = modelHeight * 0.90f;
+            targetHeightCount = 1;
+        } else if (aimTargetMode == AimTargetMode::Body) {
+            targetHeights[0] = modelHeight * 0.60f;
+            targetHeightCount = 1;
+        }
         bool targetVisible = false;
         Vector2 visibleAimScreen{};
         float visibleAimHeight = 54.0f;

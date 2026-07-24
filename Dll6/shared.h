@@ -33,7 +33,7 @@ constexpr uint32_t HandleIndexMask=0x7FFF, HandleChunkShift=9, HandleChunkMask=0
 constexpr uintptr_t EntityChunks=0x10, EntityChunkStride=sizeof(uintptr_t), EntityStride=0x70;
 }
 struct Vector3 { float x,y,z; }; struct Vector2 { float x,y; }; struct Matrix4x4 { float m[4][4]; }; struct ColorRGBA { uint8_t r,g,b,a; };
-struct PlayerData { Vector3 pos; float boxLeft,boxTop,boxRight,boxBottom; int health,maxHealth,team; float distance; };
+struct PlayerData { Vector3 pos; float boxLeft,boxTop,boxRight,boxBottom; float modelHeight; int health,maxHealth,team; float distance; };
 enum class AimTargetMode : int { Head = 0, Body = 1, Closest = 2 };
 struct EspStatus { bool entitySystemReady=false, localPawnFound=false, heroPawnsFound=false; };
 struct WindowSearchData { DWORD processId; HWND window; };

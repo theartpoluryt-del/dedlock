@@ -132,6 +132,13 @@ std::vector<PlayerData> GetPlayers() {
 
         PlayerData player;
         player.pos = pos;
+        const uintptr_t collision = Read<uintptr_t>(entity + Offsets::CollisionProperty);
+        const Vector3 collisionMins = Read<Vector3>(collision + Offsets::CollisionMins);
+        const Vector3 collisionMaxs = Read<Vector3>(collision + Offsets::CollisionMaxs);
+        player.modelHeight = collision && std::isfinite(collisionMins.z) && std::isfinite(collisionMaxs.z)
+            ? collisionMaxs.z - collisionMins.z : 80.0f;
+        if (!std::isfinite(player.modelHeight) || player.modelHeight < 20.0f || player.modelHeight > 200.0f)
+            player.modelHeight = 80.0f;
         player.health = health;
         player.maxHealth = Read<int>(entity + Offsets::MaxHealth);
         player.team = team;
