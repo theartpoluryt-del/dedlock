@@ -241,6 +241,7 @@ std::vector<PlayerData> GetPlayers() {
         player.hasHeadBone = GetEntityBonePosition(entity, "head", player.headPos);
         player.hasBodyBone = GetEntityBonePosition(entity, "spine_2", player.bodyPos);
         if (!player.hasBodyBone) player.hasBodyBone = GetEntityBonePosition(entity, "spine_0", player.bodyPos);
+        if (drawBones) GetEntityBoneSkeleton(entity, player.bones);
         player.health = health;
         player.maxHealth = Read<int>(entity + Offsets::MaxHealth);
         player.team = team;
@@ -283,6 +284,16 @@ void RenderESP(const std::vector<PlayerData>& players) {
         const float boxTop = player.boxTop;
         const float boxHeight = player.boxBottom - player.boxTop;
         const float boxWidth = player.boxRight - player.boxLeft;
+
+        if (drawBones) {
+            for (const auto& bone : player.bones) {
+                Vector2 start{}, end{};
+                if (WorldToScreen(bone.start, start, currentViewMatrix) &&
+                    WorldToScreen(bone.end, end, currentViewMatrix)) {
+                    drawList->AddLine(ImVec2(start.x, start.y), ImVec2(end.x, end.y), ImColor(255, 220, 40, 220), 1.5f);
+                }
+            }
+        }
 
         if (drawSnaplines) {
             const ImVec2 lineStart = localOnScreen
@@ -362,6 +373,7 @@ void RenderMenu(size_t playerCount) {
         ImGui::Checkbox("Hero Names", &drawNames);
         ImGui::Checkbox("Distance", &drawDistance);
         ImGui::Checkbox("Snaplines", &drawSnaplines);
+        ImGui::Checkbox("Bones", &drawBones);
         if (drawSnaplines) ImGui::SliderFloat("Snapline alpha", &snaplineAlpha, 0.0f, 255.0f, "%.0f");
         ImGui::Checkbox("Glow", &glowEnabled);
         ImGui::Checkbox("FOV circle", &drawFovCircle);

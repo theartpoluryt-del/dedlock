@@ -182,6 +182,53 @@ bool GetEntityBonePosition(uintptr_t entity, const char* boneName, Vector3& posi
     }
 }
 
+bool GetEntityBoneSkeleton(uintptr_t entity, std::vector<BoneSegment>& segments) {
+    segments.clear();
+    if (!entity) return false;
+    ResolveBoneFunctions();
+    if (!boneFunctions.calcWorldSpaceBones || !boneFunctions.getBoneIdByName) return false;
+
+    const uintptr_t sceneNode = Read<uintptr_t>(entity + Offsets::GameSceneNode);
+    if (!sceneNode) return false;
+
+    struct BonePair { const char* start; const char* end; };
+    static constexpr BonePair pairs[] = {
+        { "spine_0", "spine_1" }, { "spine_1", "spine_2" },
+        { "spine_2", "spine_3" }, { "spine_3", "head" },
+        { "spine_3", "arm_upper_L" }, { "arm_upper_L", "arm_lower_L" },
+        { "arm_lower_L", "arm_lower_L_TWIST" }, { "arm_lower_L_TWIST", "arm_lower_L_TWIST1" },
+        { "spine_3", "arm_upper_R" }, { "arm_upper_R", "arm_lower_R" },
+        { "arm_lower_R", "arm_lower_R_TWIST" }, { "arm_lower_R_TWIST", "arm_lower_R_TWIST1" },
+        { "spine_0", "leg_upper_L" }, { "leg_upper_L", "leg_lower_L" },
+        { "leg_lower_L", "leg_L_IKTARGET" },
+        { "spine_0", "leg_upper_R" }, { "leg_upper_R", "leg_lower_R" },
+        { "leg_lower_R", "leg_R_IKTARGET" }
+    };
+
+    __try {
+        boneFunctions.calcWorldSpaceBones(sceneNode, 0xFFFFFu);
+        const uintptr_t bones = Read<uintptr_t>(sceneNode + 0x150 + 0x80);
+        if (!bones) return false;
+
+        auto readBone = [&](const char* name, Vector3& position) {
+            const int index = boneFunctions.getBoneIdByName(entity, name);
+            if (index < 0 || index > 512) return false;
+            position = Read<Vector3>(bones + static_cast<uintptr_t>(index) * 0x20);
+            return std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z);
+        };
+
+        for (const auto& pair : pairs) {
+            Vector3 start{}, end{};
+            if (readBone(pair.start, start) && readBone(pair.end, end)) {
+                segments.push_back({ start, end });
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        segments.clear();
+    }
+    return !segments.empty();
+}
+
 bool GetAimAnglesFromScreen(float screenX, float screenY, Vector3& angles) {
     if (!currentViewMatrixReady) return false;
 
