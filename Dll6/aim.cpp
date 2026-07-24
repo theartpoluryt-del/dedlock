@@ -52,23 +52,6 @@ void ClearPendingSilentAngles() {
     pendingSilentAnglesReady = false;
 }
 
-bool silentFlickActive = false;
-LONG silentReturnX = 0;
-LONG silentReturnY = 0;
-
-void RestoreSilentFlick() {
-    if (!silentFlickActive) return;
-    INPUT input{};
-    input.type = INPUT_MOUSE;
-    input.mi.dwFlags = MOUSEEVENTF_MOVE;
-    input.mi.dx = silentReturnX;
-    input.mi.dy = silentReturnY;
-    SendInput(1, &input, sizeof(INPUT));
-    silentFlickActive = false;
-    silentReturnX = 0;
-    silentReturnY = 0;
-}
-
 }
 
 static ID3D11Texture2D* cachedGameDepth = nullptr;
@@ -361,12 +344,8 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     const bool leftButtonDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     const bool rightButtonDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
 
-    if (silentFlickActive) {
-        if (!aimSilentMode || !leftButtonDown) RestoreSilentFlick();
-        if (!aimSilentMode || !leftButtonDown) return;
-        // Keep correcting toward the same target while the shot button is
-        // held. One relative mouse event is not enough for the game's input
-        // sensitivity; every correction is added to the return vector.
+    if (!aimSilentMode || !leftButtonDown) {
+        ClearPendingSilentAngles();
     }
 
     const bool aiming = aimSilentMode ? leftButtonDown : rightButtonDown;
@@ -378,17 +357,29 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     const float cy = size.y * 0.5f;
     const PlayerData* best = nullptr;
     Vector2 bestAimScreen{};
+    float bestAimHeight = 54.0f;
     float bestDistance = aimFov * aimFov;
     size_t visibleTargets = 0;
     size_t testedTargets = 0;
+    float targetHeights[3] = { 42.0f, 54.0f, 66.0f };
+    int targetHeightCount = 3;
+    if (aimTargetMode == AimTargetMode::Head) {
+        targetHeights[0] = 66.0f;
+        targetHeightCount = 1;
+    } else if (aimTargetMode == AimTargetMode::Body) {
+        targetHeights[0] = 54.0f;
+        targetHeightCount = 1;
+    }
 
     for (const auto& player : players) {
         bool targetVisible = false;
         Vector2 visibleAimScreen{};
+        float visibleAimHeight = 54.0f;
         float visibleDistance = FLT_MAX;
         // Try torso, chest and head. A single fixed point can lie inside the
         // model and therefore have a different depth than its rendered surface.
-        for (const float height : { 42.0f, 54.0f, 66.0f }) {
+        for (int heightIndex = 0; heightIndex < targetHeightCount; ++heightIndex) {
+            const float height = targetHeights[heightIndex];
             Vector2 aimScreen{};
             if (!GetAimPointScreen(player, height, aimScreen)) continue;
             const float dx = aimScreen.x - cx;
@@ -401,6 +392,7 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
             if (distance < visibleDistance) {
                 visibleDistance = distance;
                 visibleAimScreen = aimScreen;
+                visibleAimHeight = height;
             }
         }
         if (targetVisible) {
@@ -410,6 +402,7 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
                 best = &player;
                 // Store the point that passed the depth test for the final move.
                 bestAimScreen = visibleAimScreen;
+                bestAimHeight = visibleAimHeight;
             }
         }
     }
@@ -438,16 +431,34 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     const LONG moveX = static_cast<LONG>((targetX - cx) / smooth);
     const LONG moveY = static_cast<LONG>((targetY - cy) / smooth);
     if (moveX || moveY) {
-        INPUT input{};
-        input.type = INPUT_MOUSE;
-        input.mi.dwFlags = MOUSEEVENTF_MOVE;
-        input.mi.dx = moveX;
-        input.mi.dy = moveY;
-        SendInput(1, &input, sizeof(INPUT));
         if (aimSilentMode) {
-            silentReturnX -= moveX;
-            silentReturnY -= moveY;
-            silentFlickActive = true;
+            const Vector3 targetWorld{
+                best->pos.x,
+                best->pos.y,
+                best->pos.z + bestAimHeight
+            };
+            const Vector3 cameraOrigin = currentCameraPositionReady
+                ? currentCameraPosition : currentLocalPosition;
+            const float dx = targetWorld.x - cameraOrigin.x;
+            const float dy = targetWorld.y - cameraOrigin.y;
+            const float dz = targetWorld.z - cameraOrigin.z;
+            const float horizontal = std::sqrt(dx * dx + dy * dy);
+            Vector3 commandAngles{
+                -std::atan2(dz, horizontal) * 57.29577951308232f,
+                std::atan2(dy, dx) * 57.29577951308232f,
+                0.0f
+            };
+            std::lock_guard<std::mutex> lock(silentAnglesMutex);
+            pendingSilentAngles = commandAngles;
+            pendingSilentAnglesReady = true;
+        }
+        if (!aimSilentMode) {
+            INPUT input{};
+            input.type = INPUT_MOUSE;
+            input.mi.dwFlags = MOUSEEVENTF_MOVE;
+            input.mi.dx = moveX;
+            input.mi.dy = moveY;
+            SendInput(1, &input, sizeof(INPUT));
         }
     }
 }

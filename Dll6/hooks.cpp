@@ -1,4 +1,6 @@
 #include "shared.h"
+#include "usercmd.hpp"
+#include "usercmd_runtime.hpp"
 #include <fstream>
 #include <atomic>
 #include <MinHook.h>
@@ -12,6 +14,86 @@ using UserCmdToNetworkFn = uintptr_t(__fastcall*)(uintptr_t, uintptr_t, uintptr_
 UserCmdToNetworkFn originalUserCmdToNetwork = nullptr;
 bool userCmdHookInstalled = false;
 std::atomic<unsigned long long> silentAppliedCalls{0};
+std::atomic<unsigned long long> createMoveCalls{0};
+std::atomic<unsigned long long> userCmdResolvedCalls{0};
+UserCmdFunctionAddresses runtimeUserCmdFunctions{};
+
+using CreateMoveFn = void(__fastcall*)(uintptr_t, uint32_t, char);
+using GetUserCmdTickFn = void(__fastcall*)(uintptr_t, int32_t*);
+using GetUserCmdArrayFn = uintptr_t(__fastcall*)(uintptr_t, int);
+using GetUserCmdBySequenceFn = uintptr_t(__fastcall*)(uintptr_t, uint32_t);
+CreateMoveFn originalCreateMove = nullptr;
+void* createMoveTarget = nullptr;
+
+uintptr_t GetCurrentController() {
+    if (!currentLocalPawn) return 0;
+    const uint32_t handle = Read<uint32_t>(currentLocalPawn + Offsets::PawnController);
+    if (handle == 0xFFFFFFFFu) return 0;
+    return ResolveEntity(handle);
+}
+
+uintptr_t GetCurrentUserCmd() {
+    if (!runtimeUserCmdFunctions.HasInputPath()) return 0;
+    const uintptr_t controller = GetCurrentController();
+    if (!controller) return 0;
+
+    auto getTick = reinterpret_cast<GetUserCmdTickFn>(runtimeUserCmdFunctions.getUserCmdTick);
+    auto getArray = reinterpret_cast<GetUserCmdArrayFn>(runtimeUserCmdFunctions.getUserCmdArray);
+    auto getBySequence = reinterpret_cast<GetUserCmdBySequenceFn>(runtimeUserCmdFunctions.getUserCmdBySequence);
+
+    int32_t outputTick = 0;
+    getTick(controller, &outputTick);
+    const int32_t tick = outputTick == -1 ? -1 : outputTick - 1;
+    const uintptr_t firstArray = Read<uintptr_t>(runtimeUserCmdFunctions.firstUserCmdArrayGlobal);
+    if (!firstArray) return 0;
+    const uintptr_t array = getArray(firstArray, tick);
+    if (!array) return 0;
+
+    // IDA-confirmed current client layout: CreateMove reads the command
+    // sequence from CUserCmdArray + 0x6270 in this build.
+    const uint32_t sequence = Read<uint32_t>(array + 0x6270);
+    if (!sequence) return 0;
+    return getBySequence(controller, sequence);
+}
+
+void ApplyPendingUserCmdAngles(uintptr_t userCmd) {
+    if (!userCmd || !aimSilentMode) return;
+    Vector3 angles{};
+    {
+        std::lock_guard<std::mutex> lock(silentAnglesMutex);
+        if (!pendingSilentAnglesReady) return;
+        angles = pendingSilentAngles;
+        pendingSilentAnglesReady = false;
+    }
+
+    auto* command = reinterpret_cast<CUserCmd*>(userCmd);
+    auto* viewAngles = command->cmd.mutable_ang_camera_angles();
+    if (!viewAngles) return;
+    viewAngles->set_x(angles.x);
+    viewAngles->set_y(angles.y);
+    viewAngles->set_z(angles.z);
+    command->cmd.clear_view_delta_x();
+    command->cmd.clear_view_delta_y();
+    ++silentAppliedCalls;
+}
+
+void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3) {
+    if (originalCreateMove) originalCreateMove(input, splitScreenIndex, a3);
+    const auto callCount = ++createMoveCalls;
+    const uintptr_t userCmd = GetCurrentUserCmd();
+    if (userCmd) ++userCmdResolvedCalls;
+    ApplyPendingUserCmdAngles(userCmd);
+    if ((callCount % 120) == 0) {
+        std::ofstream log(
+            "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\usercmd_runtime.log",
+            std::ios::app);
+        if (log) {
+            log << "createMove=" << callCount
+                << " userCmd=" << userCmdResolvedCalls.load()
+                << " silentApplied=" << silentAppliedCalls.load() << '\n';
+        }
+    }
+}
 
 void PatchInputHistory(uintptr_t userCmd, const Vector3& angles) {
     if (!userCmd) return;
@@ -76,6 +158,21 @@ bool InstallUserCmdHook() {
     return true;
 }
 
+bool InstallCreateMoveHook(const UserCmdFunctionAddresses& functions) {
+    if (!functions.HasInputPath()) return false;
+    const MH_STATUS initStatus = MH_Initialize();
+    if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED) return false;
+    createMoveTarget = reinterpret_cast<void*>(functions.createMove);
+    const MH_STATUS createStatus = MH_CreateHook(
+        createMoveTarget, reinterpret_cast<void*>(&hkCreateMove),
+        reinterpret_cast<void**>(&originalCreateMove));
+    if (createStatus != MH_OK && createStatus != MH_ERROR_ALREADY_CREATED) return false;
+    const MH_STATUS enableStatus = MH_EnableHook(createMoveTarget);
+    if (enableStatus != MH_OK && enableStatus != MH_ERROR_ENABLED) return false;
+    userCmdHookInstalled = true;
+    return true;
+}
+
 void RemoveUserCmdHook() {
     if (!userCmdHookInstalled || !clientBase) return;
     void* target = reinterpret_cast<void*>(clientBase + UserCmdToNetworkRva);
@@ -83,6 +180,12 @@ void RemoveUserCmdHook() {
     MH_RemoveHook(target);
     originalUserCmdToNetwork = nullptr;
     userCmdHookInstalled = false;
+    if (createMoveTarget) {
+        MH_DisableHook(createMoveTarget);
+        MH_RemoveHook(createMoveTarget);
+        createMoveTarget = nullptr;
+        originalCreateMove = nullptr;
+    }
 }
 
 void SetupHooks() {
@@ -183,7 +286,7 @@ DWORD WINAPI InitializeThread(LPVOID) {
         std::ofstream marker(
             "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\Dll6_runtime.marker",
             std::ios::trunc);
-        if (marker) marker << "native-los-validated-build-2026-07-24-1520\nclientBase=0x"
+        if (marker) marker << "protobuf-silent-no-flick-build-2026-07-25-0012\nclientBase=0x"
                            << std::hex << clientBase << "\n";
     }
     printf("[+] client.dll: 0x%p\n", reinterpret_cast<void*>(clientBase));
@@ -208,6 +311,29 @@ DWORD WINAPI InitializeThread(LPVOID) {
     }
     // UserCmd serializer hook disabled: restore stable pre-silent behavior.
     printf("[!] CUserCmd_to_network silent hook disabled\n");
+    const auto userCmdFunctions = ResolveUserCmdFunctions(clientBase);
+    runtimeUserCmdFunctions = userCmdFunctions;
+    printf("[+] UserCmd patterns: tick=%p array=%p sequence=%p createMove=%p\n",
+           reinterpret_cast<void*>(userCmdFunctions.getUserCmdTick),
+           reinterpret_cast<void*>(userCmdFunctions.getUserCmdArray),
+           reinterpret_cast<void*>(userCmdFunctions.getUserCmdBySequence),
+           reinterpret_cast<void*>(userCmdFunctions.createMove));
+    {
+        std::ofstream patternLog(
+            "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\usercmd_patterns.log",
+            std::ios::trunc);
+        if (patternLog) {
+            patternLog << std::hex
+                       << "clientBase=0x" << clientBase << "\n"
+                       << "getUserCmdTick=0x" << userCmdFunctions.getUserCmdTick << "\n"
+                       << "getUserCmdArray=0x" << userCmdFunctions.getUserCmdArray << "\n"
+                       << "getUserCmdBySequence=0x" << userCmdFunctions.getUserCmdBySequence << "\n"
+                       << "createMove=0x" << userCmdFunctions.createMove << "\n"
+                       << "firstUserCmdArrayGlobal=0x" << userCmdFunctions.firstUserCmdArrayGlobal << "\n"
+                       << "createMoveHook=enabled-if-input-path\n";
+        }
+    }
+    printf("[+] CreateMove hook: %s\n", InstallCreateMoveHook(userCmdFunctions) ? "installed" : "not installed");
     SetupHooks();
     return 0;
 }

@@ -138,16 +138,17 @@
       <PreprocessorDefinitions>NDEBUG;DLL6_EXPORTS;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
-      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)imgui-1.92.8;$(ProjectDir)imgui-1.92.8\backends;$(ProjectDir)minhook-1.3.4\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)imgui-1.92.8;$(ProjectDir)imgui-1.92.8\backends;$(ProjectDir)minhook-1.3.4\include;$(ProjectDir)protobuf</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalLibraryDirectories>$(ProjectDir)minhook-1.3.4\lib</AdditionalLibraryDirectories>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;libMinHook.x64.lib</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)minhook-1.3.4\lib;$(ProjectDir)protobuf</AdditionalLibraryDirectories>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;libMinHook.x64.lib;libprotobuf.lib</AdditionalDependencies>
     </Link>
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -156,6 +157,12 @@
   <ItemGroup>
     <ClInclude Include="framework.h" />
     <ClInclude Include="shared.h" />
+    <ClInclude Include="usercmd.hpp" />
+    <ClInclude Include="usercmd_runtime.hpp" />
+    <ClInclude Include="protobuf\citadel_usercmd.pb.h" />
+    <ClInclude Include="protobuf\usercmd.pb.h" />
+    <ClInclude Include="protobuf\networkbasetypes.pb.h" />
+    <ClInclude Include="protobuf\network_connection.pb.h" />
     <ClInclude Include="imgui-1.92.8\backends\imgui_impl_dx11.h" />
     <ClInclude Include="imgui-1.92.8\backends\imgui_impl_win32.h" />
     <ClInclude Include="imgui-1.92.8\imconfig.h" />
@@ -175,6 +182,11 @@
     <ClCompile Include="overlay.cpp" />
     <ClCompile Include="hooks.cpp" />
     <ClCompile Include="melee_hook.cpp" />
+    <ClCompile Include="usercmd_runtime.cpp" />
+    <ClCompile Include="protobuf\citadel_usercmd.pb.cc" />
+    <ClCompile Include="protobuf\usercmd.pb.cc" />
+    <ClCompile Include="protobuf\networkbasetypes.pb.cc" />
+    <ClCompile Include="protobuf\network_connection.pb.cc" />
     <ClCompile Include="imgui-1.92.8\backends\imgui_impl_dx11.cpp" />
     <ClCompile Include="imgui-1.92.8\backends\imgui_impl_win32.cpp" />
     <ClCompile Include="imgui-1.92.8\imgui.cpp" />

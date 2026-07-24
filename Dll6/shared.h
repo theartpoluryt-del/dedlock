@@ -34,12 +34,13 @@ constexpr uintptr_t EntityChunks=0x10, EntityChunkStride=sizeof(uintptr_t), Enti
 }
 struct Vector3 { float x,y,z; }; struct Vector2 { float x,y; }; struct Matrix4x4 { float m[4][4]; }; struct ColorRGBA { uint8_t r,g,b,a; };
 struct PlayerData { Vector3 pos; float boxLeft,boxTop,boxRight,boxBottom; int health,maxHealth,team; float distance; };
+enum class AimTargetMode : int { Head = 0, Body = 1, Closest = 2 };
 struct EspStatus { bool entitySystemReady=false, localPawnFound=false, heroPawnsFound=false; };
 struct WindowSearchData { DWORD processId; HWND window; };
 typedef HRESULT(__stdcall* PresentFn)(IDXGISwapChain*, UINT, UINT);
 constexpr UINT ApplyGlowMessage = WM_APP + 0x4D;
 
-extern uintptr_t clientBase; extern bool menuOpen,drawEsp,drawBoxes,drawHealth,aimAssist,autoParry,imguiInitialized,consoleAttached; extern Vector3 currentLocalPosition; extern bool currentLocalPositionReady; extern uintptr_t currentLocalPawn; extern uint32_t currentLocalPawnHandle; extern std::mutex meleeObjectsMutex; extern std::vector<uintptr_t> meleeObjects; extern std::mutex silentAnglesMutex; extern Vector3 pendingSilentAngles; extern bool pendingSilentAnglesReady;
+extern uintptr_t clientBase; extern bool menuOpen,drawEsp,drawBoxes,drawHealth,aimAssist,autoParry,imguiInitialized,consoleAttached; extern Vector3 currentLocalPosition; extern bool currentLocalPositionReady; extern Vector3 currentCameraPosition; extern bool currentCameraPositionReady; extern uintptr_t currentLocalPawn; extern uint32_t currentLocalPawnHandle; extern std::mutex meleeObjectsMutex; extern std::vector<uintptr_t> meleeObjects; extern std::mutex silentAnglesMutex; extern Vector3 pendingSilentAngles; extern bool pendingSilentAnglesReady;
 extern float aimFov,aimSmooth; extern bool aimVisibilityCheck; extern ID3D11Texture2D* depthStaging; extern UINT depthWidth,depthHeight; extern DXGI_FORMAT depthFormat; extern bool depthSnapshotReady; extern int depthDiagnosticState; extern Matrix4x4 currentViewMatrix; extern bool currentViewMatrixReady;
 extern ID3D11Device* pDevice; extern ID3D11DeviceContext* pContext; extern ID3D11RenderTargetView* pRenderTargetView; extern HWND gameWindow; extern WNDPROC oWndProc; extern HMODULE moduleHandle; extern void** presentVTable; extern volatile LONG unloadRequested,unloadThreadStarted; extern std::mutex glowMutex,heroPawnsMutex; extern std::unordered_set<uintptr_t> registeredGlows,queuedGlows; extern EspStatus espStatus; extern std::unordered_map<uintptr_t,bool> combatVTables; extern std::vector<uintptr_t> heroVTables,heroPawns; extern HANDLE heroDiscoveryThread,glowApplyThread,stopHeroDiscoveryEvent; extern PresentFn oPresent;
 template<typename T> T Read(uintptr_t address) { T value{}; if (!address) return value; __try { value=*reinterpret_cast<T*>(address); } __except(EXCEPTION_EXECUTE_HANDLER) { value=T{}; } return value; }
@@ -49,5 +50,6 @@ bool InstallMeleeStateMonitor(); void RemoveMeleeStateMonitor();
 BOOL CALLBACK FindGameWindowCallback(HWND,LPARAM); bool HookGameWindow(); uintptr_t ResolveEntity(uint32_t); uint32_t FindEntityHandle(uintptr_t); bool GetEntityPosition(uintptr_t,Vector3&); bool GetEntityScreenBounds(uintptr_t,const Vector3&,const Matrix4x4&,float&,float&,float&,float&); std::string GetEntityClassName(uintptr_t); bool NotifyGlowTypeChanged(uintptr_t); void ApplyHeroGlow(uintptr_t); void DiscoverHeroVTables(); void RefreshHeroPawns(); DWORD WINAPI HeroDiscoveryWorker(LPVOID); DWORD WINAPI GlowApplyWorker(LPVOID); bool IsCombatEntity(uintptr_t);
 void DebugEntityHandle(uint32_t);
 void SetMenuOpen(bool); std::vector<PlayerData> GetPlayers(); void RenderESP(const std::vector<PlayerData>&); void RenderMenu(size_t); void RestorePresentHook(); void ShutdownOverlay(); DWORD WINAPI UnloadThread(LPVOID); void RequestUnload(); HRESULT __stdcall hkPresent(IDXGISwapChain*,UINT,UINT); LRESULT __stdcall hkWndProc(HWND,UINT,WPARAM,LPARAM); void* DetourFunc(BYTE*,const BYTE*,const int); void SetupHooks(); DWORD WINAPI InitializeThread(LPVOID);
-bool InstallUserCmdHook(); void RemoveUserCmdHook();
+struct UserCmdFunctionAddresses; bool InstallUserCmdHook(); bool InstallCreateMoveHook(const UserCmdFunctionAddresses&); void RemoveUserCmdHook();
 extern bool aimSilentMode;  // true = silent (без движения мыши)
+extern AimTargetMode aimTargetMode;

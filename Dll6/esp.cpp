@@ -71,6 +71,8 @@ std::vector<PlayerData> GetPlayers() {
     Vector3 cameraPosition{};
     Vector3 distanceOrigin{};
     const bool cameraPositionFound = ReadCameraWorldPosition(cameraPosition);
+    currentCameraPosition = cameraPosition;
+    currentCameraPositionReady = cameraPositionFound;
     uintptr_t localPawn = 0;
     bool localPositionFound = false;
     // Prefer the actual locally controlled pawn when the controller is present in the entity system.
@@ -219,6 +221,11 @@ void RenderMenu(size_t playerCount) {
     ImGui::Checkbox("Aim assist (hold RMB)", &aimAssist);
     ImGui::Checkbox("Auto parry (F)", &autoParry);
     ImGui::Checkbox("Silent Aim (No Visual)", &aimSilentMode);
+    int targetMode = static_cast<int>(aimTargetMode);
+    const char* targetModes[] = { "Head", "Body", "Closest" };
+    if (ImGui::Combo("Aim target", &targetMode, targetModes, IM_ARRAYSIZE(targetModes))) {
+        aimTargetMode = static_cast<AimTargetMode>(std::clamp(targetMode, 0, 2));
+    }
 
     ImGui::SliderFloat("Aim FOV", &aimFov, 40.0f, 600.0f, "%.0f px");
     ImGui::SliderFloat("Aim smooth", &aimSmooth, 1.0f, 20.0f, "%.1f");
