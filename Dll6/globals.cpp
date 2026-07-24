@@ -6,3 +6,6 @@ bool aimSilentMode = false;
 AimTargetMode aimTargetMode = AimTargetMode::Closest;
 int aimAssistKey = VK_RBUTTON;
 bool aimKeyCapture = false;
+bool aimToggleMode = false;
+bool aimToggleActive = false;
+bool aimToggleLastDown = false;

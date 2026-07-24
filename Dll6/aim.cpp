@@ -1,4 +1,5 @@
 #include "shared.h"
+#include <sstream>
 
 // Temporary measurement mode: suppress verbose aim/parry diagnostics.
 #define printf(...) do { } while (0)
@@ -20,6 +21,54 @@ bool WorldToScreen(const Vector3& pos, Vector2& screen, const Matrix4x4& matrix)
 }
 
 namespace {
+
+using CalcWorldSpaceBonesFn = void(__fastcall*)(uintptr_t, unsigned int);
+using GetBoneIdByNameFn = int(__fastcall*)(uintptr_t, const char*);
+
+struct BoneRuntimeFunctions {
+    CalcWorldSpaceBonesFn calcWorldSpaceBones{};
+    GetBoneIdByNameFn getBoneIdByName{};
+    bool resolved = false;
+};
+
+BoneRuntimeFunctions boneFunctions{};
+
+uintptr_t FindBonePattern(uintptr_t base, std::size_t size, const char* pattern) {
+    std::vector<int> bytes;
+    std::istringstream stream(pattern ? pattern : "");
+    std::string token;
+    while (stream >> token) {
+        bytes.push_back(token == "?" || token == "??" ? -1 : std::stoi(token, nullptr, 16));
+    }
+    if (bytes.empty() || bytes.size() > size) return 0;
+    for (std::size_t i = 0; i <= size - bytes.size(); ++i) {
+        bool match = true;
+        for (std::size_t j = 0; j < bytes.size(); ++j) {
+            if (bytes[j] >= 0 && Read<uint8_t>(base + i + j) != static_cast<uint8_t>(bytes[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return base + i;
+    }
+    return 0;
+}
+
+void ResolveBoneFunctions() {
+    if (boneFunctions.resolved) return;
+    boneFunctions.resolved = true;
+    if (!clientBase) return;
+
+    MODULEINFO moduleInfo{};
+    if (!GetModuleInformation(GetCurrentProcess(), reinterpret_cast<HMODULE>(clientBase), &moduleInfo, sizeof(moduleInfo))) return;
+    const auto imageSize = static_cast<std::size_t>(moduleInfo.SizeOfImage);
+    const uintptr_t calc = FindBonePattern(clientBase, imageSize,
+        "48 89 4C 24 ? 55 53 56 57 41 54 41 55 41 56 41 57 B8 ? ? ? ? E8 ? ? ? ? 48 2B E0 48 8D 6C 24 ? 48 8B 81");
+    const uintptr_t boneId = FindBonePattern(clientBase, imageSize,
+        "40 53 48 83 EC 20 48 8B 89 ? ? ? ? 48 8B DA 48 8B 01 FF 50 ? 48 8B C8");
+    boneFunctions.calcWorldSpaceBones = reinterpret_cast<CalcWorldSpaceBonesFn>(calc);
+    boneFunctions.getBoneIdByName = reinterpret_cast<GetBoneIdByNameFn>(boneId);
+}
 
 Vector3 CalculateAimAngles(const Vector3& source, const Vector3& target) {
     constexpr float RadToDeg = 57.29577951308232f;
@@ -105,6 +154,70 @@ bool UnprojectCenter(const Matrix4x4& inverse, float depth, Vector3& world) {
     if (!std::isfinite(w) || std::fabs(w) < 1e-6f) return false;
     world = { x / w, y / w, z / w };
     return std::isfinite(world.x) && std::isfinite(world.y) && std::isfinite(world.z);
+}
+
+bool GetEntityBonePosition(uintptr_t entity, const char* boneName, Vector3& position) {
+    position = {};
+    if (!entity || !boneName || !*boneName) return false;
+    ResolveBoneFunctions();
+    if (!boneFunctions.calcWorldSpaceBones || !boneFunctions.getBoneIdByName) return false;
+
+    const uintptr_t sceneNode = Read<uintptr_t>(entity + Offsets::GameSceneNode);
+    if (!sceneNode) return false;
+
+    __try {
+        boneFunctions.calcWorldSpaceBones(sceneNode, 0xFFFFFu);
+        const int boneIndex = boneFunctions.getBoneIdByName(entity, boneName);
+        if (boneIndex < 0 || boneIndex > 512) return false;
+
+        // CModelState starts at CSkeletonInstance + 0x150 and the runtime
+        // bone pointer is the first field after its 0x80-byte prefix.
+        const uintptr_t bones = Read<uintptr_t>(sceneNode + 0x150 + 0x80);
+        if (!bones) return false;
+        position = Read<Vector3>(bones + static_cast<uintptr_t>(boneIndex) * 0x20);
+        return std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        position = {};
+        return false;
+    }
+}
+
+bool GetAimAnglesFromScreen(float screenX, float screenY, Vector3& angles) {
+    if (!currentViewMatrixReady) return false;
+
+    Matrix4x4 inverse{};
+    if (!InvertMatrix(currentViewMatrix, inverse)) return false;
+    const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
+    if (displaySize.x <= 0.0f || displaySize.y <= 0.0f) return false;
+
+    const auto unproject = [&](float depth, Vector3& world) {
+        const float clipX = (screenX / displaySize.x) * 2.0f - 1.0f;
+        const float clipY = 1.0f - (screenY / displaySize.y) * 2.0f;
+        const float clipZ = depth;
+        const float x = inverse.m[0][0] * clipX + inverse.m[0][1] * clipY + inverse.m[0][2] * clipZ + inverse.m[0][3];
+        const float y = inverse.m[1][0] * clipX + inverse.m[1][1] * clipY + inverse.m[1][2] * clipZ + inverse.m[1][3];
+        const float z = inverse.m[2][0] * clipX + inverse.m[2][1] * clipY + inverse.m[2][2] * clipZ + inverse.m[2][3];
+        const float w = inverse.m[3][0] * clipX + inverse.m[3][1] * clipY + inverse.m[3][2] * clipZ + inverse.m[3][3];
+        if (!std::isfinite(w) || std::fabs(w) < 1e-6f) return false;
+        world = { x / w, y / w, z / w };
+        return std::isfinite(world.x) && std::isfinite(world.y) && std::isfinite(world.z);
+    };
+
+    Vector3 nearPoint{}, farPoint{};
+    if (!unproject(0.0f, nearPoint) || !unproject(1.0f, farPoint)) return false;
+    const float dx = farPoint.x - nearPoint.x;
+    const float dy = farPoint.y - nearPoint.y;
+    const float dz = farPoint.z - nearPoint.z;
+    const float horizontal = std::sqrt(dx * dx + dy * dy);
+    if (!std::isfinite(horizontal) || horizontal < 1e-5f || !std::isfinite(dz)) return false;
+
+    constexpr float RadToDeg = 57.29577951308232f;
+    angles = {
+        -std::atan2(dz, horizontal) * RadToDeg,
+        std::atan2(dy, dx) * RadToDeg,
+        0.0f
+    };
+    return std::isfinite(angles.x) && std::isfinite(angles.y);
 }
 
 bool GetCameraTraceStart(Vector3& start) {
@@ -328,6 +441,10 @@ bool GetAimPointScreen(const PlayerData& player, float height, Vector2& screen) 
     return WorldToScreen(aimPoint, screen, currentViewMatrix);
 }
 
+bool GetWorldAimPointScreen(const Vector3& point, Vector2& screen) {
+    return currentViewMatrixReady && WorldToScreen(point, screen, currentViewMatrix);
+}
+
 float ResolveAimHeightFromBox(const PlayerData& player, float verticalFraction, float fallback) {
     if (!currentViewMatrixReady || !std::isfinite(player.boxTop) ||
         !std::isfinite(player.boxBottom) || player.boxBottom <= player.boxTop) {
@@ -360,6 +477,14 @@ bool IsAimPointVisible(const PlayerData& player, float height, float screenX, fl
     return PhysicsTraceVisible(traceStart, aimPoint);
 }
 
+bool IsWorldAimPointVisible(const Vector3& point) {
+    if (!clientBase || !currentLocalPositionReady) return false;
+    if (!Read<uintptr_t>(clientBase + PhysicsTraceContextRva)) return false;
+    Vector3 traceStart = currentLocalPosition;
+    traceStart.z += 64.0f;
+    return PhysicsTraceVisible(traceStart, point);
+}
+
 void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     const bool leftButtonDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     const bool rightButtonDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
@@ -369,7 +494,11 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     }
 
     const bool configuredAimKeyDown = (GetAsyncKeyState(aimAssistKey) & 0x8000) != 0;
-    const bool aiming = aimSilentMode ? leftButtonDown : configuredAimKeyDown;
+    const bool configuredAimKeyPressed = configuredAimKeyDown && !aimToggleLastDown;
+    if (aimToggleMode && configuredAimKeyPressed) aimToggleActive = !aimToggleActive;
+    aimToggleLastDown = configuredAimKeyDown;
+    const bool aiming = aimSilentMode ? leftButtonDown
+                                     : (aimToggleMode ? aimToggleActive : configuredAimKeyDown);
     if (!aimAssist || menuOpen || !aiming || !currentViewMatrixReady) return;
 
     const bool useDepthWallCheck = aimVisibilityCheck;
@@ -385,49 +514,50 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
 
     for (const auto& player : players) {
         const float modelHeight = player.modelHeight > 20.0f ? player.modelHeight : 80.0f;
-        // Resolve the target against the projected model bounds. SceneNode
-        // origin and collision Z offsets vary between hero classes, so a
-        // fixed percentage of modelHeight is not a reliable bone substitute.
         const float modelMinZ = std::isfinite(player.modelMinZ) ? player.modelMinZ : 0.0f;
         const float fallbackHead = modelMinZ + modelHeight * 0.92f;
         const float fallbackBody = modelMinZ + modelHeight * 0.62f;
-        const float headHeight = ResolveAimHeightFromBox(player, 0.14f, fallbackHead);
-        const float bodyHeight = ResolveAimHeightFromBox(player, 0.42f, fallbackBody);
-        const float centerHeight = ResolveAimHeightFromBox(player, 0.58f, modelMinZ + modelHeight * 0.50f);
-        float targetHeights[3] = {
-            centerHeight,
-            bodyHeight,
-            headHeight
-        };
-        int targetHeightCount = 3;
+        // This is used only when the model has not exposed its skeleton yet.
+        // Normal aiming uses the actual head bone below.
+        const float headHeight = ResolveAimHeightFromBox(player, 0.12f, fallbackHead);
+        const float bodyHeight = ResolveAimHeightFromBox(player, 0.60f, fallbackBody);
+        const float centerHeight = ResolveAimHeightFromBox(player, 0.50f, modelMinZ + modelHeight * 0.50f);
+        const Vector3 fallbackHeadPoint{ player.pos.x, player.pos.y, player.pos.z + headHeight };
+        const Vector3 fallbackBodyPoint{ player.pos.x, player.pos.y, player.pos.z + bodyHeight };
+        const Vector3 fallbackCenterPoint{ player.pos.x, player.pos.y, player.pos.z + centerHeight };
+        struct AimCandidate { Vector3 point; bool bone; };
+        AimCandidate candidates[3]{};
+        int candidateCount = 0;
         if (aimTargetMode == AimTargetMode::Head) {
-            targetHeights[0] = headHeight;
-            targetHeightCount = 1;
+            candidates[candidateCount++] = { player.hasHeadBone ? player.headPos : fallbackHeadPoint, player.hasHeadBone };
         } else if (aimTargetMode == AimTargetMode::Body) {
-            targetHeights[0] = bodyHeight;
-            targetHeightCount = 1;
+            candidates[candidateCount++] = { player.hasBodyBone ? player.bodyPos : fallbackBodyPoint, player.hasBodyBone };
+        } else {
+            if (player.hasHeadBone) candidates[candidateCount++] = { player.headPos, true };
+            if (player.hasBodyBone) candidates[candidateCount++] = { player.bodyPos, true };
+            if (candidateCount == 0) candidates[candidateCount++] = { fallbackCenterPoint, false };
         }
         bool targetVisible = false;
         Vector2 visibleAimScreen{};
         float visibleAimHeight = 54.0f;
         float visibleDistance = FLT_MAX;
-        // Try torso, chest and head. A single fixed point can lie inside the
-        // model and therefore have a different depth than its rendered surface.
-        for (int heightIndex = 0; heightIndex < targetHeightCount; ++heightIndex) {
-            const float height = targetHeights[heightIndex];
+        for (int candidateIndex = 0; candidateIndex < candidateCount; ++candidateIndex) {
+            const Vector3 point = candidates[candidateIndex].point;
             Vector2 aimScreen{};
-            if (!GetAimPointScreen(player, height, aimScreen)) continue;
+            if (!GetWorldAimPointScreen(point, aimScreen)) continue;
             const float dx = aimScreen.x - cx;
             const float dy = aimScreen.y - cy;
             const float distance = dx * dx + dy * dy;
             if (distance >= bestDistance) continue;
             ++testedTargets;
-            if (useDepthWallCheck && !IsAimPointVisible(player, height, aimScreen.x, aimScreen.y)) continue;
+            if (useDepthWallCheck && (candidates[candidateIndex].bone
+                ? !IsWorldAimPointVisible(point)
+                : !IsAimPointVisible(player, point.z - player.pos.z, aimScreen.x, aimScreen.y))) continue;
             targetVisible = true;
             if (distance < visibleDistance) {
                 visibleDistance = distance;
                 visibleAimScreen = aimScreen;
-                visibleAimHeight = height;
+                visibleAimHeight = point.z - player.pos.z;
             }
         }
         if (targetVisible) {
@@ -481,25 +611,12 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
             lastLoggedHeight = loggedHeight;
         }
         if (aimSilentMode) {
-            const Vector3 targetWorld{
-                best->pos.x,
-                best->pos.y,
-                best->pos.z + bestAimHeight
-            };
-            const Vector3 cameraOrigin = currentCameraPositionReady
-                ? currentCameraPosition : currentLocalPosition;
-            const float dx = targetWorld.x - cameraOrigin.x;
-            const float dy = targetWorld.y - cameraOrigin.y;
-            const float dz = targetWorld.z - cameraOrigin.z;
-            const float horizontal = std::sqrt(dx * dx + dy * dy);
-            Vector3 commandAngles{
-                -std::atan2(dz, horizontal) * 57.29577951308232f,
-                std::atan2(dy, dx) * 57.29577951308232f,
-                0.0f
-            };
-            std::lock_guard<std::mutex> lock(silentAnglesMutex);
-            pendingSilentAngles = commandAngles;
-            pendingSilentAnglesReady = true;
+            Vector3 commandAngles{};
+            if (GetAimAnglesFromScreen(targetX, targetY, commandAngles)) {
+                std::lock_guard<std::mutex> lock(silentAnglesMutex);
+                pendingSilentAngles = commandAngles;
+                pendingSilentAnglesReady = true;
+            }
         }
         if (!aimSilentMode) {
             INPUT input{};

@@ -8,8 +8,14 @@ void SetMenuOpen(bool open) {
     }
 
     if (open) {
+        if (gameWindow) {
+            SetCapture(gameWindow);
+            SetFocus(gameWindow);
+        }
         ClipCursor(nullptr);
         SetCursor(LoadCursor(nullptr, IDC_ARROW));
+    } else {
+        ReleaseCapture();
     }
 }
 
@@ -232,6 +238,9 @@ std::vector<PlayerData> GetPlayers() {
         player.modelMinZ = validBounds ? collisionMins.z : 0.0f;
         player.modelMaxZ = validBounds ? collisionMaxs.z : 80.0f;
         player.modelHeight = player.modelMaxZ - player.modelMinZ;
+        player.hasHeadBone = GetEntityBonePosition(entity, "head", player.headPos);
+        player.hasBodyBone = GetEntityBonePosition(entity, "spine_2", player.bodyPos);
+        if (!player.hasBodyBone) player.hasBodyBone = GetEntityBonePosition(entity, "spine_0", player.bodyPos);
         player.health = health;
         player.maxHealth = Read<int>(entity + Offsets::MaxHealth);
         player.team = team;
@@ -366,6 +375,18 @@ void RenderMenu(size_t playerCount) {
         }
         ImGui::SameLine();
         ImGui::TextUnformatted("Aim-assist key");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Hold", !aimToggleMode)) {
+            aimToggleMode = false;
+            aimToggleActive = false;
+            aimToggleLastDown = false;
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Toggle", aimToggleMode)) {
+            aimToggleMode = true;
+            aimToggleActive = false;
+            aimToggleLastDown = false;
+        }
         ImGui::Checkbox("Auto parry (F)", &autoParry);
         ImGui::Checkbox("Silent Aim (No Visual)", &aimSilentMode);
         ImGui::Checkbox("Visibility check", &aimVisibilityCheck);
@@ -377,7 +398,7 @@ void RenderMenu(size_t playerCount) {
         ImGui::SliderFloat("Aim FOV", &aimFov, 40.0f, 600.0f, "%.0f px");
         ImGui::SliderFloat("Aim smooth", &aimSmooth, 1.0f, 20.0f, "%.1f");
     }
-    if (ImGui::Button("Unload DLL (Delete)")) {
+    if (ImGui::Button("Unload DLL")) {
         RequestUnload();
     }
 

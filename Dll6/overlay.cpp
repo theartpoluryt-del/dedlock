@@ -257,6 +257,9 @@ LRESULT __stdcall hkWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         case WM_RBUTTONDOWN:
         case WM_RBUTTONUP:
         case WM_MOUSEWHEEL:
+        case WM_MOUSEHWHEEL:
+        case WM_MBUTTONDOWN:
+        case WM_MBUTTONUP:
         case WM_INPUT:
         case WM_MOUSEACTIVATE:
         case WM_XBUTTONDOWN:
