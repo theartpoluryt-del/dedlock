@@ -226,6 +226,21 @@ LRESULT __stdcall hkWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     }
 
     if (menuOpen && imguiInitialized && ImGui::GetCurrentContext()) {
+        if (aimKeyCapture) {
+            const bool keyboardKey = uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN;
+            const bool mouseKey = uMsg == WM_LBUTTONDOWN || uMsg == WM_RBUTTONDOWN ||
+                                  uMsg == WM_MBUTTONDOWN || uMsg == WM_XBUTTONDOWN;
+            if (keyboardKey || mouseKey) {
+                if (keyboardKey) aimAssistKey = static_cast<int>(wParam);
+                else if (uMsg == WM_LBUTTONDOWN) aimAssistKey = VK_LBUTTON;
+                else if (uMsg == WM_RBUTTONDOWN) aimAssistKey = VK_RBUTTON;
+                else if (uMsg == WM_MBUTTONDOWN) aimAssistKey = VK_MBUTTON;
+                else aimAssistKey = HIWORD(wParam) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2;
+                aimKeyCapture = false;
+                return 1;
+            }
+        }
+
         if (uMsg == WM_SETCURSOR) {
             SetCursor(LoadCursor(nullptr, IDC_ARROW));
             return TRUE;
@@ -242,8 +257,14 @@ LRESULT __stdcall hkWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         case WM_RBUTTONDOWN:
         case WM_RBUTTONUP:
         case WM_MOUSEWHEEL:
+        case WM_INPUT:
+        case WM_MOUSEACTIVATE:
+        case WM_XBUTTONDOWN:
+        case WM_XBUTTONUP:
         case WM_KEYDOWN:
         case WM_KEYUP:
+        case WM_SYSKEYDOWN:
+        case WM_SYSKEYUP:
         case WM_CHAR:
             return 1;
         }

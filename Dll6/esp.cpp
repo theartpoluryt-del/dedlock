@@ -15,6 +15,95 @@ void SetMenuOpen(bool open) {
 
 namespace {
 
+const char* AimKeyName(int key) {
+    switch (key) {
+        case VK_LBUTTON: return "LMB";
+        case VK_RBUTTON: return "RMB";
+        case VK_MBUTTON: return "MMB";
+        case VK_XBUTTON1: return "Mouse 4";
+        case VK_XBUTTON2: return "Mouse 5";
+        case VK_SHIFT: return "Shift";
+        case VK_CONTROL: return "Ctrl";
+        case VK_MENU: return "Alt";
+        case VK_SPACE: return "Space";
+        case VK_TAB: return "Tab";
+        default: {
+            static char name[16];
+            if (key >= 'A' && key <= 'Z') {
+                name[0] = static_cast<char>(key);
+                name[1] = '\0';
+                return name;
+            }
+            std::snprintf(name, sizeof(name), "VK 0x%02X", key & 0xFF);
+            return name;
+        }
+    }
+}
+
+std::string HeroNameFromId(uint32_t heroId) {
+    switch (heroId) {
+        case 1: return "Infernus";
+        case 2: return "Seven";
+        case 3: return "Vindicta";
+        case 4: return "Lady Geist";
+        case 6: return "Abrams";
+        case 7: return "Wraith";
+        case 8: return "McGinnis";
+        case 10: return "Paradox";
+        case 11: return "Dynamo";
+        case 12: return "Kelvin";
+        case 13: return "Haze";
+        case 14: return "Holliday";
+        case 15: return "Bebop";
+        case 16: return "Calico";
+        case 17: return "Grey Talon";
+        case 18: return "Mo & Krill";
+        case 19: return "Shiv";
+        case 20: return "Ivy";
+        case 25: return "Warden";
+        case 27: return "Yamato";
+        case 31: return "Lash";
+        case 35: return "Viscous";
+        case 50: return "Pocket";
+        case 52: return "Mirage";
+        case 55: return "Training Dummy";
+        case 58: return "Vyper";
+        case 60: return "Sinclair";
+        case 63: return "Mina";
+        case 64: return "Drifter";
+        case 65: return "Venator";
+        case 66: return "Victor";
+        case 67: return "Paige";
+        case 69: return "The Doorman";
+        case 72: return "Billy";
+        case 76: return "Graves";
+        case 77: return "Apollo";
+        case 79: return "Rem";
+        case 80: return "Silver";
+        case 81: return "Celeste";
+        default: return "Unknown hero";
+    }
+}
+
+std::string ReadHeroName(uintptr_t entity) {
+    if (!entity) return "Unknown hero";
+    const uint32_t heroId = Read<uint32_t>(entity + Offsets::HeroComponent + Offsets::HeroSpawnedId);
+    static std::unordered_set<uint32_t> loggedIds;
+    if (loggedIds.insert(heroId).second) {
+        FILE* log = nullptr;
+        if (fopen_s(&log, "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\hero_ids.log", "a") == 0 && log) {
+            fprintf(log, "entity=%p spawned=0x%X loading=0x%X component=0x%X portrait=0x%X\\n",
+                    reinterpret_cast<void*>(entity),
+                    heroId,
+                    Read<uint32_t>(entity + Offsets::HeroComponent + 0x30),
+                    Read<uint32_t>(entity + Offsets::HeroComponent),
+                    Read<uint32_t>(entity + 0x10C8));
+            fclose(log);
+        }
+    }
+    return HeroNameFromId(heroId);
+}
+
 // The camera object still lives at the old data anchor.  Its view and
 // projection matrices are stored consecutively in the render-camera state.
 bool ReadCurrentViewMatrix(Matrix4x4& matrix) {
@@ -135,13 +224,18 @@ std::vector<PlayerData> GetPlayers() {
         const uintptr_t collision = Read<uintptr_t>(entity + Offsets::CollisionProperty);
         const Vector3 collisionMins = Read<Vector3>(collision + Offsets::CollisionMins);
         const Vector3 collisionMaxs = Read<Vector3>(collision + Offsets::CollisionMaxs);
-        player.modelHeight = collision && std::isfinite(collisionMins.z) && std::isfinite(collisionMaxs.z)
-            ? collisionMaxs.z - collisionMins.z : 80.0f;
-        if (!std::isfinite(player.modelHeight) || player.modelHeight < 20.0f || player.modelHeight > 200.0f)
-            player.modelHeight = 80.0f;
+        const bool validBounds = collision && std::isfinite(collisionMins.z) &&
+                                 std::isfinite(collisionMaxs.z) &&
+                                 collisionMins.z < collisionMaxs.z &&
+                                 collisionMaxs.z - collisionMins.z >= 20.0f &&
+                                 collisionMaxs.z - collisionMins.z <= 200.0f;
+        player.modelMinZ = validBounds ? collisionMins.z : 0.0f;
+        player.modelMaxZ = validBounds ? collisionMaxs.z : 80.0f;
+        player.modelHeight = player.modelMaxZ - player.modelMinZ;
         player.health = health;
         player.maxHealth = Read<int>(entity + Offsets::MaxHealth);
         player.team = team;
+        player.heroName = ReadHeroName(entity);
         const float dx = pos.x - distanceOrigin.x;
         const float dy = pos.y - distanceOrigin.y;
         const float dz = pos.z - distanceOrigin.z;
@@ -160,9 +254,19 @@ std::vector<PlayerData> GetPlayers() {
 }
 
 void RenderESP(const std::vector<PlayerData>& players) {
+    auto drawList = ImGui::GetBackgroundDrawList();
+    const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
+    if (drawFovCircle && aimAssist && aimFov > 0.0f && displaySize.x > 0.0f && displaySize.y > 0.0f) {
+        const ImVec2 screenCenter(displaySize.x * 0.5f, displaySize.y * 0.5f);
+        const int alpha = static_cast<int>(std::clamp(fovCircleAlpha, 0.0f, 255.0f));
+        drawList->AddCircle(screenCenter, aimFov, ImColor(255, 255, 255, alpha), 96, 1.0f);
+    }
+
     if (!drawEsp) return;
 
-    auto drawList = ImGui::GetBackgroundDrawList();
+    Vector2 localScreen{};
+    const bool localOnScreen = currentLocalPositionReady &&
+                               WorldToScreen(currentLocalPosition, localScreen, currentViewMatrix);
 
     for (const auto& player : players) {
         const float screenX = (player.boxLeft + player.boxRight) * 0.5f;
@@ -170,6 +274,23 @@ void RenderESP(const std::vector<PlayerData>& players) {
         const float boxTop = player.boxTop;
         const float boxHeight = player.boxBottom - player.boxTop;
         const float boxWidth = player.boxRight - player.boxLeft;
+
+        if (drawSnaplines) {
+            const ImVec2 lineStart = localOnScreen
+                ? ImVec2(localScreen.x, localScreen.y)
+                : ImVec2(displaySize.x * 0.5f, displaySize.y);
+            const int alpha = static_cast<int>(std::clamp(snaplineAlpha, 0.0f, 255.0f));
+            drawList->AddLine(lineStart, ImVec2(screenX, screenY), ImColor(255, 255, 255, alpha), 1.0f);
+        }
+
+        if (drawNames) {
+            const ImVec2 nameSize = ImGui::CalcTextSize(player.heroName.c_str());
+            drawList->AddText(
+                ImVec2(screenX - nameSize.x * 0.5f, boxTop - 30.0f),
+                ImColor(255, 0, 0, 255),
+                player.heroName.c_str()
+            );
+        }
 
         if (drawBoxes) {
             drawList->AddRect(
@@ -201,11 +322,13 @@ void RenderESP(const std::vector<PlayerData>& players) {
                 healthColor
             );
 
-            const std::string healthText = std::to_string(player.health) + "/" + std::to_string(player.maxHealth);
-            drawList->AddText(ImVec2(barLeft - 4.0f, boxTop - 14.0f), ImColor(255, 255, 255, 220), healthText.c_str());
+            if (drawHealthValues) {
+                const std::string healthText = std::to_string(player.health) + "/" + std::to_string(player.maxHealth);
+                drawList->AddText(ImVec2(barLeft - 4.0f, boxTop - 14.0f), ImColor(255, 255, 255, 220), healthText.c_str());
+            }
         }
 
-        if (player.distance > 0.0f) {
+        if (drawDistance && player.distance > 0.0f) {
             const std::string distText = std::to_string(static_cast<int>(player.distance)) + "m";
             drawList->AddText(
                 ImVec2(screenX - 15, screenY + 6),
@@ -222,20 +345,38 @@ void RenderMenu(size_t playerCount) {
     const bool wasMenuOpen = menuOpen;
     ImGui::Begin("Deadlock Internal", &menuOpen, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize);
 
-    ImGui::Checkbox("ESP", &drawEsp);
-    ImGui::Checkbox("Boxes", &drawBoxes);
-    ImGui::Checkbox("Health Bars", &drawHealth);
-    ImGui::Checkbox("Aim assist (hold RMB)", &aimAssist);
-    ImGui::Checkbox("Auto parry (F)", &autoParry);
-    ImGui::Checkbox("Silent Aim (No Visual)", &aimSilentMode);
-    int targetMode = static_cast<int>(aimTargetMode);
-    const char* targetModes[] = { "Head", "Body", "Closest" };
-    if (ImGui::Combo("Aim target", &targetMode, targetModes, IM_ARRAYSIZE(targetModes))) {
-        aimTargetMode = static_cast<AimTargetMode>(std::clamp(targetMode, 0, 2));
+    if (ImGui::CollapsingHeader("Visuals", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("ESP", &drawEsp);
+        ImGui::Checkbox("Boxes", &drawBoxes);
+        ImGui::Checkbox("Health Bars", &drawHealth);
+        ImGui::Checkbox("Health Values", &drawHealthValues);
+        ImGui::Checkbox("Hero Names", &drawNames);
+        ImGui::Checkbox("Distance", &drawDistance);
+        ImGui::Checkbox("Snaplines", &drawSnaplines);
+        if (drawSnaplines) ImGui::SliderFloat("Snapline alpha", &snaplineAlpha, 0.0f, 255.0f, "%.0f");
+        ImGui::Checkbox("Glow", &glowEnabled);
+        ImGui::Checkbox("FOV circle", &drawFovCircle);
+        if (drawFovCircle) ImGui::SliderFloat("FOV circle alpha", &fovCircleAlpha, 0.0f, 255.0f, "%.0f");
     }
 
-    ImGui::SliderFloat("Aim FOV", &aimFov, 40.0f, 600.0f, "%.0f px");
-    ImGui::SliderFloat("Aim smooth", &aimSmooth, 1.0f, 20.0f, "%.1f");
+    if (ImGui::CollapsingHeader("Aim", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("Aim assist", &aimAssist);
+        if (ImGui::Button(aimKeyCapture ? "Press aim key..." : AimKeyName(aimAssistKey))) {
+            aimKeyCapture = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextUnformatted("Aim-assist key");
+        ImGui::Checkbox("Auto parry (F)", &autoParry);
+        ImGui::Checkbox("Silent Aim (No Visual)", &aimSilentMode);
+        ImGui::Checkbox("Visibility check", &aimVisibilityCheck);
+        int targetMode = static_cast<int>(aimTargetMode);
+        const char* targetModes[] = { "Head", "Body", "Closest" };
+        if (ImGui::Combo("Aim target", &targetMode, targetModes, IM_ARRAYSIZE(targetModes))) {
+            aimTargetMode = static_cast<AimTargetMode>(std::clamp(targetMode, 0, 2));
+        }
+        ImGui::SliderFloat("Aim FOV", &aimFov, 40.0f, 600.0f, "%.0f px");
+        ImGui::SliderFloat("Aim smooth", &aimSmooth, 1.0f, 20.0f, "%.1f");
+    }
     if (ImGui::Button("Unload DLL (Delete)")) {
         RequestUnload();
     }
@@ -243,7 +384,10 @@ void RenderMenu(size_t playerCount) {
     ImGui::Separator();
     ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
     ImGui::Text("Players: %zu", playerCount);
-    ImGui::Text("Hero scan: %s", espStatus.heroPawnsFound ? "ready" : "searching");
+    const char* heroScanState = !espStatus.heroScanComplete
+                                    ? "scanning"
+                                    : (espStatus.heroPawnsFound ? "ready" : "no pawns");
+    ImGui::Text("Hero scan: %s", heroScanState);
 
     ImGui::End();
 

@@ -328,6 +328,26 @@ bool GetAimPointScreen(const PlayerData& player, float height, Vector2& screen) 
     return WorldToScreen(aimPoint, screen, currentViewMatrix);
 }
 
+float ResolveAimHeightFromBox(const PlayerData& player, float verticalFraction, float fallback) {
+    if (!currentViewMatrixReady || !std::isfinite(player.boxTop) ||
+        !std::isfinite(player.boxBottom) || player.boxBottom <= player.boxTop) {
+        return fallback;
+    }
+
+    const float wantedY = player.boxTop + (player.boxBottom - player.boxTop) * verticalFraction;
+    float low = -200.0f;
+    float high = 300.0f;
+    for (int iteration = 0; iteration < 24; ++iteration) {
+        const float middle = (low + high) * 0.5f;
+        Vector2 screen{};
+        if (!GetAimPointScreen(player, middle, screen)) return fallback;
+        // Screen Y decreases as world Z increases.
+        if (screen.y > wantedY) low = middle;
+        else high = middle;
+    }
+    return (low + high) * 0.5f;
+}
+
 bool IsAimPointVisible(const PlayerData& player, float height, float screenX, float screenY) {
     const Vector3 aimPoint{ player.pos.x, player.pos.y, player.pos.z + height };
     if (!clientBase || !currentLocalPositionReady) return false;
@@ -348,10 +368,11 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         ClearPendingSilentAngles();
     }
 
-    const bool aiming = aimSilentMode ? leftButtonDown : rightButtonDown;
+    const bool configuredAimKeyDown = (GetAsyncKeyState(aimAssistKey) & 0x8000) != 0;
+    const bool aiming = aimSilentMode ? leftButtonDown : configuredAimKeyDown;
     if (!aimAssist || menuOpen || !aiming || !currentViewMatrixReady) return;
 
-    const bool useDepthWallCheck = true;
+    const bool useDepthWallCheck = aimVisibilityCheck;
     const ImVec2 size = ImGui::GetIO().DisplaySize;
     const float cx = size.x * 0.5f;
     const float cy = size.y * 0.5f;
@@ -364,13 +385,26 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
 
     for (const auto& player : players) {
         const float modelHeight = player.modelHeight > 20.0f ? player.modelHeight : 80.0f;
-        float targetHeights[3] = { modelHeight * 0.45f, modelHeight * 0.60f, modelHeight * 0.90f };
+        // Resolve the target against the projected model bounds. SceneNode
+        // origin and collision Z offsets vary between hero classes, so a
+        // fixed percentage of modelHeight is not a reliable bone substitute.
+        const float modelMinZ = std::isfinite(player.modelMinZ) ? player.modelMinZ : 0.0f;
+        const float fallbackHead = modelMinZ + modelHeight * 0.92f;
+        const float fallbackBody = modelMinZ + modelHeight * 0.62f;
+        const float headHeight = ResolveAimHeightFromBox(player, 0.14f, fallbackHead);
+        const float bodyHeight = ResolveAimHeightFromBox(player, 0.42f, fallbackBody);
+        const float centerHeight = ResolveAimHeightFromBox(player, 0.58f, modelMinZ + modelHeight * 0.50f);
+        float targetHeights[3] = {
+            centerHeight,
+            bodyHeight,
+            headHeight
+        };
         int targetHeightCount = 3;
         if (aimTargetMode == AimTargetMode::Head) {
-            targetHeights[0] = modelHeight * 0.90f;
+            targetHeights[0] = headHeight;
             targetHeightCount = 1;
         } else if (aimTargetMode == AimTargetMode::Body) {
-            targetHeights[0] = modelHeight * 0.60f;
+            targetHeights[0] = bodyHeight;
             targetHeightCount = 1;
         }
         bool targetVisible = false;
@@ -432,6 +466,20 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     const LONG moveX = static_cast<LONG>((targetX - cx) / smooth);
     const LONG moveY = static_cast<LONG>((targetY - cy) / smooth);
     if (moveX || moveY) {
+        static int lastLoggedMode = -1;
+        static int lastLoggedHeight = -1;
+        const int modeValue = static_cast<int>(aimTargetMode);
+        const int loggedHeight = static_cast<int>(std::round(bestAimHeight));
+        if (modeValue != lastLoggedMode || loggedHeight != lastLoggedHeight) {
+            FILE* targetLog = nullptr;
+            if (fopen_s(&targetLog, "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\aim_target.log", "a") == 0 && targetLog) {
+                fprintf(targetLog, "mode=%d modelHeight=%.1f targetHeight=%.1f\n",
+                        modeValue, best->modelHeight, bestAimHeight);
+                fclose(targetLog);
+            }
+            lastLoggedMode = modeValue;
+            lastLoggedHeight = loggedHeight;
+        }
         if (aimSilentMode) {
             const Vector3 targetWorld{
                 best->pos.x,

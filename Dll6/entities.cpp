@@ -291,34 +291,53 @@ void DiscoverHeroVTables() {
     }
 }
 void RefreshHeroPawns() {
-    SYSTEM_INFO systemInfo{};
-    GetSystemInfo(&systemInfo);
-    uintptr_t cursor = reinterpret_cast<uintptr_t>(systemInfo.lpMinimumApplicationAddress);
-    const uintptr_t end = reinterpret_cast<uintptr_t>(systemInfo.lpMaximumApplicationAddress);
     std::vector<uintptr_t> found;
 
-    while (cursor < end && WaitForSingleObject(stopHeroDiscoveryEvent, 0) != WAIT_OBJECT_0) {
-        MEMORY_BASIC_INFORMATION memoryInfo{};
-        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &memoryInfo, sizeof(memoryInfo))) break;
-        const uintptr_t next = cursor + memoryInfo.RegionSize;
-        const DWORD readablePages = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                                   PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-        const bool readable = memoryInfo.State == MEM_COMMIT && !(memoryInfo.Protect & PAGE_GUARD) &&
-                              memoryInfo.Protect != PAGE_NOACCESS && (memoryInfo.Protect & readablePages);
-        if (readable && memoryInfo.Type == MEM_PRIVATE && !heroVTables.empty()) {
-            const uintptr_t regionEnd = cursor + memoryInfo.RegionSize;
-            for (uintptr_t address = cursor; address + sizeof(uintptr_t) <= regionEnd; address += sizeof(uintptr_t)) {
-                const uintptr_t vtable = Read<uintptr_t>(address);
-                if (std::find(heroVTables.begin(), heroVTables.end(), vtable) == heroVTables.end()) continue;
-                if (GetEntityClassName(address).find("CitadelPlayerPawn") == std::string::npos) continue;
-                const int health = Read<int>(address + Offsets::Health);
-                const uint8_t team = Read<uint8_t>(address + Offsets::Team);
-                Vector3 position{};
-                if (health < 0 || health > 10000 || (team != 2 && team != 3) || !GetEntityPosition(address, position)) continue;
-                found.push_back(address);
+    // The old implementation walked every committed private page in the
+    // process.  That is effectively an unbounded heap scan and is the reason
+    // the menu could remain on "searching" for minutes.  Heroes are already
+    // registered in CEntitySystem, so enumerate its 0x70-byte identities.
+    if (clientBase) {
+        const uintptr_t roots[] = {
+            Read<uintptr_t>(clientBase + Offsets::GameEntitySystem),
+            clientBase + Offsets::GameEntitySystem
+        };
+        const uintptr_t tableOffsets[] = { Offsets::EntityChunks, 0, 0x110, 0x100, 0x20 };
+        std::unordered_set<uintptr_t> seen;
+        const bool haveHeroVTables = !heroVTables.empty();
+
+        for (const uintptr_t root : roots) {
+            if (!root || WaitForSingleObject(stopHeroDiscoveryEvent, 0) == WAIT_OBJECT_0) break;
+            for (const uintptr_t tableOffset : tableOffsets) {
+                for (uint32_t chunkIndex = 0;
+                     chunkIndex <= (Offsets::MaxEntityIndex >> Offsets::HandleChunkShift);
+                     ++chunkIndex) {
+                    if (WaitForSingleObject(stopHeroDiscoveryEvent, 0) == WAIT_OBJECT_0) break;
+                    const uintptr_t chunk = Read<uintptr_t>(
+                        root + tableOffset + Offsets::EntityChunkStride * chunkIndex);
+                    if (!chunk) continue;
+
+                    for (uint32_t slot = 0; slot <= Offsets::HandleChunkMask; ++slot) {
+                        const uintptr_t identity = chunk + Offsets::EntityStride * slot;
+                        const uintptr_t entity = Read<uintptr_t>(identity);
+                        if (!entity || !seen.insert(entity).second) continue;
+
+                        if (haveHeroVTables) {
+                            const uintptr_t vtable = Read<uintptr_t>(entity);
+                            if (std::find(heroVTables.begin(), heroVTables.end(), vtable) == heroVTables.end()) continue;
+                        }
+
+                        const int health = Read<int>(entity + Offsets::Health);
+                        const uint8_t team = Read<uint8_t>(entity + Offsets::Team);
+                        if (health < 0 || health > 10000 || (team != 2 && team != 3)) continue;
+                        if (GetEntityClassName(entity).find("CitadelPlayerPawn") == std::string::npos) continue;
+
+                        Vector3 position{};
+                        if (GetEntityPosition(entity, position)) found.push_back(entity);
+                    }
+                }
             }
         }
-        cursor = next;
     }
 
     std::sort(found.begin(), found.end());
@@ -333,10 +352,14 @@ void RefreshHeroPawns() {
         lastPawnCount = pawnCount;
         printf("[+] Hero pawns: %zu\n", lastPawnCount);
     }
+    espStatus.heroScanComplete = true;
 }
 
 DWORD WINAPI HeroDiscoveryWorker(LPVOID) {
     DiscoverHeroVTables();
+    if (heroVTables.empty()) {
+        printf("[!] Hero RTTI/vtable was not found; using entity-system class fallback\n");
+    }
     while (WaitForSingleObject(stopHeroDiscoveryEvent, 0) != WAIT_OBJECT_0) {
         RefreshHeroPawns();
         if (WaitForSingleObject(stopHeroDiscoveryEvent, 1000) == WAIT_OBJECT_0) break;
@@ -357,7 +380,14 @@ DWORD WINAPI GlowApplyWorker(LPVOID) {
             const int health = Read<int>(pawn + Offsets::Health);
             const uint8_t lifeState = Read<uint8_t>(pawn + Offsets::LifeState);
             const uint8_t team = Read<uint8_t>(pawn + Offsets::Team);
-            if (health > 0 && lifeState == 0 && (team == 2 || team == 3)) ApplyHeroGlow(pawn);
+            if (health > 0 && lifeState == 0 && (team == 2 || team == 3)) {
+                if (glowEnabled) {
+                    ApplyHeroGlow(pawn);
+                } else {
+                    Write<bool>(pawn + Offsets::Glow + Offsets::IsGlowing, false);
+                    Write<int>(pawn + Offsets::Glow + Offsets::GlowType, 0);
+                }
+            }
         }
 
         // The renderer clears m_bGlowing after consuming it. Reassert it on
