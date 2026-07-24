@@ -25,6 +25,57 @@ using GetUserCmdBySequenceFn = uintptr_t(__fastcall*)(uintptr_t, uint32_t);
 CreateMoveFn originalCreateMove = nullptr;
 void* createMoveTarget = nullptr;
 
+using GetAsyncKeyStateFn = SHORT(WINAPI*)(int);
+using GetKeyStateFn = SHORT(WINAPI*)(int);
+using GetKeyboardStateFn = BOOL(WINAPI*)(PBYTE);
+using GetRawInputDataFn = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
+using GetRawInputBufferFn = UINT(WINAPI*)(PRAWINPUT, PUINT, UINT);
+GetAsyncKeyStateFn originalGetAsyncKeyState = nullptr;
+GetKeyStateFn originalGetKeyState = nullptr;
+GetKeyboardStateFn originalGetKeyboardState = nullptr;
+GetRawInputDataFn originalGetRawInputData = nullptr;
+GetRawInputBufferFn originalGetRawInputBuffer = nullptr;
+
+SHORT WINAPI hkGetAsyncKeyState(int key) {
+    if (menuOpen) return 0;
+    return originalGetAsyncKeyState ? originalGetAsyncKeyState(key) : 0;
+}
+
+SHORT WINAPI hkGetKeyState(int key) {
+    if (menuOpen) return 0;
+    return originalGetKeyState ? originalGetKeyState(key) : 0;
+}
+
+BOOL WINAPI hkGetKeyboardState(PBYTE state) {
+    if (menuOpen) {
+        if (state) ZeroMemory(state, 256);
+        return TRUE;
+    }
+    return originalGetKeyboardState ? originalGetKeyboardState(state) : FALSE;
+}
+
+UINT WINAPI hkGetRawInputData(HRAWINPUT handle, UINT command, LPVOID data, PUINT size, UINT headerSize) {
+    if (menuOpen) {
+        if (size) *size = 0;
+        SetLastError(ERROR_ACCESS_DENIED);
+        return static_cast<UINT>(-1);
+    }
+    return originalGetRawInputData
+        ? originalGetRawInputData(handle, command, data, size, headerSize)
+        : static_cast<UINT>(-1);
+}
+
+UINT WINAPI hkGetRawInputBuffer(PRAWINPUT data, PUINT size, UINT headerSize) {
+    if (menuOpen) {
+        if (size) *size = 0;
+        SetLastError(ERROR_ACCESS_DENIED);
+        return static_cast<UINT>(-1);
+    }
+    return originalGetRawInputBuffer
+        ? originalGetRawInputBuffer(data, size, headerSize)
+        : static_cast<UINT>(-1);
+}
+
 uintptr_t GetCurrentController() {
     if (!currentLocalPawn) return 0;
     const uint32_t handle = Read<uint32_t>(currentLocalPawn + Offsets::PawnController);
@@ -188,6 +239,53 @@ void RemoveUserCmdHook() {
     }
 }
 
+bool InstallInputLockHooks() {
+    const MH_STATUS initStatus = MH_Initialize();
+    if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED) return false;
+
+    const MH_STATUS keyStatus = MH_CreateHookApi(
+        L"user32", "GetAsyncKeyState", reinterpret_cast<LPVOID>(&hkGetAsyncKeyState),
+        reinterpret_cast<LPVOID*>(&originalGetAsyncKeyState));
+    const MH_STATUS keyStateStatus = MH_CreateHookApi(
+        L"user32", "GetKeyState", reinterpret_cast<LPVOID>(&hkGetKeyState),
+        reinterpret_cast<LPVOID*>(&originalGetKeyState));
+    const MH_STATUS keyboardStatus = MH_CreateHookApi(
+        L"user32", "GetKeyboardState", reinterpret_cast<LPVOID>(&hkGetKeyboardState),
+        reinterpret_cast<LPVOID*>(&originalGetKeyboardState));
+    const MH_STATUS rawStatus = MH_CreateHookApi(
+        L"user32", "GetRawInputData", reinterpret_cast<LPVOID>(&hkGetRawInputData),
+        reinterpret_cast<LPVOID*>(&originalGetRawInputData));
+    const MH_STATUS rawBufferStatus = MH_CreateHookApi(
+        L"user32", "GetRawInputBuffer", reinterpret_cast<LPVOID>(&hkGetRawInputBuffer),
+        reinterpret_cast<LPVOID*>(&originalGetRawInputBuffer));
+    if ((keyStatus != MH_OK && keyStatus != MH_ERROR_ALREADY_CREATED) ||
+        (keyStateStatus != MH_OK && keyStateStatus != MH_ERROR_ALREADY_CREATED) ||
+        (keyboardStatus != MH_OK && keyboardStatus != MH_ERROR_ALREADY_CREATED) ||
+        (rawBufferStatus != MH_OK && rawBufferStatus != MH_ERROR_ALREADY_CREATED) ||
+        (rawStatus != MH_OK && rawStatus != MH_ERROR_ALREADY_CREATED)) return false;
+
+    const MH_STATUS enableStatus = MH_EnableHook(MH_ALL_HOOKS);
+    return enableStatus == MH_OK || enableStatus == MH_ERROR_ENABLED;
+}
+
+void RemoveInputLockHooks() {
+    MH_DisableHook(reinterpret_cast<LPVOID>(GetAsyncKeyState));
+    MH_DisableHook(reinterpret_cast<LPVOID>(GetKeyState));
+    MH_DisableHook(reinterpret_cast<LPVOID>(GetKeyboardState));
+    MH_DisableHook(reinterpret_cast<LPVOID>(GetRawInputData));
+    MH_DisableHook(reinterpret_cast<LPVOID>(GetRawInputBuffer));
+    MH_RemoveHook(reinterpret_cast<LPVOID>(GetAsyncKeyState));
+    MH_RemoveHook(reinterpret_cast<LPVOID>(GetKeyState));
+    MH_RemoveHook(reinterpret_cast<LPVOID>(GetKeyboardState));
+    MH_RemoveHook(reinterpret_cast<LPVOID>(GetRawInputData));
+    MH_RemoveHook(reinterpret_cast<LPVOID>(GetRawInputBuffer));
+    originalGetAsyncKeyState = nullptr;
+    originalGetKeyState = nullptr;
+    originalGetKeyboardState = nullptr;
+    originalGetRawInputData = nullptr;
+    originalGetRawInputBuffer = nullptr;
+}
+
 void SetupHooks() {
     // Create an isolated D3D11 swap chain solely to obtain the shared Present vtable.
     HWND tempWindow = CreateWindowExA(
@@ -334,6 +432,7 @@ DWORD WINAPI InitializeThread(LPVOID) {
         }
     }
     printf("[+] CreateMove hook: %s\n", InstallCreateMoveHook(userCmdFunctions) ? "installed" : "not installed");
+    printf("[+] Input lock hooks: %s\n", InstallInputLockHooks() ? "installed" : "not installed");
     SetupHooks();
     return 0;
 }

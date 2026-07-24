@@ -16,6 +16,7 @@ void RestorePresentHook() {
 
 void ShutdownOverlay() {
     RemoveUserCmdHook();
+    RemoveInputLockHooks();
     RemoveMeleeStateMonitor();
     if (stopHeroDiscoveryEvent) SetEvent(stopHeroDiscoveryEvent);
     if (heroDiscoveryThread) {
