@@ -146,18 +146,42 @@ uintptr_t GetCurrentUserCmd() {
     return getBySequence(controller, sequence);
 }
 
+void PatchInputHistory(uintptr_t userCmd, const Vector3& angles);
+
 void ApplyPendingUserCmdAngles(uintptr_t userCmd) {
     if (!userCmd || (!aimSilentMode && !farmSilentMode && !autoLastHitOrbs)) return;
     Vector3 angles{};
     bool attack = false;
+    bool ready = false;
     {
-        std::lock_guard<std::mutex> lock(silentAnglesMutex);
-        if (!pendingSilentAnglesReady) return;
-        angles = pendingSilentAngles;
-        attack = pendingSilentAttack;
-        pendingSilentAnglesReady = false;
-        pendingSilentAttack = false;
+        if (autoLastHitOrbs) {
+            std::lock_guard<std::mutex> lock(orbSilentMutex);
+            if (pendingOrbReady) {
+                angles = pendingOrbAngles;
+                attack = pendingOrbAttack;
+                pendingOrbReady = false;
+                pendingOrbAttack = false;
+                ready = true;
+            }
+        }
+        if (!ready && aimSilentMode) {
+            std::lock_guard<std::mutex> lock(humanSilentMutex);
+            if (pendingHumanReady) {
+                angles = pendingHumanAngles;
+                pendingHumanReady = false;
+                ready = true;
+            }
+        }
+        if (!ready && farmSilentMode) {
+            std::lock_guard<std::mutex> lock(creepSilentMutex);
+            if (pendingCreepReady) {
+                angles = pendingCreepAngles;
+                pendingCreepReady = false;
+                ready = true;
+            }
+        }
     }
+    if (!ready) return;
 
     auto* command = reinterpret_cast<CUserCmd*>(userCmd);
     auto* viewAngles = command->cmd.mutable_ang_camera_angles();

@@ -99,8 +99,38 @@ Vector3 NormalizeAimAngles(Vector3 angles) {
 }
 
 void ClearPendingSilentAngles() {
-    std::lock_guard<std::mutex> lock(silentAnglesMutex);
-    pendingSilentAnglesReady = false;
+    std::lock_guard<std::mutex> lock(humanSilentMutex);
+    pendingHumanReady = false;
+}
+
+bool silentFlickActive = false;
+LONG silentReturnX = 0;
+LONG silentReturnY = 0;
+
+void RestoreSilentFlick() {
+    if (!silentFlickActive) return;
+    INPUT input{};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_MOVE;
+    input.mi.dx = silentReturnX;
+    input.mi.dy = silentReturnY;
+    SendInput(1, &input, sizeof(input));
+    silentFlickActive = false;
+    silentReturnX = 0;
+    silentReturnY = 0;
+}
+
+void ApplySilentFlick(LONG moveX, LONG moveY) {
+    if (!moveX && !moveY) return;
+    INPUT input{};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_MOVE;
+    input.mi.dx = moveX;
+    input.mi.dy = moveY;
+    SendInput(1, &input, sizeof(input));
+    silentReturnX -= moveX;
+    silentReturnY -= moveY;
+    silentFlickActive = true;
 }
 
 }
@@ -544,9 +574,12 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
             // Trooper scene origins are near the feet. Use the actual head
             // bone so creep aim does not converge on the pelvis.
             GetEntityBonePosition(target.entity, "head", point);
-            // Use the same world trace as normal aim assist. A creep behind
-            // a wall is rejected before it can become the best target.
-            if (!IsWorldAimPointVisible(point)) continue;
+            // Use the trace only when the current client exposes a valid
+            // physics context. If it is unavailable, do not discard every
+            // creep; orb aim already follows this safe fallback.
+            const bool traceAvailable = clientBase &&
+                Read<uintptr_t>(clientBase + PhysicsTraceContextRva) != 0;
+            if (aimVisibilityCheck && traceAvailable && !IsWorldAimPointVisible(point)) continue;
             if (!WorldToScreen(point, screen, currentViewMatrix)) continue;
             const float dx = screen.x - cx;
             const float dy = screen.y - cy;
@@ -559,17 +592,20 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
         }
     }
     if (!best.entity) {
-        std::lock_guard<std::mutex> lock(silentAnglesMutex);
-        pendingSilentAttack = false;
+        if (farmSilentMode) RestoreSilentFlick();
         return;
     }
 
     if (farmSilentMode) {
-        Vector3 commandAngles{};
-        if (GetAimAnglesFromScreen(bestScreen.x, bestScreen.y, commandAngles)) {
-            std::lock_guard<std::mutex> lock(silentAnglesMutex);
-            pendingSilentAngles = commandAngles;
-            pendingSilentAnglesReady = true;
+        Vector3 targetWorld{ best.pos.x, best.pos.y, best.pos.z + 24.0f };
+        GetEntityBonePosition(best.entity, "head", targetWorld);
+        const Vector3 cameraOrigin = currentCameraPositionReady
+            ? currentCameraPosition : currentLocalPosition;
+        const Vector3 commandAngles = CalculateAimAngles(cameraOrigin, targetWorld);
+        if (std::isfinite(commandAngles.x) && std::isfinite(commandAngles.y)) {
+        std::lock_guard<std::mutex> lock(creepSilentMutex);
+        pendingCreepAngles = commandAngles;
+        pendingCreepReady = true;
         }
         return;
     }
@@ -598,9 +634,9 @@ void AutoLastHitOrbs() {
     else if (!autoLastHitOrbsToggleMode) autoLastHitOrbsActive = configuredKeyDown;
     const bool orbAimActive = autoLastHitOrbs && autoLastHitOrbsActive;
     if (!orbAimActive || menuOpen || !currentViewMatrixReady) {
-        std::lock_guard<std::mutex> lock(silentAnglesMutex);
-        pendingSilentAttack = false;
-        pendingSilentAnglesReady = false;
+        std::lock_guard<std::mutex> lock(orbSilentMutex);
+        pendingOrbAttack = false;
+        pendingOrbReady = false;
         return;
     }
 
@@ -628,7 +664,13 @@ void AutoLastHitOrbs() {
             // hitbox until CItemXP.m_flAttackableTime has elapsed.
             if (!IsXpOrbAttackable(orb.entity)) continue;
             Vector3 point{};
-            if (!GetXpOrbPosition(orb.entity, point)) point = orb.pos;
+            // Keep orb aim on the same stable world position as Orb ESP.
+            // RenderOrigin can be a view-dependent render-cache coordinate;
+            // AbsOrigin is the networked position used by the entity itself.
+            if (!GetEntityPosition(orb.entity, point) &&
+                !GetXpOrbPosition(orb.entity, point)) {
+                point = orb.pos;
+            }
             if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) continue;
             const bool traceAvailable = clientBase &&
                 Read<uintptr_t>(clientBase + PhysicsTraceContextRva) != 0;
@@ -649,9 +691,9 @@ void AutoLastHitOrbs() {
         }
     }
     if (!best.entity) {
-        std::lock_guard<std::mutex> lock(silentAnglesMutex);
-        pendingSilentAttack = false;
-        pendingSilentAnglesReady = false;
+        std::lock_guard<std::mutex> lock(orbSilentMutex);
+        pendingOrbAttack = false;
+        pendingOrbReady = false;
         lastOrb = 0;
         lastAttackApplied = 0;
         return;
@@ -685,10 +727,10 @@ void AutoLastHitOrbs() {
          (attackPulsesApplied == 1 && now - lastAttackApplied >= secondAttackDelay)) &&
         now - attackStarted < 800;
     {
-        std::lock_guard<std::mutex> lock(silentAnglesMutex);
-        pendingSilentAngles = commandAngles;
-        pendingSilentAttack = fire;
-        pendingSilentAnglesReady = true;
+        std::lock_guard<std::mutex> lock(orbSilentMutex);
+        pendingOrbAngles = commandAngles;
+        pendingOrbAttack = fire;
+        pendingOrbReady = true;
     }
     static ULONGLONG lastOrbLog = 0;
     if (now - lastOrbLog >= 1000) {
@@ -746,22 +788,18 @@ bool IsWorldAimPointVisible(const Vector3& point) {
 void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     const bool leftButtonDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     const bool rightButtonDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
-
-    if (!aimSilentMode || !leftButtonDown) {
-        ClearPendingSilentAngles();
-    }
-
+    if (!aimSilentMode || !leftButtonDown) ClearPendingSilentAngles();
     const bool configuredAimKeyDown = (GetAsyncKeyState(aimAssistKey) & 0x8000) != 0;
     const bool configuredAimKeyPressed = configuredAimKeyDown && !aimToggleLastDown;
     if (aimToggleMode && configuredAimKeyPressed) aimToggleActive = !aimToggleActive;
     aimToggleLastDown = configuredAimKeyDown;
     const bool keyActive = aimToggleMode ? aimToggleActive : configuredAimKeyDown;
-    // Toggle controls the aim key in both normal and silent modes. Silent aim
-    // still applies only while firing, but no longer silently bypasses toggle.
-    const bool aiming = keyActive && (!aimSilentMode || leftButtonDown);
+    const bool aiming = aimSilentMode ? (keyActive && leftButtonDown) : keyActive;
     if (!aimAssist || menuOpen || !aiming || !currentViewMatrixReady) return;
 
-    const bool useDepthWallCheck = aimVisibilityCheck;
+    const bool traceAvailable = clientBase &&
+        Read<uintptr_t>(clientBase + PhysicsTraceContextRva) != 0;
+    const bool useDepthWallCheck = aimVisibilityCheck && traceAvailable;
     const ImVec2 size = ImGui::GetIO().DisplaySize;
     const float cx = size.x * 0.5f;
     const float cy = size.y * 0.5f;
@@ -777,8 +815,6 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         const float modelMinZ = std::isfinite(player.modelMinZ) ? player.modelMinZ : 0.0f;
         const float fallbackHead = modelMinZ + modelHeight * 0.92f;
         const float fallbackBody = modelMinZ + modelHeight * 0.62f;
-        // This is used only when the model has not exposed its skeleton yet.
-        // Normal aiming uses the actual head bone below.
         const float headHeight = ResolveAimHeightFromBox(player, 0.12f, fallbackHead);
         const float bodyHeight = ResolveAimHeightFromBox(player, 0.60f, fallbackBody);
         const float centerHeight = ResolveAimHeightFromBox(player, 0.50f, modelMinZ + modelHeight * 0.50f);
@@ -856,26 +892,12 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     const LONG moveX = static_cast<LONG>((targetX - cx) / smooth);
     const LONG moveY = static_cast<LONG>((targetY - cy) / smooth);
     if (moveX || moveY) {
-        static int lastLoggedMode = -1;
-        static int lastLoggedHeight = -1;
-        const int modeValue = static_cast<int>(aimTargetMode);
-        const int loggedHeight = static_cast<int>(std::round(bestAimHeight));
-        if (modeValue != lastLoggedMode || loggedHeight != lastLoggedHeight) {
-            FILE* targetLog = nullptr;
-            if (fopen_s(&targetLog, "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\aim_target.log", "a") == 0 && targetLog) {
-                fprintf(targetLog, "mode=%d modelHeight=%.1f targetHeight=%.1f\n",
-                        modeValue, best->modelHeight, bestAimHeight);
-                fclose(targetLog);
-            }
-            lastLoggedMode = modeValue;
-            lastLoggedHeight = loggedHeight;
-        }
         if (aimSilentMode) {
             Vector3 commandAngles{};
             if (GetAimAnglesFromScreen(targetX, targetY, commandAngles)) {
-                std::lock_guard<std::mutex> lock(silentAnglesMutex);
-                pendingSilentAngles = commandAngles;
-                pendingSilentAnglesReady = true;
+                std::lock_guard<std::mutex> lock(humanSilentMutex);
+                pendingHumanAngles = commandAngles;
+                pendingHumanReady = true;
             }
         }
         if (!aimSilentMode) {

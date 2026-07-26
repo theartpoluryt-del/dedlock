@@ -327,11 +327,25 @@ void RenderESP(const std::vector<PlayerData>& players) {
             orbs = orbTargets;
         }
         for (const auto& orb : orbs) {
-            Vector3 position{};
-            const bool hasLivePosition = GetXpOrbPosition(orb.entity, position);
-            if (!hasLivePosition) position = orb.pos;
-            if (!std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z)) continue;
-            if (hasLivePosition) {
+            Vector3 position = orb.pos;
+            Vector2 screen{};
+            bool projected = false;
+            Vector3 candidate{};
+            // Use the networked/absolute entity origin first. RenderOrigin is
+            // a render-cache value and can be updated differently depending
+            // on which side of the entity the camera is viewing from.
+            if (GetEntityPosition(orb.entity, candidate)) {
+                projected = WorldToScreen(candidate, screen, currentViewMatrix);
+                if (projected) position = candidate;
+            }
+            if (!projected && GetXpOrbPosition(orb.entity, candidate)) {
+                projected = WorldToScreen(candidate, screen, currentViewMatrix);
+                if (projected) position = candidate;
+            }
+            if (!projected) projected = WorldToScreen(position, screen, currentViewMatrix);
+            if (!projected || !std::isfinite(position.x) || !std::isfinite(position.y) ||
+                !std::isfinite(position.z)) continue;
+            if (projected) {
                 std::lock_guard<std::mutex> lock(orbTargetsMutex);
                 for (auto& cachedOrb : orbTargets) {
                     if ((orb.handle != 0 && cachedOrb.handle == orb.handle) || cachedOrb.entity == orb.entity) {
@@ -340,8 +354,6 @@ void RenderESP(const std::vector<PlayerData>& players) {
                     }
                 }
             }
-            Vector2 screen{};
-            if (!WorldToScreen(position, screen, currentViewMatrix)) continue;
             const ImVec2 point(screen.x, screen.y);
             const uint8_t localTeam = currentLocalPawn
                 ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;

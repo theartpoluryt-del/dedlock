@@ -128,7 +128,11 @@ bool GetEntityPosition(uintptr_t entity, Vector3& position) {
     const uintptr_t sceneNode = Read<uintptr_t>(entity + Offsets::GameSceneNode);
     if (sceneNode) {
         position = Read<Vector3>(sceneNode + Offsets::SceneNodeAbsOrigin);
-        if (std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z)) {
+        if (std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z) &&
+            std::fabs(position.x) < 100000.0f && std::fabs(position.y) < 100000.0f &&
+            std::fabs(position.z) < 100000.0f &&
+            (std::fabs(position.x) > 0.01f || std::fabs(position.y) > 0.01f ||
+             std::fabs(position.z) > 0.01f)) {
             return true;
         }
     }
@@ -657,12 +661,13 @@ void RefreshFarmTargets() {
     std::vector<FarmTarget> found;
     std::vector<OrbTarget> foundOrbs;
     struct OrbMotionState {
-        Vector3 position{};
+        Vector3 visualPosition{};
+        Vector3 entityPosition{};
+        bool hasEntityPosition{};
         ULONGLONG lastSeen{};
         uint8_t stationarySamples{};
     };
     static std::unordered_map<uintptr_t, OrbMotionState> orbMotion;
-    constexpr float kMinimumOrbMovement = 0.05f;
     if (!clientBase) return;
     // The current dump identifies this as a pointer to the client entity
     // system. Its entity identity chunk array starts at +0x10. Do not scan
@@ -713,36 +718,61 @@ void RefreshFarmTargets() {
                         IsSoulDesignerName(designerName);
                     if (isOrb) {
                         Vector3 position{};
-                        if (!GetXpOrbPosition(entity, position)) continue;
+                        bool hasPosition = GetXpOrbPosition(entity, position);
+                        if (!hasPosition) hasPosition = GetEntityPosition(entity, position);
+                        if (!hasPosition) continue;
 
-                        // A soul is a flying entity. Once its position stops
-                        // changing it has already popped or been recycled;
-                        // don't keep its last ESP marker on screen.
-                        auto& motion = orbMotion[entity];
+                        // RenderOrigin is the visual point used for drawing,
+                        // but it can remain unchanged while the networked
+                        // entity is still travelling. Use the entity origin
+                        // exclusively for the stopped-state test.
+                        Vector3 motionPosition{};
+                        const bool hasMotionPosition = GetEntityPosition(entity, motionPosition);
+                        if (!hasMotionPosition) motionPosition = position;
+
+                        // A valid position that is unchanged for two complete
+                        // scans means the orb has already disappeared. A
+                        // single unchanged sample is retained so slow orbs do
+                        // not flicker out of ESP.
+                        // Entity pointers are recycled by the game. The
+                        // handle identifies the current orb lifetime, so a
+                        // newly spawned orb must not inherit the old orb's
+                        // stationary counter.
+                        const uintptr_t motionKey = storedHandle != 0
+                            ? static_cast<uintptr_t>(storedHandle) : entity;
+                        auto& motion = orbMotion[motionKey];
                         const bool newEntity = motion.lastSeen == 0 ||
                             now - motion.lastSeen > 1000;
                         if (newEntity) {
-                            motion.position = position;
+                            motion.visualPosition = position;
+                            motion.entityPosition = motionPosition;
+                            motion.hasEntityPosition = hasMotionPosition;
                             motion.stationarySamples = 0;
                         } else {
-                            const float dx = position.x - motion.position.x;
-                            const float dy = position.y - motion.position.y;
-                            const float dz = position.z - motion.position.z;
-                            if (dx * dx + dy * dy + dz * dz >=
-                                kMinimumOrbMovement * kMinimumOrbMovement) {
-                                motion.position = position;
+                            constexpr float kPositionEpsilon = 0.001f;
+                            const float visualDx = position.x - motion.visualPosition.x;
+                            const float visualDy = position.y - motion.visualPosition.y;
+                            const float visualDz = position.z - motion.visualPosition.z;
+                            const bool visualMoved = visualDx * visualDx + visualDy * visualDy +
+                                visualDz * visualDz > kPositionEpsilon * kPositionEpsilon;
+                            const float entityDx = motionPosition.x - motion.entityPosition.x;
+                            const float entityDy = motionPosition.y - motion.entityPosition.y;
+                            const float entityDz = motionPosition.z - motion.entityPosition.z;
+                            const bool entityMoved = hasMotionPosition && motion.hasEntityPosition &&
+                                entityDx * entityDx + entityDy * entityDy + entityDz * entityDz >
+                                kPositionEpsilon * kPositionEpsilon;
+                            if (visualMoved || entityMoved) {
+                                motion.visualPosition = position;
+                                motion.entityPosition = motionPosition;
+                                motion.hasEntityPosition = hasMotionPosition;
                                 motion.stationarySamples = 0;
                             } else if (motion.stationarySamples < UINT8_MAX) {
                                 ++motion.stationarySamples;
                             }
                         }
                         motion.lastSeen = now;
-                        // The first sample establishes the previous position;
-                        // the next unchanged sample confirms that the orb has
-                        // stopped and it must disappear from ESP immediately.
-                        if (motion.stationarySamples >= 1) {
-                            continue;
-                        }
+                        if (motion.stationarySamples >= 2) continue;
+
                         foundOrbs.push_back({ entity, position,
                             designerName.empty() ? className : designerName, storedHandle,
                             Read<uint8_t>(entity + Offsets::Team) });
