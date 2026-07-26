@@ -1,7 +1,35 @@
 #include "shared.h"
 #include <fstream>
+#include <cstring>
 
 #define printf(...) do { } while (0)
+
+namespace {
+
+constexpr char kMeleeChargeSound[] = "Player.Melee.Hold.Shared";
+constexpr ULONGLONG kMeleeSoundWindowMs = 600;
+// Deadlock world units used by this project: approximately 200 units ~= 2 m.
+constexpr float kSoundOnlyDistance = 200.0f;
+constexpr float kLastMomentDistance = 100.0f;
+constexpr float kMinApproachSpeed = 50.0f;
+constexpr float kDefaultParryDelayMs = 500.0f;
+constexpr float kCloseParryDelayMs = 250.0f;
+
+std::mutex parrySoundMutex;
+std::unordered_map<uint32_t, ULONGLONG> meleeSoundUntil;
+
+} // namespace
+
+void NotifyParrySound(int entityIndex, const char* soundName) {
+    if (!autoParry || entityIndex <= 0 || !soundName ||
+        std::strcmp(soundName, kMeleeChargeSound) != 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(parrySoundMutex);
+    meleeSoundUntil[static_cast<uint32_t>(entityIndex) & Offsets::HandleIndexMask] =
+        GetTickCount64() + kMeleeSoundWindowMs;
+}
 
 static void WriteSpeedMeasurement(uintptr_t pawn, uint8_t team, float distance, float closingSpeed) {
     static std::unordered_map<uintptr_t, ULONGLONG> lastWritten;
@@ -67,6 +95,7 @@ void AutoParry(const std::vector<PlayerData>&) {
         Vector3 position{};
         ULONGLONG time = 0;
         ULONGLONG armedUntil = 0;
+        ULONGLONG parryAt = 0;
         float closingSpeed = 0.0f;
     };
     static std::unordered_map<uintptr_t, MotionSample> enemyMotion;
@@ -216,17 +245,65 @@ void AutoParry(const std::vector<PlayerData>&) {
         const float closingAcceleration = current.closingSpeed - previous.closingSpeed;
         WriteSpeedMeasurement(pawn, Read<uint8_t>(pawn + Offsets::Team), distance, closingSpeed);
         current.armedUntil = previous.armedUntil;
+        current.parryAt = previous.parryAt;
         const bool rangedMeleeSignal = distance > 400.0f &&
             enemySpeed >= 748.0f && enemySpeed <= 752.0f;
         const bool closeMeleeSignal = distance <= 400.0f &&
             enemySpeed >= 400.0f &&
             speedAcceleration >= 1700.0f && speedAcceleration <= 2000.0f;
-        if (distance <= 900.0f && (rangedMeleeSignal || closeMeleeSignal))
+
+        bool soundMeleeSignal = false;
+        {
+            uint32_t pawnEntityIndex = 0;
+            const uintptr_t identity = Read<uintptr_t>(pawn + 0x10);
+            if (identity)
+                pawnEntityIndex = Read<uint32_t>(identity + 0x10) & Offsets::HandleIndexMask;
+
+            std::lock_guard<std::mutex> lock(parrySoundMutex);
+            const auto soundIt = meleeSoundUntil.find(pawnEntityIndex);
+            if (soundIt != meleeSoundUntil.end()) {
+                soundMeleeSignal = soundIt->second >= now;
+                if (!soundMeleeSignal)
+                    meleeSoundUntil.erase(soundIt);
+            }
+        }
+
+        const bool soundOnlyRange = distance <= kSoundOnlyDistance;
+        const bool movementMeleeSignal = rangedMeleeSignal || closeMeleeSignal;
+
+        // At close range require the sound. Outside the 2 m zone, retain the
+        // previous speed/acceleration detection and also accept the sound.
+        const bool parrySignal = distance <= 900.0f &&
+            (soundMeleeSignal || (!soundOnlyRange && movementMeleeSignal));
+        if (parrySignal) {
+            // Schedule once per signal. The delay is the estimated time to
+            // reach the last-moment distance, instead of pressing instantly.
+            if (previous.armedUntil < now || previous.parryAt == 0) {
+                if (soundOnlyRange && soundMeleeSignal) {
+                    // At 0-2 m use only the sound, with a short fixed delay.
+                    current.parryAt = now + static_cast<ULONGLONG>(kCloseParryDelayMs);
+                } else {
+                    // Use only the component directed toward the local player.
+                    // Total enemy speed is unsuitable here because strafing can
+                    // make the delay much too short or much too long.
+                    float delayMs = kDefaultParryDelayMs;
+                    if (current.closingSpeed > kMinApproachSpeed) {
+                        const float distanceToLastMoment =
+                            (std::max)(0.0f, distance - kLastMomentDistance);
+                        delayMs = distanceToLastMoment / current.closingSpeed * 1000.0f;
+                    }
+                    const ULONGLONG scheduledDelayMs = static_cast<ULONGLONG>(
+                        std::clamp(delayMs, 400.0f, 700.0f));
+                    current.parryAt = now + scheduledDelayMs;
+                }
+            }
             current.armedUntil = now + 500;
+        }
         enemyMotion[pawn] = current;
 
         if (heuristicParryEnabled && isEnemy(pawn) && distance <= 400.0f &&
-            current.armedUntil >= now && now - lastHeuristicParry >= 250) {
+            current.armedUntil >= now && current.parryAt <= now &&
+            now - lastHeuristicParry >= 250) {
             INPUT input{};
             input.type = INPUT_KEYBOARD;
             input.ki.wVk = 'F';
@@ -236,7 +313,20 @@ void AutoParry(const std::vector<PlayerData>&) {
             lastHeuristicParry = now;
             printf("[ParryHeuristic] parry sent distance=%.1f closing=%.1f pawn=0x%p\n",
                    distance, closingSpeed, reinterpret_cast<void*>(pawn));
+
+            // Consume the sound event so the same hold sound cannot trigger
+            // a second parry while its 600 ms signal window is still active.
+            const uintptr_t identity = Read<uintptr_t>(pawn + 0x10);
+            const uint32_t pawnEntityIndex = identity
+                ? Read<uint32_t>(identity + 0x10) & Offsets::HandleIndexMask
+                : 0;
+            if (pawnEntityIndex) {
+                std::lock_guard<std::mutex> lock(parrySoundMutex);
+                meleeSoundUntil.erase(pawnEntityIndex);
+            }
+
             current.armedUntil = 0;
+            current.parryAt = 0;
             enemyMotion[pawn] = current;
             return;
         }

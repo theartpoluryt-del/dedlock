@@ -1,4 +1,6 @@
 #include "shared.h"
+#include <fstream>
+#include <random>
 #include <sstream>
 
 // Temporary measurement mode: suppress verbose aim/parry diagnostics.
@@ -494,6 +496,209 @@ bool GetAimPointScreen(const PlayerData& player, float height, Vector2& screen) 
     return WorldToScreen(aimPoint, screen, currentViewMatrix);
 }
 
+void FarmAimAssist(const std::vector<PlayerData>& players) {
+    const bool configuredFarmKeyDown = (GetAsyncKeyState(farmAssistKey) & 0x8000) != 0;
+    const bool configuredFarmKeyPressed = configuredFarmKeyDown && !farmToggleLastDown;
+    if (farmAssist && farmToggleMode && configuredFarmKeyPressed) {
+        farmToggleActive = !farmToggleActive;
+    }
+    farmToggleLastDown = configuredFarmKeyDown;
+    if (!farmAssist) {
+        farmToggleActive = false;
+        return;
+    }
+    const bool farmAiming = farmToggleMode ? farmToggleActive : configuredFarmKeyDown;
+    if (menuOpen || !currentViewMatrixReady || !farmAiming) return;
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const float cx = display.x * 0.5f;
+    const float cy = display.y * 0.5f;
+    const float heroSuppressRadius = farmFov * 1.5f;
+    for (const auto& player : players) {
+        Vector2 screen{};
+        const Vector3 point = player.hasBodyBone
+            ? player.bodyPos : Vector3{ player.pos.x, player.pos.y, player.pos.z + 24.0f };
+        if (!WorldToScreen(point, screen, currentViewMatrix)) continue;
+        const float dx = screen.x - cx;
+        const float dy = screen.y - cy;
+        if (dx * dx + dy * dy <= heroSuppressRadius * heroSuppressRadius) return;
+    }
+
+    FarmTarget best{};
+    Vector2 bestScreen{};
+    float bestDistance = farmFov * farmFov;
+    const uint8_t localTeam = currentLocalPawn
+        ? Read<uint8_t>(currentLocalPawn + Offsets::Team)
+        : 0;
+    {
+        std::lock_guard lock(farmTargetsMutex);
+        for (const auto& target : farmTargets) {
+            if (localTeam != 0 && target.team == localTeam) continue;
+            if (!target.entity || Read<int>(target.entity + Offsets::Health) <= 0 ||
+                Read<uint8_t>(target.entity + Offsets::LifeState) != 0 ||
+                Read<uint32_t>(target.entity + Offsets::NPCState) == 5 ||
+                Read<uint32_t>(target.entity + Offsets::NPCState) == 6 ||
+                Read<uint8_t>(target.entity + Offsets::FadeCorpse) != 0) continue;
+            Vector2 screen{};
+            Vector3 point{ target.pos.x, target.pos.y, target.pos.z + 24.0f };
+            // Trooper scene origins are near the feet. Use the actual head
+            // bone so creep aim does not converge on the pelvis.
+            GetEntityBonePosition(target.entity, "head", point);
+            // Use the same world trace as normal aim assist. A creep behind
+            // a wall is rejected before it can become the best target.
+            if (!IsWorldAimPointVisible(point)) continue;
+            if (!WorldToScreen(point, screen, currentViewMatrix)) continue;
+            const float dx = screen.x - cx;
+            const float dy = screen.y - cy;
+            const float distance = dx * dx + dy * dy;
+            if (distance < bestDistance) {
+                best = target;
+                bestScreen = screen;
+                bestDistance = distance;
+            }
+        }
+    }
+    if (!best.entity) {
+        std::lock_guard<std::mutex> lock(silentAnglesMutex);
+        pendingSilentAttack = false;
+        return;
+    }
+
+    if (farmSilentMode) {
+        Vector3 commandAngles{};
+        if (GetAimAnglesFromScreen(bestScreen.x, bestScreen.y, commandAngles)) {
+            std::lock_guard<std::mutex> lock(silentAnglesMutex);
+            pendingSilentAngles = commandAngles;
+            pendingSilentAnglesReady = true;
+        }
+        return;
+    }
+
+    const float smooth = farmAimSmooth < 1.0f ? 1.0f : farmAimSmooth;
+    const LONG moveX = static_cast<LONG>((bestScreen.x - cx) / smooth);
+    const LONG moveY = static_cast<LONG>((bestScreen.y - cy) / smooth);
+    if (!moveX && !moveY) return;
+    INPUT input{};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_MOVE;
+    input.mi.dx = moveX;
+    input.mi.dy = moveY;
+    SendInput(1, &input, sizeof(input));
+}
+
+void AutoLastHitOrbs() {
+    static bool orbToggleLastDown = false;
+    const bool configuredKeyDown = (GetAsyncKeyState(autoLastHitOrbsKey) & 0x8000) != 0;
+    const bool configuredKeyPressed = configuredKeyDown && !orbToggleLastDown;
+    if (autoLastHitOrbs && autoLastHitOrbsToggleMode && configuredKeyPressed) {
+        autoLastHitOrbsActive = !autoLastHitOrbsActive;
+    }
+    orbToggleLastDown = configuredKeyDown;
+    if (!autoLastHitOrbs) autoLastHitOrbsActive = false;
+    else if (!autoLastHitOrbsToggleMode) autoLastHitOrbsActive = configuredKeyDown;
+    const bool orbAimActive = autoLastHitOrbs && autoLastHitOrbsActive;
+    if (!orbAimActive || menuOpen || !currentViewMatrixReady) {
+        std::lock_guard<std::mutex> lock(silentAnglesMutex);
+        pendingSilentAttack = false;
+        pendingSilentAnglesReady = false;
+        return;
+    }
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const float centerX = display.x * 0.5f;
+    const float centerY = display.y * 0.5f;
+    OrbTarget best{};
+    Vector2 bestScreen{};
+    float bestDistance = FLT_MAX;
+    static uintptr_t lastOrb = 0;
+    static LONG attackBaseline = 0;
+    static ULONGLONG attackStarted = 0;
+    static ULONGLONG lastAttackApplied = 0;
+    static uint8_t attackPulsesApplied = 0;
+    static ULONGLONG firstAttackDelay = 0;
+    static ULONGLONG secondAttackDelay = 45;
+    static std::mt19937 jitterRng{ std::random_device{}() };
+    static std::uniform_int_distribution<int> firstDelayDistribution(0, 35);
+    static std::uniform_int_distribution<int> secondDelayDistribution(35, 80);
+    {
+        std::lock_guard<std::mutex> lock(orbTargetsMutex);
+        for (const auto& orb : orbTargets) {
+            if (!orb.entity) continue;
+            // The orb is visible immediately after launch, but it has no
+            // hitbox until CItemXP.m_flAttackableTime has elapsed.
+            if (!IsXpOrbAttackable(orb.entity)) continue;
+            Vector3 point{};
+            if (!GetXpOrbPosition(orb.entity, point)) point = orb.pos;
+            if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) continue;
+            const bool traceAvailable = clientBase &&
+                Read<uintptr_t>(clientBase + PhysicsTraceContextRva) != 0;
+            if (orbAimVisibilityCheck && traceAvailable && !IsWorldAimPointVisible(point)) continue;
+            Vector2 screen{};
+            if (!WorldToScreen(point, screen, currentViewMatrix)) continue;
+            if (screen.x < 0.0f || screen.y < 0.0f ||
+                screen.x > display.x || screen.y > display.y) continue;
+            const float dx = screen.x - centerX;
+            const float dy = screen.y - centerY;
+            const float distance = dx * dx + dy * dy;
+            if (distance < bestDistance) {
+                best = orb;
+                best.pos = point;
+                bestScreen = screen;
+                bestDistance = distance;
+            }
+        }
+    }
+    if (!best.entity) {
+        std::lock_guard<std::mutex> lock(silentAnglesMutex);
+        pendingSilentAttack = false;
+        pendingSilentAnglesReady = false;
+        lastOrb = 0;
+        lastAttackApplied = 0;
+        return;
+    }
+
+    Vector3 commandAngles{};
+    if (!GetAimAnglesFromScreen(bestScreen.x, bestScreen.y, commandAngles)) return;
+
+    const ULONGLONG now = GetTickCount64();
+    if (best.entity != lastOrb) {
+        lastOrb = best.entity;
+        attackBaseline = autoOrbAttackAppliedCount;
+        attackStarted = now;
+        lastAttackApplied = 0;
+        attackPulsesApplied = 0;
+        firstAttackDelay = static_cast<ULONGLONG>(firstDelayDistribution(jitterRng));
+        secondAttackDelay = static_cast<ULONGLONG>(secondDelayDistribution(jitterRng));
+    }
+    // Count only commands that actually reached CreateMove. Two pulses are
+    // enough to cover the moving hitbox while preventing repeated firing.
+    if (autoOrbAttackAppliedCount != attackBaseline) {
+        attackBaseline = autoOrbAttackAppliedCount;
+        lastAttackApplied = now;
+        if (attackPulsesApplied < 2) ++attackPulsesApplied;
+        if (attackPulsesApplied == 1) {
+            secondAttackDelay = static_cast<ULONGLONG>(secondDelayDistribution(jitterRng));
+        }
+    }
+    const bool fire = autoLastHitOrbsAutoFire && attackPulsesApplied < 2 &&
+        ((attackPulsesApplied == 0 && now - attackStarted >= firstAttackDelay) ||
+         (attackPulsesApplied == 1 && now - lastAttackApplied >= secondAttackDelay)) &&
+        now - attackStarted < 800;
+    {
+        std::lock_guard<std::mutex> lock(silentAnglesMutex);
+        pendingSilentAngles = commandAngles;
+        pendingSilentAttack = fire;
+        pendingSilentAnglesReady = true;
+    }
+    static ULONGLONG lastOrbLog = 0;
+    if (now - lastOrbLog >= 1000) {
+        std::ofstream log("C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\orb_runtime.log", std::ios::app);
+        if (log) log << "target class=" << best.className << " screen=" << bestScreen.x << ','
+                     << bestScreen.y << " attack=" << (fire ? 1 : 0) << "\n";
+        lastOrbLog = now;
+    }
+}
+
 bool GetWorldAimPointScreen(const Vector3& point, Vector2& screen) {
     return currentViewMatrixReady && WorldToScreen(point, screen, currentViewMatrix);
 }
@@ -550,8 +755,10 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     const bool configuredAimKeyPressed = configuredAimKeyDown && !aimToggleLastDown;
     if (aimToggleMode && configuredAimKeyPressed) aimToggleActive = !aimToggleActive;
     aimToggleLastDown = configuredAimKeyDown;
-    const bool aiming = aimSilentMode ? leftButtonDown
-                                     : (aimToggleMode ? aimToggleActive : configuredAimKeyDown);
+    const bool keyActive = aimToggleMode ? aimToggleActive : configuredAimKeyDown;
+    // Toggle controls the aim key in both normal and silent modes. Silent aim
+    // still applies only while firing, but no longer silently bypasses toggle.
+    const bool aiming = keyActive && (!aimSilentMode || leftButtonDown);
     if (!aimAssist || menuOpen || !aiming || !currentViewMatrixReady) return;
 
     const bool useDepthWallCheck = aimVisibilityCheck;

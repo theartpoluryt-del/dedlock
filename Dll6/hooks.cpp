@@ -2,10 +2,49 @@
 #include "usercmd.hpp"
 #include "usercmd_runtime.hpp"
 #include <fstream>
+#include <sstream>
+#include <vector>
+#include <cstdlib>
 #include <atomic>
 #include <MinHook.h>
 
 namespace {
+
+using EntityLifecycleFn = void(__fastcall*)(uintptr_t, uintptr_t, uint32_t);
+EntityLifecycleFn originalEntityAdded = nullptr;
+EntityLifecycleFn originalEntityRemoved = nullptr;
+void* entityAddedTarget = nullptr;
+void* entityRemovedTarget = nullptr;
+
+uintptr_t FindClientPattern(const char* pattern) {
+    if (!clientBase) return 0;
+    MODULEINFO info{};
+    if (!GetModuleInformation(GetCurrentProcess(), reinterpret_cast<HMODULE>(clientBase), &info, sizeof(info))) return 0;
+    std::vector<int> bytes;
+    std::stringstream stream(pattern);
+    std::string token;
+    while (stream >> token) bytes.push_back(token == "?" ? -1 : std::strtoul(token.c_str(), nullptr, 16));
+    if (bytes.empty() || bytes.size() > info.SizeOfImage) return 0;
+    const auto* image = reinterpret_cast<const uint8_t*>(clientBase);
+    for (size_t i = 0; i + bytes.size() <= info.SizeOfImage; ++i) {
+        bool match = true;
+        for (size_t j = 0; j < bytes.size(); ++j) {
+            if (bytes[j] >= 0 && image[i + j] != static_cast<uint8_t>(bytes[j])) { match = false; break; }
+        }
+        if (match) return clientBase + i;
+    }
+    return 0;
+}
+
+void __fastcall HookEntityAdded(uintptr_t system, uintptr_t instance, uint32_t handle) {
+    if (originalEntityAdded) originalEntityAdded(system, instance, handle);
+    QueueOrbEntityAdded(handle);
+}
+
+void __fastcall HookEntityRemoved(uintptr_t system, uintptr_t instance, uint32_t handle) {
+    QueueOrbEntityRemoved(handle);
+    if (originalEntityRemoved) originalEntityRemoved(system, instance, handle);
+}
 
 // IDA-confirmed CUserCmd_to_network entrypoint:
 // image EA 0x1814E0F00 - image base 0x180000000 = RVA 0x14E0F00.
@@ -108,13 +147,16 @@ uintptr_t GetCurrentUserCmd() {
 }
 
 void ApplyPendingUserCmdAngles(uintptr_t userCmd) {
-    if (!userCmd || !aimSilentMode) return;
+    if (!userCmd || (!aimSilentMode && !farmSilentMode && !autoLastHitOrbs)) return;
     Vector3 angles{};
+    bool attack = false;
     {
         std::lock_guard<std::mutex> lock(silentAnglesMutex);
         if (!pendingSilentAnglesReady) return;
         angles = pendingSilentAngles;
+        attack = pendingSilentAttack;
         pendingSilentAnglesReady = false;
+        pendingSilentAttack = false;
     }
 
     auto* command = reinterpret_cast<CUserCmd*>(userCmd);
@@ -125,6 +167,28 @@ void ApplyPendingUserCmdAngles(uintptr_t userCmd) {
     viewAngles->set_z(angles.z);
     command->cmd.clear_view_delta_x();
     command->cmd.clear_view_delta_y();
+    if (attack) {
+        const auto attackMask = static_cast<std::uint64_t>(InputBitMask::Attack);
+        command->buttonStates.buttonState1 |= attackMask;
+        command->buttonStates.buttonState2 |= attackMask;
+        command->buttonStates.buttonState3 |= attackMask;
+
+        // The network serializer reads the protobuf button block. On ticks
+        // without physical input it may be absent, so merely changing the
+        // native CInButtonState is not enough to produce an attack command.
+        // Materialize both optional messages before setting the attack bit.
+        auto* base = command->cmd.mutable_base();
+        if (base) {
+            auto* buttons = base->mutable_buttons_pb();
+            if (buttons) {
+                buttons->set_buttonstate1(buttons->buttonstate1() | attackMask);
+                buttons->set_buttonstate2(buttons->buttonstate2() | attackMask);
+                buttons->set_buttonstate3(buttons->buttonstate3() | attackMask);
+            }
+        }
+        lastSilentAttackAppliedAt = GetTickCount64();
+        if (autoLastHitOrbs) InterlockedIncrement(&autoOrbAttackAppliedCount);
+    }
     ++silentAppliedCalls;
 }
 
@@ -191,6 +255,56 @@ uintptr_t __fastcall hkUserCmdToNetwork(uintptr_t a1, uintptr_t a2, uintptr_t a3
         ? originalUserCmdToNetwork(a1, a2, a3) : 0;
 }
 
+}
+
+bool InstallOrbEntityHooks() {
+    if (!clientBase || orbEntityEventsAvailable) return orbEntityEventsAvailable;
+    const char* addPattern = "48 89 74 24 ? 57 48 83 EC ? 41 B9 ? ? ? ? 41 8B C0 41 23 C1 48 8B F2 41 83 F8 ? 48 8B F9 44 0F 45 C8 41 81 F9 ? ? ? ? 73 ? FF 81";
+    const char* removePattern = "48 89 74 24 ? 57 48 83 EC ? 41 B9 ? ? ? ? 41 8B C0 41 23 C1 48 8B F2 41 83 F8 ? 48 8B F9 44 0F 45 C8 41 81 F9 ? ? ? ? 73 ? FF 89";
+    entityAddedTarget = reinterpret_cast<void*>(FindClientPattern(addPattern));
+    entityRemovedTarget = reinterpret_cast<void*>(FindClientPattern(removePattern));
+    if (!entityAddedTarget || !entityRemovedTarget) {
+        printf("[Orb] entity lifecycle patterns not found\n");
+        std::ofstream log("C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\orb_hooks.log", std::ios::app);
+        if (log) log << "patterns not found add=0x" << std::hex << reinterpret_cast<uintptr_t>(entityAddedTarget)
+                    << " remove=0x" << reinterpret_cast<uintptr_t>(entityRemovedTarget) << "\n";
+        return false;
+    }
+    const MH_STATUS addStatus = MH_CreateHook(entityAddedTarget,
+        reinterpret_cast<void*>(&HookEntityAdded), reinterpret_cast<void**>(&originalEntityAdded));
+    const MH_STATUS removeStatus = MH_CreateHook(entityRemovedTarget,
+        reinterpret_cast<void*>(&HookEntityRemoved), reinterpret_cast<void**>(&originalEntityRemoved));
+    if ((addStatus != MH_OK && addStatus != MH_ERROR_ALREADY_CREATED) ||
+        (removeStatus != MH_OK && removeStatus != MH_ERROR_ALREADY_CREATED)) {
+        printf("[Orb] entity lifecycle hook creation failed add=%d remove=%d\n", addStatus, removeStatus);
+        std::ofstream log("C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\orb_hooks.log", std::ios::app);
+        if (log) log << "create failed add=" << addStatus << " remove=" << removeStatus << "\n";
+        return false;
+    }
+    const MH_STATUS addEnable = MH_EnableHook(entityAddedTarget);
+    const MH_STATUS removeEnable = MH_EnableHook(entityRemovedTarget);
+    if ((addEnable != MH_OK && addEnable != MH_ERROR_ENABLED) ||
+        (removeEnable != MH_OK && removeEnable != MH_ERROR_ENABLED)) return false;
+    orbEntityEventsAvailable = true;
+    printf("[Orb] entity lifecycle hooks installed\n");
+    std::ofstream log("C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\orb_hooks.log", std::ios::app);
+    if (log) log << "installed add=0x" << std::hex << reinterpret_cast<uintptr_t>(entityAddedTarget)
+                << " remove=0x" << reinterpret_cast<uintptr_t>(entityRemovedTarget) << "\n";
+    return true;
+}
+
+void RemoveOrbEntityHooks() {
+    if (entityAddedTarget) {
+        MH_DisableHook(entityAddedTarget);
+        MH_RemoveHook(entityAddedTarget);
+    }
+    if (entityRemovedTarget) {
+        MH_DisableHook(entityRemovedTarget);
+        MH_RemoveHook(entityRemovedTarget);
+    }
+    entityAddedTarget = entityRemovedTarget = nullptr;
+    originalEntityAdded = originalEntityRemoved = nullptr;
+    orbEntityEventsAvailable = false;
 }
 
 bool InstallUserCmdHook() {
@@ -364,9 +478,17 @@ void SetupHooks() {
     DestroyWindow(tempWindow);
 
     printf("[+] VMT Hook installed!\n");
+    // The detours only enqueue handles; entity memory is read later by the
+    // worker thread. This avoids touching partially constructed entities.
+    // Orb discovery is handled by the validated polling scan. Lifecycle
+    // detours are disabled because callbacks can run while identities are
+    // being rebuilt and are unsafe for ESP lifetime tracking.
+    orbEntityEventsAvailable = false;
+    printf("[+] Orb entity hooks: disabled; using polling\n");
 }
 
 DWORD WINAPI InitializeThread(LPVOID) {
+    LoadConfig();
     for (int attempt = 0; attempt < 100; ++attempt) {
         clientBase = reinterpret_cast<uintptr_t>(GetModuleHandleA("client.dll"));
         if (clientBase) break;
@@ -403,6 +525,7 @@ DWORD WINAPI InitializeThread(LPVOID) {
     stopHeroDiscoveryEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
     if (stopHeroDiscoveryEvent) {
         heroDiscoveryThread = CreateThread(nullptr, 0, HeroDiscoveryWorker, nullptr, 0, nullptr);
+        farmTargetThread = CreateThread(nullptr, 0, FarmTargetWorker, nullptr, 0, nullptr);
         // DX11 ESP is intentionally independent from the unresolved native
         // glow experiment. Do not mutate game render properties in the stable
         // build.
@@ -433,6 +556,7 @@ DWORD WINAPI InitializeThread(LPVOID) {
     }
     printf("[+] CreateMove hook: %s\n", InstallCreateMoveHook(userCmdFunctions) ? "installed" : "not installed");
     printf("[+] Input lock hooks: %s\n", InstallInputLockHooks() ? "installed" : "not installed");
+    printf("[+] Sound event hook: %s\n", InstallSoundEventHook() ? "installed" : "not installed");
     SetupHooks();
     return 0;
 }

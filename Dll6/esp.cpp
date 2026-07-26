@@ -273,10 +273,238 @@ std::vector<PlayerData> GetPlayers() {
 void RenderESP(const std::vector<PlayerData>& players) {
     auto drawList = ImGui::GetBackgroundDrawList();
     const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
+    const bool aimKeyDown = (GetAsyncKeyState(aimAssistKey) & 0x8000) != 0;
+    const bool aimEnabled = aimAssist && (aimToggleMode ? aimToggleActive : aimKeyDown);
+    const bool farmKeyDown = (GetAsyncKeyState(farmAssistKey) & 0x8000) != 0;
+    const bool farmEnabled = farmAssist && (farmToggleMode ? farmToggleActive : farmKeyDown);
+    const char* aimStatus = aimEnabled
+        ? (aimSilentMode ? "AIM  ON  [SILENT]" : "AIM  ON")
+        : "AIM  OFF";
+    const ImColor aimColor = aimEnabled ? ImColor(80, 220, 120, 235) : ImColor(220, 90, 90, 220);
+    const ImVec2 statusPosition(18.0f, 18.0f);
+    char fpsText[32]{};
+    std::snprintf(fpsText, sizeof(fpsText), "FPS: %.0f", ImGui::GetIO().Framerate);
+    const ImVec2 fpsSize = ImGui::CalcTextSize(fpsText);
+    const ImVec2 fpsPosition(displaySize.x - fpsSize.x - 18.0f, 18.0f);
+    drawList->AddText(ImVec2(fpsPosition.x + 1.0f, fpsPosition.y + 1.0f),
+                      ImColor(0, 0, 0, 190), fpsText);
+    drawList->AddText(fpsPosition, ImColor(255, 255, 255, 235), fpsText);
+    drawList->AddText(ImVec2(statusPosition.x + 1.0f, statusPosition.y + 1.0f),
+                      ImColor(0, 0, 0, 190), aimStatus);
+    drawList->AddText(statusPosition, aimColor, aimStatus);
+    if (farmAssist) {
+        const char* farmStatus = farmEnabled ? "CREEP AIM  ON" : "CREEP AIM  OFF";
+        const ImColor farmColor = farmEnabled ? ImColor(255, 190, 70, 235) : ImColor(180, 180, 180, 210);
+        drawList->AddText(ImVec2(statusPosition.x + 1.0f, statusPosition.y + 19.0f),
+                          ImColor(0, 0, 0, 190), farmStatus);
+        drawList->AddText(ImVec2(statusPosition.x, statusPosition.y + 18.0f), farmColor, farmStatus);
+    }
+    if (autoLastHitOrbs) {
+        const char* orbStatus = autoLastHitOrbsActive ? "ORB AIM  ON" : "ORB AIM  OFF";
+        const ImColor orbStatusColor = autoLastHitOrbsActive
+            ? ImColor(80, 220, 120, 235) : ImColor(180, 180, 180, 210);
+        drawList->AddText(ImVec2(statusPosition.x + 1.0f, statusPosition.y + 37.0f),
+                          ImColor(0, 0, 0, 190), orbStatus);
+        drawList->AddText(ImVec2(statusPosition.x, statusPosition.y + 36.0f),
+                          orbStatusColor, orbStatus);
+    }
     if (drawFovCircle && aimAssist && aimFov > 0.0f && displaySize.x > 0.0f && displaySize.y > 0.0f) {
         const ImVec2 screenCenter(displaySize.x * 0.5f, displaySize.y * 0.5f);
         const int alpha = static_cast<int>(std::clamp(fovCircleAlpha, 0.0f, 255.0f));
         drawList->AddCircle(screenCenter, aimFov, ImColor(255, 255, 255, alpha), 96, 1.0f);
+    }
+    if (drawFarmFovCircle && farmAssist && farmFov > 0.0f &&
+        displaySize.x > 0.0f && displaySize.y > 0.0f) {
+        const ImVec2 screenCenter(displaySize.x * 0.5f, displaySize.y * 0.5f);
+        const int alpha = static_cast<int>(std::clamp(farmFovAlpha, 0.0f, 255.0f));
+        drawList->AddCircle(screenCenter, farmFov, ImColor(255, 190, 70, alpha), 96, 1.0f);
+    }
+
+    if (drawOrbEsp && currentViewMatrixReady) {
+        std::vector<OrbTarget> orbs;
+        {
+            std::lock_guard<std::mutex> lock(orbTargetsMutex);
+            orbs = orbTargets;
+        }
+        for (const auto& orb : orbs) {
+            Vector3 position{};
+            const bool hasLivePosition = GetXpOrbPosition(orb.entity, position);
+            if (!hasLivePosition) position = orb.pos;
+            if (!std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z)) continue;
+            if (hasLivePosition) {
+                std::lock_guard<std::mutex> lock(orbTargetsMutex);
+                for (auto& cachedOrb : orbTargets) {
+                    if ((orb.handle != 0 && cachedOrb.handle == orb.handle) || cachedOrb.entity == orb.entity) {
+                        cachedOrb.pos = position;
+                        break;
+                    }
+                }
+            }
+            Vector2 screen{};
+            if (!WorldToScreen(position, screen, currentViewMatrix)) continue;
+            const ImVec2 point(screen.x, screen.y);
+            const uint8_t localTeam = currentLocalPawn
+                ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
+            const bool friendly = localTeam != 0 && orb.team != 0 && orb.team == localTeam;
+            // The game uses the opposite visual convention for these items:
+            // enemy orbs are green and allied orbs are red.
+            const ImColor orbColor = friendly
+                ? ImColor(245, 65, 65, 235)
+                : ImColor(50, 235, 90, 235);
+            const char* orbLabel = friendly ? "Ally orb" : "Enemy orb";
+            // C_BaseModelEntity::m_Collision is embedded in the entity.  The old
+            // code treated 0x340 as a pointer, producing a distance-dependent,
+            // oversized ring.  Project the real bounding sphere instead.
+            const uintptr_t orbSceneNode = Read<uintptr_t>(orb.entity + Offsets::GameSceneNode);
+            const float absScale = orbSceneNode ? Read<float>(orbSceneNode + Offsets::SceneNodeAbsScale) : 1.0f;
+            float outlineRadius = 14.0f;
+            const float scale = std::isfinite(absScale) && absScale > 0.001f && absScale < 100.0f
+                ? absScale : 1.0f;
+            const uintptr_t collision = orb.entity + Offsets::OrbCollisionProperty;
+            const Vector3 mins = Read<Vector3>(collision + Offsets::CollisionMins);
+            const Vector3 maxs = Read<Vector3>(collision + Offsets::CollisionMaxs);
+            const bool validBounds = std::isfinite(mins.x) && std::isfinite(mins.y) && std::isfinite(mins.z) &&
+                std::isfinite(maxs.x) && std::isfinite(maxs.y) && std::isfinite(maxs.z) &&
+                mins.x < maxs.x && mins.y < maxs.y && mins.z < maxs.z &&
+                maxs.x - mins.x < 256.0f && maxs.y - mins.y < 256.0f && maxs.z - mins.z < 256.0f;
+            if (validBounds) {
+                for (int x = 0; x < 2; ++x) {
+                    for (int y = 0; y < 2; ++y) {
+                        for (int z = 0; z < 2; ++z) {
+                            const Vector3 corner{
+                                position.x + (x ? maxs.x : mins.x) * scale,
+                                position.y + (y ? maxs.y : mins.y) * scale,
+                                position.z + (z ? maxs.z : mins.z) * scale
+                            };
+                            Vector2 edge{};
+                            if (!WorldToScreen(corner, edge, currentViewMatrix)) continue;
+                            outlineRadius = (std::max)(outlineRadius,
+                                std::sqrt((edge.x - screen.x) * (edge.x - screen.x) +
+                                          (edge.y - screen.y) * (edge.y - screen.y)));
+                        }
+                    }
+                }
+            }
+            outlineRadius *= 0.4f;
+            const float fillRadius = outlineRadius * 0.64f;
+            if (IsXpOrbAttackable(orb.entity)) {
+                drawList->AddCircleFilled(point, fillRadius, orbColor, 24);
+            }
+            drawList->AddCircle(point, outlineRadius, ImColor(255, 165, 45, 245), 24, 2.0f);
+            drawList->AddText(ImVec2(screen.x + outlineRadius + 3.0f, screen.y - 8.0f),
+                              ImColor(255, 255, 255, 240), orbLabel);
+        }
+    }
+
+    if (drawCreepEsp && currentViewMatrixReady) {
+        std::vector<FarmTarget> creeps;
+        {
+            std::lock_guard<std::mutex> lock(farmTargetsMutex);
+            creeps = farmTargets;
+        }
+        std::vector<FarmTarget> liveCreeps;
+        liveCreeps.reserve(creeps.size());
+        for (auto& creep : creeps) {
+            if (creep.className.find("TrooperBoss") != std::string::npos) continue;
+            // The worker discovers entities slowly to avoid scanning the full
+            // entity table on the render thread. Positions and health, however,
+            // must be refreshed every frame so moving creeps do not leave stale
+            // boxes behind.
+            Vector3 livePosition{};
+            if (!GetEntityPosition(creep.entity, livePosition)) continue;
+            const uintptr_t sceneNode = Read<uintptr_t>(creep.entity + Offsets::GameSceneNode);
+            if (!sceneNode || Read<uint8_t>(sceneNode + Offsets::SceneNodeDormant) != 0) continue;
+            creep.pos = livePosition;
+            creep.health = Read<int>(creep.entity + Offsets::Health);
+            creep.maxHealth = Read<int>(creep.entity + Offsets::MaxHealth);
+            const uint8_t lifeState = Read<uint8_t>(creep.entity + Offsets::LifeState);
+            const uint32_t npcState = Read<uint32_t>(creep.entity + Offsets::NPCState);
+            if (creep.health <= 0 || lifeState != 0 || npcState == 5 || npcState == 6 ||
+                Read<uint8_t>(creep.entity + Offsets::FadeCorpse) != 0) continue;
+
+            // A stale entity slot can retain the NPC class and a positive
+            // health value after its render object is gone. Require a valid
+            // model bone before drawing the diagnostic box.
+            Vector3 headPosition{};
+            if (!GetEntityBonePosition(creep.entity, "head", headPosition)) continue;
+            const float headDeltaX = headPosition.x - creep.pos.x;
+            const float headDeltaY = headPosition.y - creep.pos.y;
+            const float headDeltaZ = headPosition.z - creep.pos.z;
+            const float headDistanceSquared = headDeltaX * headDeltaX +
+                                              headDeltaY * headDeltaY +
+                                              headDeltaZ * headDeltaZ;
+            if (!std::isfinite(headDistanceSquared) || headDistanceSquared > 300.0f * 300.0f ||
+                headDeltaZ < 8.0f || headDeltaZ > 180.0f) continue;
+            // Creep collision bounds are not reliable for diagnostics: on some
+            // units they describe a separate collision object, not the render
+            // model. Project a conservative box around the scene-node origin.
+            constexpr float halfWidth = 22.0f;
+            constexpr float height = 72.0f;
+            const Vector3 corners[] = {
+                { creep.pos.x - halfWidth, creep.pos.y - halfWidth, creep.pos.z },
+                { creep.pos.x + halfWidth, creep.pos.y - halfWidth, creep.pos.z },
+                { creep.pos.x - halfWidth, creep.pos.y + halfWidth, creep.pos.z },
+                { creep.pos.x + halfWidth, creep.pos.y + halfWidth, creep.pos.z },
+                { creep.pos.x - halfWidth, creep.pos.y - halfWidth, creep.pos.z + height },
+                { creep.pos.x + halfWidth, creep.pos.y - halfWidth, creep.pos.z + height },
+                { creep.pos.x - halfWidth, creep.pos.y + halfWidth, creep.pos.z + height },
+                { creep.pos.x + halfWidth, creep.pos.y + halfWidth, creep.pos.z + height }
+            };
+            float left = FLT_MAX, top = FLT_MAX, right = -FLT_MAX, bottom = -FLT_MAX;
+            bool projected = false;
+            for (const auto& corner : corners) {
+                Vector2 screen{};
+                if (!WorldToScreen(corner, screen, currentViewMatrix)) continue;
+                projected = true;
+                left = (std::min)(left, screen.x);
+                top = (std::min)(top, screen.y);
+                right = (std::max)(right, screen.x);
+                bottom = (std::max)(bottom, screen.y);
+            }
+            if (!projected || right <= left || bottom <= top) continue;
+            liveCreeps.push_back(creep);
+            const uint8_t localTeam = currentLocalPawn
+                ? Read<uint8_t>(currentLocalPawn + Offsets::Team)
+                : 0;
+            const bool ally = localTeam != 0 && creep.team == localTeam;
+            const bool neutral = creep.team == 4;
+            const ImColor color = neutral
+                ? ImColor(190, 190, 190, 150)
+                : (ally ? ImColor(90, 170, 255, 150) : ImColor(255, 170, 0, 220));
+            drawList->AddRect(ImVec2(left, top), ImVec2(right, bottom), color, 0.0f, 0, ally ? 1.0f : 1.25f);
+
+            Vector2 originScreen{};
+            if (WorldToScreen(creep.pos, originScreen, currentViewMatrix)) {
+                drawList->AddCircleFilled(ImVec2(originScreen.x, originScreen.y), 3.0f, color, 12);
+            }
+            const float dx = creep.pos.x - currentLocalPosition.x;
+            const float dy = creep.pos.y - currentLocalPosition.y;
+            const float dz = creep.pos.z - currentLocalPosition.z;
+            const float distance = std::sqrt(dx * dx + dy * dy + dz * dz) / 39.37f;
+            char distanceText[24]{};
+            std::snprintf(distanceText, sizeof(distanceText), "%.0fm", distance);
+            const ImVec2 textSize = ImGui::CalcTextSize(distanceText);
+            drawList->AddText(ImVec2((left + right - textSize.x) * 0.5f,
+                                     bottom + 4.0f),
+                              ImColor(255, 255, 255, 220), distanceText);
+
+            const float healthPercent = creep.maxHealth > 0
+                ? std::clamp(static_cast<float>(creep.health) / creep.maxHealth, 0.0f, 1.0f)
+                : 0.0f;
+            constexpr float barWidth = 3.0f;
+            const float barLeft = left - 6.0f;
+            drawList->AddRectFilled(ImVec2(barLeft, top), ImVec2(barLeft + barWidth, bottom),
+                                    ImColor(40, 40, 40, 130));
+            const ImColor healthColor = neutral
+                ? ImColor(190, 190, 190, 190)
+                : (ally ? ImColor(80, 180, 255, 190) : ImColor(70, 220, 100, 220));
+            drawList->AddRectFilled(ImVec2(barLeft, bottom - (bottom - top) * healthPercent),
+                                    ImVec2(barLeft + barWidth, bottom), healthColor);
+        }
+        {
+            std::lock_guard<std::mutex> lock(farmTargetsMutex);
+            farmTargets = std::move(liveCreeps);
+        }
     }
 
     if (!drawEsp) return;
@@ -370,53 +598,107 @@ void RenderMenu(size_t playerCount) {
     if (!menuOpen) return;
 
     const bool wasMenuOpen = menuOpen;
+    ImGui::SetNextWindowSize(ImVec2(760.0f, 0.0f), ImGuiCond_FirstUseEver);
     ImGui::Begin("Deadlock Internal", &menuOpen, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize);
 
-    if (ImGui::CollapsingHeader("Visuals", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Checkbox("ESP", &drawEsp);
-        ImGui::Checkbox("Boxes", &drawBoxes);
-        ImGui::Checkbox("Health Bars", &drawHealth);
-        ImGui::Checkbox("Health Values", &drawHealthValues);
-        ImGui::Checkbox("Hero Names", &drawNames);
-        ImGui::Checkbox("Distance", &drawDistance);
-        ImGui::Checkbox("Snaplines", &drawSnaplines);
-        ImGui::Checkbox("Bones", &drawBones);
-        if (drawSnaplines) ImGui::SliderFloat("Snapline alpha", &snaplineAlpha, 0.0f, 255.0f, "%.0f");
-        ImGui::Checkbox("Glow", &glowEnabled);
-        ImGui::Checkbox("FOV circle", &drawFovCircle);
-        if (drawFovCircle) ImGui::SliderFloat("FOV circle alpha", &fovCircleAlpha, 0.0f, 255.0f, "%.0f");
+    if (ImGui::BeginTable("TopSections", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableNextColumn();
+        if (ImGui::CollapsingHeader("Visuals", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox("ESP", &drawEsp);
+            ImGui::Checkbox("Boxes", &drawBoxes);
+            ImGui::Checkbox("Health Bars", &drawHealth);
+            ImGui::Checkbox("Health Values", &drawHealthValues);
+            ImGui::Checkbox("Hero Names", &drawNames);
+            ImGui::Checkbox("Distance", &drawDistance);
+            ImGui::Checkbox("Snaplines", &drawSnaplines);
+            ImGui::Checkbox("Bones", &drawBones);
+            if (drawSnaplines) ImGui::SliderFloat("Snapline alpha", &snaplineAlpha, 0.0f, 255.0f, "%.0f");
+            ImGui::Checkbox("Glow", &glowEnabled);
+            ImGui::Checkbox("FOV circle", &drawFovCircle);
+            if (drawFovCircle) ImGui::SliderFloat("FOV circle alpha", &fovCircleAlpha, 0.0f, 255.0f, "%.0f");
+        }
+
+        ImGui::TableNextColumn();
+        if (ImGui::CollapsingHeader("Farm Assist", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox("Creep aim", &farmAssist);
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Normal##FarmMode", !farmSilentMode)) farmSilentMode = false;
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Silent##FarmMode", farmSilentMode)) farmSilentMode = true;
+            if (ImGui::Button(farmKeyCapture ? "Press creep key..." : AimKeyName(farmAssistKey))) {
+                farmKeyCapture = true;
+            }
+            ImGui::SameLine();
+            ImGui::TextUnformatted("Creep key");
+            if (ImGui::RadioButton("Hold", !farmToggleMode)) {
+                farmToggleMode = false;
+                farmToggleActive = false;
+                farmToggleLastDown = false;
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Toggle", farmToggleMode)) {
+                farmToggleMode = true;
+                farmToggleActive = false;
+                farmToggleLastDown = false;
+            }
+            ImGui::SliderFloat("Creep smooth", &farmAimSmooth, 1.0f, 20.0f, "%.1f");
+            ImGui::SliderFloat("Farm assist FOV", &farmFov, 40.0f, 600.0f, "%.0f px");
+            ImGui::Checkbox("Farm assist FOV circle", &drawFarmFovCircle);
+            if (drawFarmFovCircle) ImGui::SliderFloat("Farm assist FOV alpha", &farmFovAlpha, 0.0f, 255.0f, "%.0f");
+            ImGui::Checkbox("Creep ESP", &drawCreepEsp);
+            ImGui::Checkbox("Orb ESP", &drawOrbEsp);
+            ImGui::Checkbox("Auto Last Hit Orbs", &autoLastHitOrbs);
+            if (autoLastHitOrbs) {
+                ImGui::SameLine();
+                if (ImGui::RadioButton("Auto fire##OrbMode", autoLastHitOrbsAutoFire)) autoLastHitOrbsAutoFire = true;
+                ImGui::SameLine();
+                if (ImGui::RadioButton("Player fire##OrbMode", !autoLastHitOrbsAutoFire)) autoLastHitOrbsAutoFire = false;
+                if (ImGui::Button(autoLastHitOrbsKeyCapture ? "Press orb key..." : AimKeyName(autoLastHitOrbsKey))) {
+                    autoLastHitOrbsKeyCapture = true;
+                }
+                ImGui::SameLine();
+                ImGui::TextUnformatted("Orb key");
+                if (ImGui::RadioButton("Hold##OrbBind", !autoLastHitOrbsToggleMode)) autoLastHitOrbsToggleMode = false;
+                ImGui::SameLine();
+                if (ImGui::RadioButton("Toggle##OrbBind", autoLastHitOrbsToggleMode)) autoLastHitOrbsToggleMode = true;
+                ImGui::Checkbox("Orb visibility check", &orbAimVisibilityCheck);
+            }
+        }
+        ImGui::EndTable();
     }
 
     if (ImGui::CollapsingHeader("Aim", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Checkbox("Aim assist", &aimAssist);
-        if (ImGui::Button(aimKeyCapture ? "Press aim key..." : AimKeyName(aimAssistKey))) {
-            aimKeyCapture = true;
-        }
-        ImGui::SameLine();
-        ImGui::TextUnformatted("Aim-assist key");
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Hold", !aimToggleMode)) {
-            aimToggleMode = false;
-            aimToggleActive = false;
-            aimToggleLastDown = false;
-        }
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Toggle", aimToggleMode)) {
-            aimToggleMode = true;
-            aimToggleActive = false;
-            aimToggleLastDown = false;
-        }
-        ImGui::Checkbox("Auto parry (F)", &autoParry);
-        ImGui::Checkbox("Silent Aim (No Visual)", &aimSilentMode);
-        ImGui::Checkbox("Visibility check", &aimVisibilityCheck);
-        int targetMode = static_cast<int>(aimTargetMode);
-        const char* targetModes[] = { "Head", "Body", "Closest" };
-        if (ImGui::Combo("Aim target", &targetMode, targetModes, IM_ARRAYSIZE(targetModes))) {
-            aimTargetMode = static_cast<AimTargetMode>(std::clamp(targetMode, 0, 2));
-        }
-        ImGui::SliderFloat("Aim FOV", &aimFov, 40.0f, 600.0f, "%.0f px");
-        ImGui::SliderFloat("Aim smooth", &aimSmooth, 1.0f, 20.0f, "%.1f");
+            ImGui::Checkbox("Aim assist", &aimAssist);
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Normal##AimMode", !aimSilentMode)) aimSilentMode = false;
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Silent##AimMode", aimSilentMode)) aimSilentMode = true;
+            if (ImGui::Button(aimKeyCapture ? "Press aim key..." : AimKeyName(aimAssistKey))) {
+                aimKeyCapture = true;
+            }
+            ImGui::SameLine();
+            ImGui::TextUnformatted("Aim key");
+            if (ImGui::RadioButton("Hold", !aimToggleMode)) {
+                aimToggleMode = false;
+                aimToggleActive = false;
+                aimToggleLastDown = false;
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Toggle", aimToggleMode)) {
+                aimToggleMode = true;
+                aimToggleActive = false;
+                aimToggleLastDown = false;
+            }
+            ImGui::Checkbox("Visibility check", &aimVisibilityCheck);
+            int targetMode = static_cast<int>(aimTargetMode);
+            const char* targetModes[] = { "Head", "Body", "Closest" };
+            if (ImGui::Combo("Aim target", &targetMode, targetModes, IM_ARRAYSIZE(targetModes))) {
+                aimTargetMode = static_cast<AimTargetMode>(std::clamp(targetMode, 0, 2));
+            }
+            ImGui::SliderFloat("Aim FOV", &aimFov, 40.0f, 600.0f, "%.0f px");
+            ImGui::SliderFloat("Aim smooth", &aimSmooth, 1.0f, 20.0f, "%.1f");
     }
+    ImGui::Checkbox("Auto parry (F)", &autoParry);
     if (ImGui::Button("Unload DLL")) {
         RequestUnload();
     }
@@ -428,10 +710,15 @@ void RenderMenu(size_t playerCount) {
                                     ? "scanning"
                                     : (espStatus.heroPawnsFound ? "ready" : "no pawns");
     ImGui::Text("Hero scan: %s", heroScanState);
+    if (drawCreepEsp) {
+        std::lock_guard<std::mutex> lock(farmTargetsMutex);
+        ImGui::Text("Creep scan: %zu targets", farmTargets.size());
+    }
 
     ImGui::End();
 
     if (wasMenuOpen && !menuOpen) {
+        SaveConfig();
         SetMenuOpen(false);
     }
 }

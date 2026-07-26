@@ -15,14 +15,22 @@ void RestorePresentHook() {
 }
 
 void ShutdownOverlay() {
+    SaveConfig();
     RemoveUserCmdHook();
     RemoveInputLockHooks();
+    RemoveSoundEventHook();
+    RemoveOrbEntityHooks();
     RemoveMeleeStateMonitor();
     if (stopHeroDiscoveryEvent) SetEvent(stopHeroDiscoveryEvent);
     if (heroDiscoveryThread) {
         WaitForSingleObject(heroDiscoveryThread, 2000);
         CloseHandle(heroDiscoveryThread);
         heroDiscoveryThread = nullptr;
+    }
+    if (farmTargetThread) {
+        WaitForSingleObject(farmTargetThread, 2000);
+        CloseHandle(farmTargetThread);
+        farmTargetThread = nullptr;
     }
     if (glowApplyThread) {
         WaitForSingleObject(glowApplyThread, 2000);
@@ -180,7 +188,21 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    const bool depthReady = CaptureDepthSnapshot();
+    // Copying the full depth texture and mapping it every Present stalls the
+    // render queue. Visibility checks do not need a new snapshot every frame;
+    // keep the last one and refresh it at 10 Hz.
+    static ULONGLONG lastDepthCapture = 0;
+    const ULONGLONG now = GetTickCount64();
+    const bool visibilityNeeded =
+        (aimAssist && aimVisibilityCheck &&
+         ((GetAsyncKeyState(aimAssistKey) & 0x8000) != 0 || aimToggleActive)) ||
+        (farmAssist && ((GetAsyncKeyState(farmAssistKey) & 0x8000) != 0 || farmToggleActive)) ||
+        autoLastHitOrbs;
+    bool depthReady = depthSnapshotReady;
+    if (visibilityNeeded && now - lastDepthCapture >= 100) {
+        depthReady = CaptureDepthSnapshot();
+        lastDepthCapture = now;
+    }
     const int depthState = depthReady ? 1 : 0;
     if (depthState != depthDiagnosticState) {
         const char* status = depthReady ? "ready" : "unavailable";
@@ -192,9 +214,13 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         }
         depthDiagnosticState = depthState;
     }
+    // Keep the regular ESP path frame-synchronous. Throttling this snapshot
+    // makes boxes and bones visibly lag behind moving entities.
     const auto players = GetPlayers();
     AutoParry(players);
     AimAtClosestEnemy(players);
+    FarmAimAssist(players);
+    AutoLastHitOrbs();
     RenderESP(players);
     RenderMenu(players.size());
 
@@ -227,6 +253,34 @@ LRESULT __stdcall hkWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     }
 
     if (menuOpen && imguiInitialized && ImGui::GetCurrentContext()) {
+        if (farmKeyCapture) {
+            const bool keyboardKey = uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN;
+            const bool mouseKey = uMsg == WM_LBUTTONDOWN || uMsg == WM_RBUTTONDOWN ||
+                                  uMsg == WM_MBUTTONDOWN || uMsg == WM_XBUTTONDOWN;
+            if (keyboardKey || mouseKey) {
+                if (keyboardKey) farmAssistKey = static_cast<int>(wParam);
+                else if (uMsg == WM_LBUTTONDOWN) farmAssistKey = VK_LBUTTON;
+                else if (uMsg == WM_RBUTTONDOWN) farmAssistKey = VK_RBUTTON;
+                else if (uMsg == WM_MBUTTONDOWN) farmAssistKey = VK_MBUTTON;
+                else farmAssistKey = HIWORD(wParam) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2;
+                farmKeyCapture = false;
+                return 1;
+            }
+        }
+        if (autoLastHitOrbsKeyCapture) {
+            const bool keyboardKey = uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN;
+            const bool mouseKey = uMsg == WM_LBUTTONDOWN || uMsg == WM_RBUTTONDOWN ||
+                                  uMsg == WM_MBUTTONDOWN || uMsg == WM_XBUTTONDOWN;
+            if (keyboardKey || mouseKey) {
+                if (keyboardKey) autoLastHitOrbsKey = static_cast<int>(wParam);
+                else if (uMsg == WM_LBUTTONDOWN) autoLastHitOrbsKey = VK_LBUTTON;
+                else if (uMsg == WM_RBUTTONDOWN) autoLastHitOrbsKey = VK_RBUTTON;
+                else if (uMsg == WM_MBUTTONDOWN) autoLastHitOrbsKey = VK_MBUTTON;
+                else autoLastHitOrbsKey = HIWORD(wParam) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2;
+                autoLastHitOrbsKeyCapture = false;
+                return 1;
+            }
+        }
         if (aimKeyCapture) {
             const bool keyboardKey = uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN;
             const bool mouseKey = uMsg == WM_LBUTTONDOWN || uMsg == WM_RBUTTONDOWN ||
