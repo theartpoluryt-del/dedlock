@@ -470,6 +470,16 @@ bool IsXpOrbAttackable(uintptr_t entity) {
     if (observation.firstSeen == 0) observation.firstSeen = now;
     if (observation.attackable) return true;
 
+    // The replicated attackable-time field is not reliable for every orb
+    // spawn: it can contain a plausible but stale value. The game transition
+    // is one-way, so latch the second stage after the observed launch delay
+    // instead of allowing that field to keep the orb in stage one forever.
+    constexpr ULONGLONG kOrbAttackableDelayMs = 600;
+    if (now - observation.firstSeen >= kOrbAttackableDelayMs) {
+        observation.attackable = true;
+        return true;
+    }
+
     // The orb starts non-attackable and transitions to attackable once. It
     // remains attackable until the entity is removed, so do not use the
     // neighbouring 0x0A10 field as an end time.

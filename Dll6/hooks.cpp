@@ -521,11 +521,6 @@ DWORD WINAPI InitializeThread(LPVOID) {
 
     if (!clientBase) return 0;
 
-    AllocConsole();
-    consoleAttached = true;
-    FILE* fDummy;
-    freopen_s(&fDummy, "CONOUT$", "w", stdout);
-    printf("[+] Deadlock Internal loaded!\n");
     {
         std::ofstream marker(
             "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\Dll6_runtime.marker",
