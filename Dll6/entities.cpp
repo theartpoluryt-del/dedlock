@@ -728,8 +728,11 @@ void RefreshFarmTargets() {
                         IsSoulDesignerName(designerName);
                     if (isOrb) {
                         Vector3 position{};
-                        bool hasPosition = GetXpOrbPosition(entity, position);
-                        if (!hasPosition) hasPosition = GetEntityPosition(entity, position);
+                        // Keep discovery and ESP on the same stable position
+                        // source. RenderOrigin is a transient render cache and
+                        // can make the target list flicker between scans.
+                        bool hasPosition = GetEntityPosition(entity, position);
+                        if (!hasPosition) hasPosition = GetXpOrbPosition(entity, position);
                         if (!hasPosition) continue;
 
                         // RenderOrigin is the visual point used for drawing,
@@ -740,10 +743,10 @@ void RefreshFarmTargets() {
                         const bool hasMotionPosition = GetEntityPosition(entity, motionPosition);
                         if (!hasMotionPosition) motionPosition = position;
 
-                        // A valid position that is unchanged for two complete
-                        // scans means the orb has already disappeared. A
-                        // single unchanged sample is retained so slow orbs do
-                        // not flicker out of ESP.
+                        // Compare adjacent scans exactly. The first scan
+                        // establishes the previous coordinates; if the next
+                        // scan reports the same coordinates, the orb is
+                        // already gone and must not remain in ESP.
                         // Entity pointers are recycled by the game. The
                         // handle identifies the current orb lifetime, so a
                         // newly spawned orb must not inherit the old orb's
@@ -759,18 +762,13 @@ void RefreshFarmTargets() {
                             motion.hasEntityPosition = hasMotionPosition;
                             motion.stationarySamples = 0;
                         } else {
-                            constexpr float kPositionEpsilon = 0.001f;
-                            const float visualDx = position.x - motion.visualPosition.x;
-                            const float visualDy = position.y - motion.visualPosition.y;
-                            const float visualDz = position.z - motion.visualPosition.z;
-                            const bool visualMoved = visualDx * visualDx + visualDy * visualDy +
-                                visualDz * visualDz > kPositionEpsilon * kPositionEpsilon;
-                            const float entityDx = motionPosition.x - motion.entityPosition.x;
-                            const float entityDy = motionPosition.y - motion.entityPosition.y;
-                            const float entityDz = motionPosition.z - motion.entityPosition.z;
+                            const bool visualMoved = position.x != motion.visualPosition.x ||
+                                position.y != motion.visualPosition.y ||
+                                position.z != motion.visualPosition.z;
                             const bool entityMoved = hasMotionPosition && motion.hasEntityPosition &&
-                                entityDx * entityDx + entityDy * entityDy + entityDz * entityDz >
-                                kPositionEpsilon * kPositionEpsilon;
+                                (motionPosition.x != motion.entityPosition.x ||
+                                 motionPosition.y != motion.entityPosition.y ||
+                                 motionPosition.z != motion.entityPosition.z);
                             if (visualMoved || entityMoved) {
                                 motion.visualPosition = position;
                                 motion.entityPosition = motionPosition;
@@ -781,7 +779,7 @@ void RefreshFarmTargets() {
                             }
                         }
                         motion.lastSeen = now;
-                        if (motion.stationarySamples >= 2) continue;
+                        if (motion.stationarySamples >= 1) continue;
 
                         foundOrbs.push_back({ entity, position,
                             designerName.empty() ? className : designerName, storedHandle,

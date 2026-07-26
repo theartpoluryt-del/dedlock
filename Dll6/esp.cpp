@@ -110,6 +110,19 @@ std::string ReadHeroName(uintptr_t entity) {
     return HeroNameFromId(heroId);
 }
 
+std::string ReadPlayerName(uintptr_t controller) {
+    if (!controller) return {};
+    std::string name;
+    for (size_t i = 0; i < 128; ++i) {
+        const char c = Read<char>(controller + Offsets::PlayerName + i);
+        if (!c) break;
+        if (static_cast<unsigned char>(c) < 0x20 ||
+            static_cast<unsigned char>(c) > 0x7E) break;
+        name.push_back(c);
+    }
+    return name;
+}
+
 // The camera object still lives at the old data anchor.  Its view and
 // projection matrices are stored consecutively in the render-camera state.
 bool ReadCurrentViewMatrix(Matrix4x4& matrix) {
@@ -308,6 +321,66 @@ void RenderESP(const std::vector<PlayerData>& players) {
         drawList->AddText(ImVec2(statusPosition.x, statusPosition.y + 36.0f),
                           orbStatusColor, orbStatus);
     }
+    if (drawSpectatorList) {
+    // Enumerate player controllers directly. Spectators use
+    // C_CitadelObserverPawn, which is intentionally not part of heroPawns.
+    std::vector<std::string> spectators;
+    std::unordered_set<std::string> spectatorNames;
+    const uintptr_t entityRoot = clientBase
+        ? Read<uintptr_t>(clientBase + Offsets::GameEntitySystem) : 0;
+    if (entityRoot) {
+        for (uint32_t chunkIndex = 0;
+             chunkIndex <= (Offsets::MaxEntityIndex >> Offsets::HandleChunkShift); ++chunkIndex) {
+            const uintptr_t chunk = Read<uintptr_t>(entityRoot + Offsets::EntityChunks +
+                Offsets::EntityChunkStride * chunkIndex);
+            if (!chunk) continue;
+            for (uint32_t slot = 0; slot <= Offsets::HandleChunkMask; ++slot) {
+                const uintptr_t identity = chunk + Offsets::EntityStride * slot;
+                const uint32_t handle = Read<uint32_t>(identity + 0x10);
+                const uint32_t expectedIndex = (chunkIndex << Offsets::HandleChunkShift) | slot;
+                if ((handle & Offsets::HandleIndexMask) != expectedIndex) continue;
+                const uintptr_t controller = Read<uintptr_t>(identity);
+                if (!controller) continue;
+                const std::string className = GetEntityClassName(controller);
+                if (className.find("PlayerController") == std::string::npos) continue;
+                const uintptr_t pawn = ResolveEntity(Read<uint32_t>(controller + Offsets::ControllerPawn));
+                if (!pawn || pawn == currentLocalPawn) continue;
+                const uintptr_t observerServices = Read<uintptr_t>(pawn + Offsets::ObserverServices);
+                if (!observerServices) continue;
+                const uint8_t observerMode = Read<uint8_t>(observerServices + Offsets::ObserverMode);
+                const uint32_t observerTarget = Read<uint32_t>(observerServices + Offsets::ObserverTarget);
+                if (observerMode == 0 || observerTarget == 0xFFFFFFFFu) continue;
+                std::string name = ReadPlayerName(controller);
+                if (name.empty()) name = "Unknown";
+                if (spectatorNames.insert(name).second) spectators.push_back(std::move(name));
+            }
+        }
+    }
+    if (drawSpectatorList) {
+        float spectatorY = statusPosition.y + 58.0f;
+        const char* title = "SPECTATOR LIST";
+        drawList->AddText(ImVec2(statusPosition.x + 1.0f, spectatorY + 1.0f),
+                          ImColor(0, 0, 0, 190), title);
+        drawList->AddText(ImVec2(statusPosition.x, spectatorY),
+                          ImColor(255, 210, 90, 235), title);
+        spectatorY += 18.0f;
+        if (spectators.empty()) {
+            const char* emptyText = "No spectators";
+            drawList->AddText(ImVec2(statusPosition.x + 1.0f, spectatorY + 1.0f),
+                              ImColor(0, 0, 0, 190), emptyText);
+            drawList->AddText(ImVec2(statusPosition.x, spectatorY),
+                              ImColor(180, 180, 180, 220), emptyText);
+        } else {
+            for (const auto& name : spectators) {
+                drawList->AddText(ImVec2(statusPosition.x + 1.0f, spectatorY + 1.0f),
+                                  ImColor(0, 0, 0, 190), name.c_str());
+                drawList->AddText(ImVec2(statusPosition.x, spectatorY),
+                                  ImColor(255, 255, 255, 235), name.c_str());
+                spectatorY += 17.0f;
+            }
+        }
+    }
+    }
     if (drawFovCircle && aimAssist && aimFov > 0.0f && displaySize.x > 0.0f && displaySize.y > 0.0f) {
         const ImVec2 screenCenter(displaySize.x * 0.5f, displaySize.y * 0.5f);
         const int alpha = static_cast<int>(std::clamp(fovCircleAlpha, 0.0f, 255.0f));
@@ -327,6 +400,11 @@ void RenderESP(const std::vector<PlayerData>& players) {
             orbs = orbTargets;
         }
         for (const auto& orb : orbs) {
+            // Entity slots are recycled by the game. Never draw an old orb
+            // record after its handle resolves to a different entity.
+            if (orb.handle != 0 && ResolveEntity(orb.handle) != orb.entity) continue;
+            const std::string liveClass = GetEntityClassName(orb.entity);
+            if (!liveClass.empty() && liveClass.find("ItemXP") == std::string::npos) continue;
             Vector3 position = orb.pos;
             Vector2 screen{};
             bool projected = false;
@@ -679,7 +757,10 @@ void RenderMenu(size_t playerCount) {
         ImGui::EndTable();
     }
 
-    if (ImGui::CollapsingHeader("Aim", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::BeginTable("AimMiscSections", 2,
+                          ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableNextColumn();
+        if (ImGui::CollapsingHeader("Aim", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Checkbox("Aim assist", &aimAssist);
             ImGui::SameLine();
             if (ImGui::RadioButton("Normal##AimMode", !aimSilentMode)) aimSilentMode = false;
@@ -709,8 +790,14 @@ void RenderMenu(size_t playerCount) {
             }
             ImGui::SliderFloat("Aim FOV", &aimFov, 40.0f, 600.0f, "%.0f px");
             ImGui::SliderFloat("Aim smooth", &aimSmooth, 1.0f, 20.0f, "%.1f");
+        }
+        ImGui::TableNextColumn();
+        if (ImGui::CollapsingHeader("Misc", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox("Auto parry (F)", &autoParry);
+            ImGui::Checkbox("Spectator list", &drawSpectatorList);
+        }
+        ImGui::EndTable();
     }
-    ImGui::Checkbox("Auto parry (F)", &autoParry);
     if (ImGui::Button("Unload DLL")) {
         RequestUnload();
     }
