@@ -183,6 +183,8 @@
     <ClCompile Include="hooks.cpp" />
     <ClCompile Include="melee_hook.cpp" />
     <ClCompile Include="sound_hook.cpp" />
+    <ClCompile Include="model_glow.cpp" />
+    <ClCompile Include="runtime_offsets.cpp" />
     <ClCompile Include="C:\Users\artpo\source\repos\Dll6\Dll6\work\Andromeda-DeadLock-Base-1.2.0\Andromeda-DeadLock-Base\Andromeda-DeadLock\DeadLock\Protobuf\gameevents.pb.cc" />
     <ClCompile Include="usercmd_runtime.cpp" />
     <ClCompile Include="protobuf\citadel_usercmd.pb.cc" />

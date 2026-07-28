@@ -373,17 +373,6 @@ bool PhysicsTraceVisible(const Vector3& start, const Vector3& end) {
 
         const float fraction = *reinterpret_cast<const float*>(result + 172);
         const bool startSolid = *reinterpret_cast<const bool*>(result + 183);
-        static int traceLogCount = 0;
-        if (traceLogCount < 40) {
-            FILE* traceLog = nullptr;
-            if (fopen_s(&traceLog, "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\visibility_runtime.log", "a") == 0 && traceLog) {
-                fprintf(traceLog, "current trace start=%.1f,%.1f,%.1f end=%.1f,%.1f,%.1f fraction=%.6f startSolid=%d\n",
-                        start.x, start.y, start.z, end.x, end.y, end.z,
-                        fraction, startSolid ? 1 : 0);
-                fclose(traceLog);
-            }
-            ++traceLogCount;
-        }
         return std::isfinite(fraction) && fraction >= 0.995f && !startSolid;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -543,53 +532,73 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     const float cx = display.x * 0.5f;
     const float cy = display.y * 0.5f;
-    const float heroSuppressRadius = farmFov * 1.5f;
-    for (const auto& player : players) {
-        Vector2 screen{};
-        const Vector3 point = player.hasBodyBone
-            ? player.bodyPos : Vector3{ player.pos.x, player.pos.y, player.pos.z + 24.0f };
-        if (!WorldToScreen(point, screen, currentViewMatrix)) continue;
-        const float dx = screen.x - cx;
-        const float dy = screen.y - cy;
-        if (dx * dx + dy * dy <= heroSuppressRadius * heroSuppressRadius) return;
-    }
+    // AimAtClosestEnemy runs immediately before this function and sets this
+    // only when it found a live target inside Human FOV (including its
+    // visibility rules). A player merely present on screen must not suppress
+    // creep aim.
+    if (humanAimTargetFound) return;
 
     FarmTarget best{};
     Vector2 bestScreen{};
+    Vector3 bestWorld{};
     float bestDistance = farmFov * farmFov;
     const uint8_t localTeam = currentLocalPawn
         ? Read<uint8_t>(currentLocalPawn + Offsets::Team)
         : 0;
+    std::vector<FarmTarget> targetSnapshot;
     {
         std::lock_guard lock(farmTargetsMutex);
-        for (const auto& target : farmTargets) {
-            if (localTeam != 0 && target.team == localTeam) continue;
-            if (!target.entity || Read<int>(target.entity + Offsets::Health) <= 0 ||
-                Read<uint8_t>(target.entity + Offsets::LifeState) != 0 ||
-                Read<uint32_t>(target.entity + Offsets::NPCState) == 5 ||
-                Read<uint32_t>(target.entity + Offsets::NPCState) == 6 ||
-                Read<uint8_t>(target.entity + Offsets::FadeCorpse) != 0) continue;
-            Vector2 screen{};
-            Vector3 point{ target.pos.x, target.pos.y, target.pos.z + 24.0f };
-            // Trooper scene origins are near the feet. Use the actual head
-            // bone so creep aim does not converge on the pelvis.
-            GetEntityBonePosition(target.entity, "head", point);
-            // Use the trace only when the current client exposes a valid
-            // physics context. If it is unavailable, do not discard every
-            // creep; orb aim already follows this safe fallback.
-            const bool traceAvailable = clientBase &&
-                Read<uintptr_t>(clientBase + PhysicsTraceContextRva) != 0;
-            if (aimVisibilityCheck && traceAvailable && !IsWorldAimPointVisible(point)) continue;
-            if (!WorldToScreen(point, screen, currentViewMatrix)) continue;
-            const float dx = screen.x - cx;
-            const float dy = screen.y - cy;
-            const float distance = dx * dx + dy * dy;
-            if (distance < bestDistance) {
-                best = target;
-                bestScreen = screen;
-                bestDistance = distance;
-            }
-        }
+        targetSnapshot = farmTargets;
+    }
+    struct FarmCandidate {
+        float screenDistance;
+        FarmTarget target;
+    };
+    std::vector<FarmCandidate> candidates;
+    candidates.reserve(targetSnapshot.size());
+    for (const auto& target : targetSnapshot) {
+        if (localTeam != 0 && target.team == localTeam) continue;
+        if (!target.entity || Read<int>(target.entity + Offsets::Health) <= 0 ||
+            Read<uint8_t>(target.entity + Offsets::LifeState) != 0 ||
+            Read<uint32_t>(target.entity + Offsets::NPCState) == 5 ||
+            Read<uint32_t>(target.entity + Offsets::NPCState) == 6 ||
+            Read<uint8_t>(target.entity + Offsets::FadeCorpse) != 0) continue;
+        Vector2 screen{};
+        const Vector3 approximatePoint{ target.pos.x, target.pos.y, target.pos.z + 24.0f };
+        if (!WorldToScreen(approximatePoint, screen, currentViewMatrix)) continue;
+        const float dx = screen.x - cx;
+        const float dy = screen.y - cy;
+        const float distance = dx * dx + dy * dy;
+        if (distance < farmFov * farmFov)
+            candidates.push_back({ distance, target });
+    }
+    std::sort(candidates.begin(), candidates.end(),
+        [](const FarmCandidate& left, const FarmCandidate& right) {
+            return left.screenDistance < right.screenDistance;
+        });
+
+    const bool traceAvailable = clientBase &&
+        Read<uintptr_t>(clientBase + PhysicsTraceContextRva) != 0;
+    for (const auto& candidate : candidates) {
+        Vector3 point{ candidate.target.pos.x, candidate.target.pos.y,
+                       candidate.target.pos.z + 24.0f };
+        // Only nearby screen candidates reach this expensive engine call.
+        GetEntityBonePosition(candidate.target.entity, "head", point);
+        if (aimVisibilityCheck && traceAvailable && !IsWorldAimPointVisible(point)) continue;
+        Vector2 screen{};
+        if (!WorldToScreen(point, screen, currentViewMatrix)) continue;
+        const float dx = screen.x - cx;
+        const float dy = screen.y - cy;
+        const float distance = dx * dx + dy * dy;
+        if (distance >= bestDistance) continue;
+        best = candidate.target;
+        bestWorld = point;
+        bestScreen = screen;
+        bestDistance = distance;
+        // Candidates are ordered by their inexpensive screen estimate. The
+        // first visible result is the same practical target without tracing
+        // every creep in the lane.
+        break;
     }
     if (!best.entity) {
         if (farmSilentMode) RestoreSilentFlick();
@@ -597,11 +606,9 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
     }
 
     if (farmSilentMode) {
-        Vector3 targetWorld{ best.pos.x, best.pos.y, best.pos.z + 24.0f };
-        GetEntityBonePosition(best.entity, "head", targetWorld);
         const Vector3 cameraOrigin = currentCameraPositionReady
             ? currentCameraPosition : currentLocalPosition;
-        const Vector3 commandAngles = CalculateAimAngles(cameraOrigin, targetWorld);
+        const Vector3 commandAngles = CalculateAimAngles(cameraOrigin, bestWorld);
         if (std::isfinite(commandAngles.x) && std::isfinite(commandAngles.y)) {
         std::lock_guard<std::mutex> lock(creepSilentMutex);
         pendingCreepAngles = commandAngles;
@@ -732,13 +739,6 @@ void AutoLastHitOrbs() {
         pendingOrbAttack = fire;
         pendingOrbReady = true;
     }
-    static ULONGLONG lastOrbLog = 0;
-    if (now - lastOrbLog >= 1000) {
-        std::ofstream log("C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\orb_runtime.log", std::ios::app);
-        if (log) log << "target class=" << best.className << " screen=" << bestScreen.x << ','
-                     << bestScreen.y << " attack=" << (fire ? 1 : 0) << "\n";
-        lastOrbLog = now;
-    }
 }
 
 bool GetWorldAimPointScreen(const Vector3& point, Vector2& screen) {
@@ -786,6 +786,7 @@ bool IsWorldAimPointVisible(const Vector3& point) {
 }
 
 void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
+    humanAimTargetFound = false;
     const bool leftButtonDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     const bool rightButtonDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
     if (!aimSilentMode || !leftButtonDown) ClearPendingSilentAngles();
@@ -868,23 +869,10 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         }
     }
 
-    static size_t lastTestedTargets = static_cast<size_t>(-1);
-    static size_t lastVisibleTargets = static_cast<size_t>(-1);
-    if (testedTargets != lastTestedTargets || visibleTargets != lastVisibleTargets) {
-        printf("[Aim] visibility tested=%zu visible=%zu blocked=%zu\n",
-               testedTargets, visibleTargets, testedTargets - visibleTargets);
-        FILE* diagnostic = nullptr;
-        if (fopen_s(&diagnostic, "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\aim_visibility.log", "a") == 0 && diagnostic) {
-            fprintf(diagnostic, "tested=%zu visible=%zu blocked=%zu depthCheck=%d\n", testedTargets, visibleTargets, testedTargets - visibleTargets, useDepthWallCheck ? 1 : 0);
-            fclose(diagnostic);
-        }
-        lastTestedTargets = testedTargets;
-        lastVisibleTargets = visibleTargets;
-    }
-
     if (!best) {
         return;
     }
+    humanAimTargetFound = true;
 
     const float targetX = bestAimScreen.x;
     const float targetY = bestAimScreen.y;

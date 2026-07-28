@@ -3,10 +3,12 @@
 #include <MinHook.h>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 
 // The protobuf type and its generated implementation are kept in the work
 // tree supplied with this project. They are the same CMsgSosStartSoundEvent
@@ -25,6 +27,23 @@ void* parseMessageTarget = nullptr;
 bool soundHookInstalled = false;
 volatile LONG soundParsingDisabled = 0;
 std::mutex soundLogMutex;
+std::mutex soundCacheMutex;
+std::unordered_map<uint32_t, bool> meleeSoundHashCache;
+constexpr char kMeleeChargeSound[] = "Player.Melee.Hold.Shared";
+
+bool FindCachedMeleeSound(uint32_t hash, bool& isMeleeCharge) {
+    std::lock_guard<std::mutex> lock(soundCacheMutex);
+    const auto cached = meleeSoundHashCache.find(hash);
+    if (cached == meleeSoundHashCache.end()) return false;
+    isMeleeCharge = cached->second;
+    return true;
+}
+
+void CacheMeleeSound(uint32_t hash, bool isMeleeCharge) {
+    std::lock_guard<std::mutex> lock(soundCacheMutex);
+    if (meleeSoundHashCache.size() < 4096)
+        meleeSoundHashCache.emplace(hash, isMeleeCharge);
+}
 
 void LogSound(const char* message) {
     std::lock_guard<std::mutex> lock(soundLogMutex);
@@ -33,12 +52,9 @@ void LogSound(const char* message) {
 }
 
 void LogSoundEvent(int sourceEntity, uint32_t hash, const char* soundName) {
-    std::lock_guard<std::mutex> lock(soundLogMutex);
-    std::ofstream log("C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\sound_hook.log", std::ios::app);
-    if (log) {
-        log << "event source=" << sourceEntity << " hash=0x" << std::hex << hash
-            << std::dec << " name=" << (soundName ? soundName : "<null>") << '\n';
-    }
+    (void)sourceEntity;
+    (void)hash;
+    (void)soundName;
 }
 
 bool IsReadable(uintptr_t address, size_t size = sizeof(uintptr_t)) {
@@ -127,7 +143,10 @@ CSoundEventManager* GetSoundEventManager() {
 }
 
 void TryHandleSoundMessage(uintptr_t serializer, uintptr_t netMessage) {
-    if (InterlockedCompareExchange(&soundParsingDisabled, 0, 0) != 0 ||
+    // Sound parsing exists solely for Auto Parry. Avoid protobuf inspection,
+    // VirtualQuery calls and sound-name resolution for every combat sound
+    // while the feature is disabled.
+    if (!autoParry || InterlockedCompareExchange(&soundParsingDisabled, 0, 0) != 0 ||
         !IsReadable(serializer, 0x2A) || !IsReadable(netMessage + kParseMessageProtobufOffset)) return;
 
     int sourceEntity = 0;
@@ -139,6 +158,11 @@ void TryHandleSoundMessage(uintptr_t serializer, uintptr_t netMessage) {
         if (!message->has_source_entity_index() || !message->has_soundevent_hash()) return;
         sourceEntity = message->source_entity_index();
         soundHash = message->soundevent_hash();
+        bool cachedMeleeCharge = false;
+        if (FindCachedMeleeSound(soundHash, cachedMeleeCharge)) {
+            if (cachedMeleeCharge) NotifyParrySound(sourceEntity, kMeleeChargeSound);
+            return;
+        }
         const char* gameSoundName = nullptr;
         if (auto* manager = GetSoundEventManager())
             gameSoundName = manager->GetSoundEventName(soundHash);
@@ -156,8 +180,10 @@ void TryHandleSoundMessage(uintptr_t serializer, uintptr_t netMessage) {
         return;
     }
 
-    LogSoundEvent(sourceEntity, soundHash, soundName[0] ? soundName : "<unresolved>");
-    if (soundName[0]) NotifyParrySound(sourceEntity, soundName);
+    const bool isMeleeCharge = soundName[0] &&
+        std::strcmp(soundName, kMeleeChargeSound) == 0;
+    CacheMeleeSound(soundHash, isMeleeCharge);
+    if (isMeleeCharge) NotifyParrySound(sourceEntity, kMeleeChargeSound);
 }
 
 bool __fastcall HookParseMessage(uintptr_t demoRecorder, uintptr_t serializer, uintptr_t netMessage) {

@@ -16,9 +16,11 @@ void RestorePresentHook() {
 
 void ShutdownOverlay() {
     SaveConfig();
+    freeCam = false;
     RemoveUserCmdHook();
     RemoveInputLockHooks();
     RemoveSoundEventHook();
+    RemoveModelGlowHook();
     RemoveOrbEntityHooks();
     RemoveMeleeStateMonitor();
     if (stopHeroDiscoveryEvent) SetEvent(stopHeroDiscoveryEvent);
@@ -168,6 +170,9 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         }
         imguiInitialized = true;
         SetMenuOpen(menuOpen);
+        // The model hook is installed during initialization, but the DX11
+        // draw hooks can only be attached after the immediate context exists.
+        InstallModelGlowHook();
     }
 
     if (!imguiInitialized) return oPresent(pSwapChain, SyncInterval, Flags);
@@ -188,41 +193,30 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    // Copying the full depth texture and mapping it every Present stalls the
-    // render queue. Visibility checks do not need a new snapshot every frame;
-    // keep the last one and refresh it at 10 Hz.
-    static ULONGLONG lastDepthCapture = 0;
+    // Visibility is checked by the native physics trace in aim.cpp.  Do not
+    // copy/map the complete depth texture here: on teamfights this stalls the
+    // render queue and can cost several frames at a time.  Keep the old depth
+    // helpers available for diagnostics, but do not run them in Present.
+    // Entity discovery and assist logic are heavier than ImGui drawing. Keep
+    // one coherent snapshot and update it at a bounded cadence so high-refresh
+    // Present calls do not starve the render path.
+    static ULONGLONG lastVisualSnapshot = 0;
+    static ULONGLONG lastAssistUpdate = 0;
+    static std::vector<PlayerData> visualSnapshot;
     const ULONGLONG now = GetTickCount64();
-    const bool visibilityNeeded =
-        (aimAssist && aimVisibilityCheck &&
-         ((GetAsyncKeyState(aimAssistKey) & 0x8000) != 0 || aimToggleActive)) ||
-        (farmAssist && ((GetAsyncKeyState(farmAssistKey) & 0x8000) != 0 || farmToggleActive)) ||
-        autoLastHitOrbs;
-    bool depthReady = depthSnapshotReady;
-    if (visibilityNeeded && now - lastDepthCapture >= 100) {
-        depthReady = CaptureDepthSnapshot();
-        lastDepthCapture = now;
+    if (lastVisualSnapshot == 0 || now - lastVisualSnapshot >= 4) {
+        visualSnapshot = GetPlayers();
+        lastVisualSnapshot = now;
     }
-    const int depthState = depthReady ? 1 : 0;
-    if (depthState != depthDiagnosticState) {
-        const char* status = depthReady ? "ready" : "unavailable";
-        printf("[Aim] DX11 depth visibility: %s\n", status);
-        FILE* diagnostic = nullptr;
-        if (fopen_s(&diagnostic, "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\aim_visibility.log", "a") == 0 && diagnostic) {
-            fprintf(diagnostic, "depth=%s width=%u height=%u format=%u\n", status, depthWidth, depthHeight, static_cast<unsigned>(depthFormat));
-            fclose(diagnostic);
-        }
-        depthDiagnosticState = depthState;
+    if (lastAssistUpdate == 0 || now - lastAssistUpdate >= 16) {
+        AutoParry(visualSnapshot);
+        AimAtClosestEnemy(visualSnapshot);
+        FarmAimAssist(visualSnapshot);
+        AutoLastHitOrbs();
+        lastAssistUpdate = now;
     }
-    // Keep the regular ESP path frame-synchronous. Throttling this snapshot
-    // makes boxes and bones visibly lag behind moving entities.
-    const auto players = GetPlayers();
-    AutoParry(players);
-    AimAtClosestEnemy(players);
-    FarmAimAssist(players);
-    AutoLastHitOrbs();
-    RenderESP(players);
-    RenderMenu(players.size());
+    RenderESP(visualSnapshot);
+    RenderMenu(visualSnapshot.size());
 
     ImGui::EndFrame();
     ImGui::Render();
@@ -295,7 +289,20 @@ LRESULT __stdcall hkWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 return 1;
             }
         }
-
+        if (freeCamKeyCapture) {
+            const bool keyboardKey = uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN;
+            const bool mouseKey = uMsg == WM_LBUTTONDOWN || uMsg == WM_RBUTTONDOWN ||
+                                  uMsg == WM_MBUTTONDOWN || uMsg == WM_XBUTTONDOWN;
+            if (keyboardKey || mouseKey) {
+                if (keyboardKey) freeCamKey = static_cast<int>(wParam);
+                else if (uMsg == WM_LBUTTONDOWN) freeCamKey = VK_LBUTTON;
+                else if (uMsg == WM_RBUTTONDOWN) freeCamKey = VK_RBUTTON;
+                else if (uMsg == WM_MBUTTONDOWN) freeCamKey = VK_MBUTTON;
+                else freeCamKey = HIWORD(wParam) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2;
+                freeCamKeyCapture = false;
+                return 1;
+            }
+        }
         if (uMsg == WM_SETCURSOR) {
             SetCursor(LoadCursor(nullptr, IDC_ARROW));
             return TRUE;

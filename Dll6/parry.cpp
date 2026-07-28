@@ -32,20 +32,14 @@ void NotifyParrySound(int entityIndex, const char* soundName) {
 }
 
 static void WriteSpeedMeasurement(uintptr_t pawn, uint8_t team, float distance, float closingSpeed) {
-    static std::unordered_map<uintptr_t, ULONGLONG> lastWritten;
-    const ULONGLONG now = GetTickCount64();
-    auto it = lastWritten.find(pawn);
-    if (it != lastWritten.end() && now - it->second < 100) return;
-    lastWritten[pawn] = now;
-
-    std::ofstream out("C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\speed_measurement.txt",
-                      std::ios::app);
-    if (out) {
-        out << "SPEED pawn=0x" << std::hex << pawn << std::dec
-            << " team=" << static_cast<unsigned>(team)
-            << " distance=" << distance
-            << " closing=" << closingSpeed << "\n";
-    }
+    // This diagnostic used to open/append a file from the Present thread for
+    // every pawn every 100 ms.  In a teamfight that causes visible stalls on
+    // the game's main thread.  Keep the hook/API surface intact, but make the
+    // optional measurement side effect free.
+    (void)pawn;
+    (void)team;
+    (void)distance;
+    (void)closingSpeed;
 }
 
 void AutoParry(const std::vector<PlayerData>&) {

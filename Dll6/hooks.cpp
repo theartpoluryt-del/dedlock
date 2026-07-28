@@ -6,6 +6,10 @@
 #include <vector>
 #include <cstdlib>
 #include <atomic>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstring>
 #include <MinHook.h>
 
 namespace {
@@ -16,7 +20,7 @@ EntityLifecycleFn originalEntityRemoved = nullptr;
 void* entityAddedTarget = nullptr;
 void* entityRemovedTarget = nullptr;
 
-uintptr_t FindClientPattern(const char* pattern) {
+uintptr_t FindClientPattern(const char* pattern, uintptr_t startAddress = 0) {
     if (!clientBase) return 0;
     MODULEINFO info{};
     if (!GetModuleInformation(GetCurrentProcess(), reinterpret_cast<HMODULE>(clientBase), &info, sizeof(info))) return 0;
@@ -26,7 +30,12 @@ uintptr_t FindClientPattern(const char* pattern) {
     while (stream >> token) bytes.push_back(token == "?" ? -1 : std::strtoul(token.c_str(), nullptr, 16));
     if (bytes.empty() || bytes.size() > info.SizeOfImage) return 0;
     const auto* image = reinterpret_cast<const uint8_t*>(clientBase);
-    for (size_t i = 0; i + bytes.size() <= info.SizeOfImage; ++i) {
+    size_t begin = 0;
+    if (startAddress > clientBase) {
+        begin = static_cast<size_t>(startAddress - clientBase);
+        if (begin >= info.SizeOfImage) return 0;
+    }
+    for (size_t i = begin; i + bytes.size() <= info.SizeOfImage; ++i) {
         bool match = true;
         for (size_t j = 0; j < bytes.size(); ++j) {
             if (bytes[j] >= 0 && image[i + j] != static_cast<uint8_t>(bytes[j])) { match = false; break; }
@@ -64,6 +73,45 @@ using GetUserCmdBySequenceFn = uintptr_t(__fastcall*)(uintptr_t, uint32_t);
 CreateMoveFn originalCreateMove = nullptr;
 void* createMoveTarget = nullptr;
 
+// Current Deadlock camera-origin writer. This signature resolves the only
+// instructions in the current client image that store all three axes into
+// ViewMatrix + 0x28. Free cam temporarily NOPs those two stores, exactly like
+// the Source 2 external-freecam technique, and restores them on disable.
+constexpr const char* CameraOriginWriterPattern =
+    "F2 0F 11 05 ? ? ? ? 41 8B 46 08 89 05 ? ? ? ? "
+    "F2 0F 10 45 00";
+void* cameraOriginWriterXY = nullptr;
+void* cameraOriginWriterZ = nullptr;
+std::array<uint8_t, 8> cameraOriginWriterXYBytes{};
+std::array<uint8_t, 6> cameraOriginWriterZBytes{};
+std::mutex cameraOriginPatchMutex;
+bool cameraOriginWritersPatched = false;
+
+// Verified against the live current client: vtable RVA 0x22F5F88 and active
+// camera at manager + 0x28.
+constexpr uintptr_t CitadelCameraManagerRva = 0x3252E30;
+constexpr const char* CreateFreeCameraPattern =
+    "40 53 48 83 EC 20 48 8B D9 B9 F0 00 00 00 E8 ? ? ? ? "
+    "48 85 C0 74 ? 48 8B D3 48 8B C8 48 83 C4 20 5B E9";
+using CreateFreeCameraFn = uintptr_t(__fastcall*)(uintptr_t);
+using SwitchCameraFn = void(__fastcall*)(uintptr_t, uintptr_t, float);
+using DestroyCameraFn = uintptr_t(__fastcall*)(uintptr_t, uint32_t);
+using FreeCameraUpdateFn = void(__fastcall*)(uintptr_t);
+uintptr_t builtInFreeCamera = 0;
+uintptr_t cameraBeforeFreeCamera = 0;
+uintptr_t protectedCameraBeforeFreeCamera = 0;
+bool builtInFreeCameraActive = false;
+FreeCameraUpdateFn originalFreeCameraUpdate = nullptr;
+void* freeCameraUpdateTarget = nullptr;
+std::atomic<uintptr_t> freeCameraUserCmd{0};
+std::chrono::steady_clock::time_point lastFreeCameraUpdate{};
+std::mutex freeCameraLifecycleMutex;
+Vector3 freeCameraAnchor{};
+bool freeCameraAnchorReady = false;
+bool freeCameraStartPending = false;
+Vector3 freeCameraStartAngles{};
+bool freeCameraStartAnglesReady = false;
+
 using GetAsyncKeyStateFn = SHORT(WINAPI*)(int);
 using GetKeyStateFn = SHORT(WINAPI*)(int);
 using GetKeyboardStateFn = BOOL(WINAPI*)(PBYTE);
@@ -75,22 +123,432 @@ GetKeyboardStateFn originalGetKeyboardState = nullptr;
 GetRawInputDataFn originalGetRawInputData = nullptr;
 GetRawInputBufferFn originalGetRawInputBuffer = nullptr;
 
+bool WriteCodeBytes(void* address, const void* bytes, size_t size) {
+    if (!address || !bytes || !size) return false;
+    DWORD oldProtect{};
+    if (!VirtualProtect(address, size, PAGE_EXECUTE_READWRITE, &oldProtect))
+        return false;
+    std::memcpy(address, bytes, size);
+    FlushInstructionCache(GetCurrentProcess(), address, size);
+    DWORD unused{};
+    VirtualProtect(address, size, oldProtect, &unused);
+    return true;
+}
+
+bool PatchCameraOriginWriters() {
+    std::lock_guard<std::mutex> lock(cameraOriginPatchMutex);
+    if (cameraOriginWritersPatched) return true;
+
+    const uintptr_t expectedOrigin =
+        clientBase + Offsets::ViewMatrix + 0x28;
+    uintptr_t xy = 0;
+    uintptr_t z = 0;
+    uintptr_t searchFrom = clientBase;
+    while ((xy = FindClientPattern(CameraOriginWriterPattern, searchFrom))) {
+        z = xy + 12;
+        const int32_t xyDisplacement = Read<int32_t>(xy + 4);
+        const int32_t zDisplacement = Read<int32_t>(z + 2);
+        const uintptr_t xyTarget = xy + 8 + xyDisplacement;
+        const uintptr_t zTarget = z + 6 + zDisplacement;
+        if (xyTarget == expectedOrigin && zTarget == expectedOrigin + 8)
+            break;
+        searchFrom = xy + 1;
+        xy = 0;
+        z = 0;
+    }
+    if (!xy || !z) return false;
+
+    cameraOriginWriterXY = reinterpret_cast<void*>(xy);
+    cameraOriginWriterZ = reinterpret_cast<void*>(z);
+    std::memcpy(cameraOriginWriterXYBytes.data(), cameraOriginWriterXY,
+        cameraOriginWriterXYBytes.size());
+    std::memcpy(cameraOriginWriterZBytes.data(), cameraOriginWriterZ,
+        cameraOriginWriterZBytes.size());
+
+    const std::array<uint8_t, 8> xyNops{
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    const std::array<uint8_t, 6> zNops{
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    if (!WriteCodeBytes(cameraOriginWriterXY, xyNops.data(), xyNops.size()))
+        return false;
+    if (!WriteCodeBytes(cameraOriginWriterZ, zNops.data(), zNops.size())) {
+        WriteCodeBytes(cameraOriginWriterXY, cameraOriginWriterXYBytes.data(),
+            cameraOriginWriterXYBytes.size());
+        return false;
+    }
+
+    cameraOriginWritersPatched = true;
+    return true;
+}
+
+void RestoreCameraOriginWriters() {
+    std::lock_guard<std::mutex> lock(cameraOriginPatchMutex);
+    if (!cameraOriginWritersPatched) return;
+    WriteCodeBytes(cameraOriginWriterXY, cameraOriginWriterXYBytes.data(),
+        cameraOriginWriterXYBytes.size());
+    WriteCodeBytes(cameraOriginWriterZ, cameraOriginWriterZBytes.data(),
+        cameraOriginWriterZBytes.size());
+    cameraOriginWritersPatched = false;
+    cameraOriginWriterXY = nullptr;
+    cameraOriginWriterZ = nullptr;
+}
+
+void ClearFreeCameraMovement(uintptr_t userCmd) {
+    if (!userCmd) return;
+    auto* command = reinterpret_cast<CUserCmd*>(userCmd);
+    if (auto* base = command->cmd.mutable_base()) {
+        base->set_forwardmove(0.0f);
+        base->set_leftmove(0.0f);
+        base->set_upmove(0.0f);
+        if (auto* buttons = base->mutable_buttons_pb()) {
+            buttons->set_buttonstate1(0);
+            buttons->set_buttonstate2(0);
+            buttons->set_buttonstate3(0);
+        }
+    }
+    command->buttonStates.buttonState1 = 0;
+    command->buttonStates.buttonState2 = 0;
+    command->buttonStates.buttonState3 = 0;
+}
+
+float NormalizeCameraAngle(float angle) {
+    while (angle > 180.0f) angle -= 360.0f;
+    while (angle < -180.0f) angle += 360.0f;
+    return angle;
+}
+
+bool IsFreeCameraMovementKey(int key) {
+    return key == 'W' || key == 'S' || key == 'A' || key == 'D' ||
+        key == VK_SPACE || key == VK_CONTROL || key == VK_LCONTROL ||
+        key == VK_RCONTROL || key == VK_SHIFT || key == VK_LSHIFT ||
+        key == VK_RSHIFT;
+}
+
+bool IsGameFocused() {
+    if (!gameWindow || !IsWindow(gameWindow)) return false;
+    const HWND foreground = GetForegroundWindow();
+    if (!foreground) return false;
+    return foreground == gameWindow ||
+        GetAncestor(foreground, GA_ROOT) == GetAncestor(gameWindow, GA_ROOT);
+}
+
+void __fastcall hkFreeCameraUpdate(uintptr_t camera) {
+    std::lock_guard<std::mutex> lifecycleLock(freeCameraLifecycleMutex);
+    if (freeCameraStartPending && freeCameraAnchorReady) {
+        Write<Vector3>(camera + 0x38, freeCameraAnchor);
+        if (freeCameraStartAnglesReady) {
+            Write<float>(camera + 0xC4, freeCameraStartAngles.x);
+            Write<float>(camera + 0xCC, freeCameraStartAngles.y);
+            Write<float>(camera + 0x44, freeCameraStartAngles.x);
+            Write<float>(camera + 0x48, freeCameraStartAngles.y);
+            Write<float>(camera + 0x4C, freeCameraStartAngles.z);
+        }
+        freeCameraStartPending = false;
+    }
+    const Vector3 oldPosition = Read<Vector3>(camera + 0x38);
+    const float oldPitch = Read<float>(camera + 0xC4);
+    const float oldYaw = Read<float>(camera + 0xCC);
+
+    if (originalFreeCameraUpdate)
+        originalFreeCameraUpdate(camera);
+
+    if (!freeCam || camera != builtInFreeCamera)
+        return;
+
+    // CFreeCamera scales mouse deltas by frame time, which makes its stock
+    // sensitivity extremely low. Preserve the engine's own update and only
+    // amplify the angle delta it produced this frame.
+    constexpr float sensitivityMultiplier = 10.0f;
+    const float enginePitch = Read<float>(camera + 0xC4);
+    const float engineYaw = Read<float>(camera + 0xCC);
+    float pitch = oldPitch +
+        NormalizeCameraAngle(enginePitch - oldPitch) * sensitivityMultiplier;
+    float yaw = oldYaw +
+        NormalizeCameraAngle(engineYaw - oldYaw) * sensitivityMultiplier;
+    if (pitch > 89.0f) pitch = 89.0f;
+    if (pitch < -89.0f) pitch = -89.0f;
+    yaw = NormalizeCameraAngle(yaw);
+
+    Write<float>(camera + 0xC4, pitch);
+    Write<float>(camera + 0xCC, yaw);
+    Write<float>(camera + 0x44, pitch);
+    Write<float>(camera + 0x48, yaw);
+
+    const auto now = std::chrono::steady_clock::now();
+    float deltaTime = 1.0f / 60.0f;
+    if (lastFreeCameraUpdate.time_since_epoch().count()) {
+        deltaTime = std::chrono::duration<float>(
+            now - lastFreeCameraUpdate).count();
+        if (deltaTime < 0.001f) deltaTime = 0.001f;
+        if (deltaTime > 0.05f) deltaTime = 0.05f;
+    }
+    lastFreeCameraUpdate = now;
+
+    const auto keyDown = [](int key) {
+        if (!IsGameFocused()) return false;
+        const SHORT state = originalGetAsyncKeyState
+            ? originalGetAsyncKeyState(key)
+            : GetAsyncKeyState(key);
+        return (state & 0x8000) != 0;
+    };
+    const bool wantsMovement =
+        keyDown('W') || keyDown('S') || keyDown('A') || keyDown('D') ||
+        keyDown(VK_SPACE) || keyDown(VK_CONTROL);
+    // Keep only the engine's angle update. Its position update performs camera
+    // collision and pushes the camera onto the top of geometry. Start from
+    // the previous origin every frame and apply our own noclip translation.
+    Vector3 position = oldPosition;
+    if (wantsMovement) {
+        constexpr float degreesToRadians = 0.01745329251994329577f;
+        const float pitchRadians = pitch * degreesToRadians;
+        const float yawRadians = yaw * degreesToRadians;
+        const float cosPitch = std::cos(pitchRadians);
+        const Vector3 forward{
+            cosPitch * std::cos(yawRadians),
+            cosPitch * std::sin(yawRadians),
+            -std::sin(pitchRadians)};
+        const Vector3 right{
+            std::sin(yawRadians), -std::cos(yawRadians), 0.0f};
+
+        float forwardAxis =
+            (keyDown('W') ? 1.0f : 0.0f) -
+            (keyDown('S') ? 1.0f : 0.0f);
+        float rightAxis =
+            (keyDown('D') ? 1.0f : 0.0f) -
+            (keyDown('A') ? 1.0f : 0.0f);
+        float upAxis =
+            (keyDown(VK_SPACE) ? 1.0f : 0.0f) -
+            (keyDown(VK_CONTROL) ? 1.0f : 0.0f);
+        const float axisLength = std::sqrt(
+            forwardAxis * forwardAxis + rightAxis * rightAxis +
+            upAxis * upAxis);
+        if (axisLength > 1.0f) {
+            forwardAxis /= axisLength;
+            rightAxis /= axisLength;
+            upAxis /= axisLength;
+        }
+
+        const float speed =
+            freeCamSpeed * (keyDown(VK_SHIFT) ? 3.0f : 1.0f) * deltaTime;
+        position.x +=
+            (forward.x * forwardAxis + right.x * rightAxis) * speed;
+        position.y +=
+            (forward.y * forwardAxis + right.y * rightAxis) * speed;
+        position.z +=
+            (forward.z * forwardAxis + upAxis) * speed;
+    }
+
+    // Deliberately do not clamp the camera to the activation anchor.  The
+    // free camera is noclip and may travel any distance; only reject invalid
+    // coordinates so a bad input/state cannot write NaNs into the engine.
+    if (!std::isfinite(position.x) ||
+        !std::isfinite(position.y) ||
+        !std::isfinite(position.z)) {
+        position = freeCameraAnchorReady
+            ? freeCameraAnchor : oldPosition;
+    }
+    Write<Vector3>(camera + 0x38, position);
+
+    // The camera has already consumed this command. Clear movement only now,
+    // so WASD moves CFreeCamera but is not sent as pawn movement.
+    ClearFreeCameraMovement(
+        freeCameraUserCmd.load(std::memory_order_acquire));
+}
+
+bool EnsureFreeCameraUpdateHook(uintptr_t camera) {
+    if (freeCameraUpdateTarget && originalFreeCameraUpdate)
+        return true;
+    const uintptr_t vtable = Read<uintptr_t>(camera);
+    const uintptr_t updateAddress =
+        Read<uintptr_t>(vtable + 3 * sizeof(uintptr_t));
+    if (!vtable || !updateAddress)
+        return false;
+
+    const MH_STATUS initStatus = MH_Initialize();
+    if (initStatus != MH_OK &&
+        initStatus != MH_ERROR_ALREADY_INITIALIZED)
+        return false;
+
+    void* target = reinterpret_cast<void*>(updateAddress);
+    const MH_STATUS createStatus = MH_CreateHook(
+        target, reinterpret_cast<void*>(&hkFreeCameraUpdate),
+        reinterpret_cast<void**>(&originalFreeCameraUpdate));
+    if (createStatus != MH_OK &&
+        createStatus != MH_ERROR_ALREADY_CREATED)
+        return false;
+    const MH_STATUS enableStatus = MH_EnableHook(target);
+    if (enableStatus != MH_OK && enableStatus != MH_ERROR_ENABLED)
+        return false;
+
+    freeCameraUpdateTarget = target;
+    return true;
+}
+
+bool ActivateBuiltInFreeCamera() {
+    if (builtInFreeCameraActive && builtInFreeCamera) return true;
+    RestoreCameraOriginWriters();
+
+    const uintptr_t manager = clientBase + CitadelCameraManagerRva;
+    const uintptr_t managerVtable = Read<uintptr_t>(manager);
+    const uintptr_t switchAddress =
+        Read<uintptr_t>(managerVtable + 9 * sizeof(uintptr_t));
+    const uintptr_t factoryAddress =
+        FindClientPattern(CreateFreeCameraPattern);
+    if (!managerVtable || !switchAddress || !factoryAddress) return false;
+
+    const uintptr_t oldCamera = Read<uintptr_t>(manager + 0x28);
+    if (!oldCamera) return false;
+    freeCameraStartAngles = {
+        Read<float>(oldCamera + 0x44),
+        Read<float>(oldCamera + 0x48),
+        Read<float>(oldCamera + 0x4C)};
+    freeCameraStartAnglesReady =
+        std::isfinite(freeCameraStartAngles.x) &&
+        std::isfinite(freeCameraStartAngles.y) &&
+        std::isfinite(freeCameraStartAngles.z);
+    Vector3 thirdPersonStart = currentCameraPosition;
+    bool thirdPersonStartReady = currentCameraPositionReady &&
+        std::isfinite(thirdPersonStart.x) &&
+        std::isfinite(thirdPersonStart.y) &&
+        std::isfinite(thirdPersonStart.z);
+    if (!thirdPersonStartReady) {
+        thirdPersonStart = Read<Vector3>(oldCamera + 0x38);
+        thirdPersonStartReady =
+            std::isfinite(thirdPersonStart.x) &&
+            std::isfinite(thirdPersonStart.y) &&
+            std::isfinite(thirdPersonStart.z);
+    }
+
+    if (builtInFreeCamera) {
+        if (!EnsureFreeCameraUpdateHook(builtInFreeCamera))
+            return false;
+        cameraBeforeFreeCamera = oldCamera;
+        reinterpret_cast<SwitchCameraFn>(switchAddress)(
+            manager, builtInFreeCamera, 0.0f);
+        builtInFreeCameraActive =
+            Read<uintptr_t>(manager + 0x28) == builtInFreeCamera;
+        return builtInFreeCameraActive;
+    }
+
+    auto createCamera =
+        reinterpret_cast<CreateFreeCameraFn>(factoryAddress);
+    const uintptr_t newCamera = createCamera(manager);
+    if (!newCamera) return false;
+
+    if (!EnsureFreeCameraUpdateHook(newCamera)) {
+        const uintptr_t vtable = Read<uintptr_t>(newCamera);
+        const uintptr_t destructor = Read<uintptr_t>(vtable);
+        if (destructor)
+            reinterpret_cast<DestroyCameraFn>(destructor)(newCamera, 1);
+        return false;
+    }
+
+    auto switchCamera = reinterpret_cast<SwitchCameraFn>(switchAddress);
+    // SwitchCamera normally destroys the outgoing camera unless it matches
+    // manager + 0x20. Protect the exact active player camera only for the
+    // duration of this switch, then restore the manager's original field.
+    protectedCameraBeforeFreeCamera = Read<uintptr_t>(manager + 0x20);
+    const bool protectPlayerCamera =
+        oldCamera != protectedCameraBeforeFreeCamera;
+    if (protectPlayerCamera)
+        Write<uintptr_t>(manager + 0x20, oldCamera);
+    switchCamera(manager, newCamera, 0.0f);
+    if (protectPlayerCamera)
+        Write<uintptr_t>(
+            manager + 0x20, protectedCameraBeforeFreeCamera);
+    if (Read<uintptr_t>(manager + 0x28) != newCamera) {
+        const uintptr_t vtable = Read<uintptr_t>(newCamera);
+        const uintptr_t destructor = Read<uintptr_t>(vtable);
+        if (destructor)
+            reinterpret_cast<DestroyCameraFn>(destructor)(newCamera, 1);
+        return false;
+    }
+
+    cameraBeforeFreeCamera = oldCamera;
+    builtInFreeCamera = newCamera;
+    builtInFreeCameraActive = true;
+    if (thirdPersonStartReady) {
+        // Preserve the exact third-person camera position from immediately
+        // before the switch, including its current distance and offset.
+        freeCameraAnchor = thirdPersonStart;
+    } else {
+        Vector3 playerOrigin = currentLocalPosition;
+        if (!currentLocalPositionReady && currentLocalPawn)
+            GetEntityPosition(currentLocalPawn, playerOrigin);
+        freeCameraAnchor = playerOrigin;
+        freeCameraAnchor.z += 64.0f;
+    }
+    freeCameraAnchorReady =
+        std::isfinite(freeCameraAnchor.x) &&
+        std::isfinite(freeCameraAnchor.y) &&
+        std::isfinite(freeCameraAnchor.z);
+    freeCameraStartPending = freeCameraAnchorReady;
+    return true;
+}
+
+void DeactivateBuiltInFreeCamera() {
+    std::lock_guard<std::mutex> lifecycleLock(freeCameraLifecycleMutex);
+    freeCameraUserCmd.store(0, std::memory_order_release);
+    lastFreeCameraUpdate = {};
+    freeCameraAnchorReady = false;
+    freeCameraStartPending = false;
+    freeCameraStartAnglesReady = false;
+    if (!builtInFreeCamera) {
+        builtInFreeCameraActive = false;
+        cameraBeforeFreeCamera = 0;
+        protectedCameraBeforeFreeCamera = 0;
+        return;
+    }
+
+    const uintptr_t manager = clientBase + CitadelCameraManagerRva;
+    const uintptr_t managerVtable = Read<uintptr_t>(manager);
+    const uintptr_t switchAddress =
+        Read<uintptr_t>(managerVtable + 9 * sizeof(uintptr_t));
+    if (Read<uintptr_t>(manager + 0x28) == builtInFreeCamera &&
+        cameraBeforeFreeCamera &&
+        cameraBeforeFreeCamera != builtInFreeCamera &&
+        switchAddress) {
+        reinterpret_cast<SwitchCameraFn>(switchAddress)(
+            manager, cameraBeforeFreeCamera, 0.0f);
+    }
+
+    // SwitchCamera owns the outgoing camera lifetime and may destroy it before
+    // returning. Never call its destructor a second time, and discard our
+    // pointer once the manager has completed the switch.
+    if (Read<uintptr_t>(manager + 0x28) != builtInFreeCamera)
+        builtInFreeCamera = 0;
+    cameraBeforeFreeCamera = 0;
+    protectedCameraBeforeFreeCamera = 0;
+    builtInFreeCameraActive = false;
+}
+
 SHORT WINAPI hkGetAsyncKeyState(int key) {
-    if (menuOpen) return 0;
+    if (!IsGameFocused() || menuOpen ||
+        (freeCam && IsFreeCameraMovementKey(key))) return 0;
     return originalGetAsyncKeyState ? originalGetAsyncKeyState(key) : 0;
 }
 
 SHORT WINAPI hkGetKeyState(int key) {
-    if (menuOpen) return 0;
+    if (!IsGameFocused() || menuOpen ||
+        (freeCam && IsFreeCameraMovementKey(key))) return 0;
     return originalGetKeyState ? originalGetKeyState(key) : 0;
 }
 
 BOOL WINAPI hkGetKeyboardState(PBYTE state) {
-    if (menuOpen) {
+    if (!IsGameFocused() || menuOpen) {
         if (state) ZeroMemory(state, 256);
         return TRUE;
     }
-    return originalGetKeyboardState ? originalGetKeyboardState(state) : FALSE;
+    const BOOL result =
+        originalGetKeyboardState ? originalGetKeyboardState(state) : FALSE;
+    if (result && freeCam && state) {
+        constexpr int blockedKeys[] = {
+            'W', 'S', 'A', 'D', VK_SPACE, VK_CONTROL, VK_LCONTROL,
+            VK_RCONTROL, VK_SHIFT, VK_LSHIFT, VK_RSHIFT};
+        for (const int key : blockedKeys)
+            state[key] = 0;
+    }
+    return result;
 }
 
 UINT WINAPI hkGetRawInputData(HRAWINPUT handle, UINT command, LPVOID data, PUINT size, UINT headerSize) {
@@ -99,9 +557,21 @@ UINT WINAPI hkGetRawInputData(HRAWINPUT handle, UINT command, LPVOID data, PUINT
         SetLastError(ERROR_ACCESS_DENIED);
         return static_cast<UINT>(-1);
     }
-    return originalGetRawInputData
+    const UINT result = originalGetRawInputData
         ? originalGetRawInputData(handle, command, data, size, headerSize)
         : static_cast<UINT>(-1);
+    if (freeCam && command == RID_INPUT && data &&
+        result != static_cast<UINT>(-1) &&
+        result >= sizeof(RAWINPUTHEADER)) {
+        auto* input = static_cast<RAWINPUT*>(data);
+        if (input->header.dwType == RIM_TYPEKEYBOARD &&
+            (!IsGameFocused() || freeCam) &&
+            IsFreeCameraMovementKey(input->data.keyboard.VKey)) {
+            input->data.keyboard.Flags |= RI_KEY_BREAK;
+            input->data.keyboard.Message = WM_KEYUP;
+        }
+    }
+    return result;
 }
 
 UINT WINAPI hkGetRawInputBuffer(PRAWINPUT data, PUINT size, UINT headerSize) {
@@ -110,9 +580,25 @@ UINT WINAPI hkGetRawInputBuffer(PRAWINPUT data, PUINT size, UINT headerSize) {
         SetLastError(ERROR_ACCESS_DENIED);
         return static_cast<UINT>(-1);
     }
-    return originalGetRawInputBuffer
+    const UINT result = originalGetRawInputBuffer
         ? originalGetRawInputBuffer(data, size, headerSize)
         : static_cast<UINT>(-1);
+    if (freeCam && data && result != static_cast<UINT>(-1)) {
+        RAWINPUT* input = data;
+        for (UINT i = 0; i < result; ++i) {
+            if (input->header.dwType == RIM_TYPEKEYBOARD &&
+                (!IsGameFocused() || freeCam) &&
+                IsFreeCameraMovementKey(input->data.keyboard.VKey)) {
+                input->data.keyboard.Flags |= RI_KEY_BREAK;
+                input->data.keyboard.Message = WM_KEYUP;
+            }
+            const UINT alignedSize =
+                (input->header.dwSize + 7u) & ~7u;
+            input = reinterpret_cast<RAWINPUT*>(
+                reinterpret_cast<uint8_t*>(input) + alignedSize);
+        }
+    }
+    return result;
 }
 
 uintptr_t GetCurrentController() {
@@ -216,22 +702,33 @@ void ApplyPendingUserCmdAngles(uintptr_t userCmd) {
     ++silentAppliedCalls;
 }
 
+void UpdateFreeCameraCommand(uintptr_t userCmd) {
+    if (!freeCam) {
+        DeactivateBuiltInFreeCamera();
+        return;
+    }
+    if (!userCmd || !ActivateBuiltInFreeCamera())
+        return;
+
+    freeCameraUserCmd.store(userCmd, std::memory_order_release);
+    // Camera translation uses raw key state in hkFreeCameraUpdate, so the
+    // outgoing command can be cleared immediately and the pawn stays still.
+    ClearFreeCameraMovement(userCmd);
+}
+
 void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3) {
     if (originalCreateMove) originalCreateMove(input, splitScreenIndex, a3);
     const auto callCount = ++createMoveCalls;
     const uintptr_t userCmd = GetCurrentUserCmd();
     if (userCmd) ++userCmdResolvedCalls;
     ApplyPendingUserCmdAngles(userCmd);
-    if ((callCount % 120) == 0) {
-        std::ofstream log(
-            "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\usercmd_runtime.log",
-            std::ios::app);
-        if (log) {
-            log << "createMove=" << callCount
-                << " userCmd=" << userCmdResolvedCalls.load()
-                << " silentApplied=" << silentAppliedCalls.load() << '\n';
-        }
-    }
+    static bool freeCamKeyLastDown = false;
+    const bool freeCamKeyDown = IsGameFocused() && !menuOpen && freeCamKey > 0 &&
+        ((GetAsyncKeyState(freeCamKey) & 0x8000) != 0);
+    if (freeCamKeyDown && !freeCamKeyLastDown)
+        freeCam = !freeCam;
+    freeCamKeyLastDown = freeCamKeyDown;
+    UpdateFreeCameraCommand(userCmd);
 }
 
 void PatchInputHistory(uintptr_t userCmd, const Vector3& angles) {
@@ -275,6 +772,9 @@ uintptr_t __fastcall hkUserCmdToNetwork(uintptr_t a1, uintptr_t a2, uintptr_t a3
     // Silent is now handled by paired mouse movement in aim.cpp. Keep the
     // serializer untouched so it cannot modify ordinary input or fight the
     // camera restoration step.
+    if (freeCam)
+        ClearFreeCameraMovement(
+            freeCameraUserCmd.load(std::memory_order_acquire));
     return originalUserCmdToNetwork
         ? originalUserCmdToNetwork(a1, a2, a3) : 0;
 }
@@ -363,18 +863,27 @@ bool InstallCreateMoveHook(const UserCmdFunctionAddresses& functions) {
 }
 
 void RemoveUserCmdHook() {
-    if (!userCmdHookInstalled || !clientBase) return;
-    void* target = reinterpret_cast<void*>(clientBase + UserCmdToNetworkRva);
-    MH_DisableHook(target);
-    MH_RemoveHook(target);
-    originalUserCmdToNetwork = nullptr;
-    userCmdHookInstalled = false;
+    DeactivateBuiltInFreeCamera();
+    if (freeCameraUpdateTarget) {
+        MH_DisableHook(freeCameraUpdateTarget);
+        MH_RemoveHook(freeCameraUpdateTarget);
+        freeCameraUpdateTarget = nullptr;
+        originalFreeCameraUpdate = nullptr;
+    }
+    if (userCmdHookInstalled && clientBase) {
+        void* target = reinterpret_cast<void*>(clientBase + UserCmdToNetworkRva);
+        MH_DisableHook(target);
+        MH_RemoveHook(target);
+        originalUserCmdToNetwork = nullptr;
+        userCmdHookInstalled = false;
+    }
     if (createMoveTarget) {
         MH_DisableHook(createMoveTarget);
         MH_RemoveHook(createMoveTarget);
         createMoveTarget = nullptr;
         originalCreateMove = nullptr;
     }
+    RestoreCameraOriginWriters();
 }
 
 bool InstallInputLockHooks() {
@@ -521,6 +1030,10 @@ DWORD WINAPI InitializeThread(LPVOID) {
 
     if (!clientBase) return 0;
 
+    const bool nativeGlowFound = InitializeNativeGlow();
+    printf("[Glow] native registration: %s\n",
+           nativeGlowFound ? "ready" : "unavailable");
+
     {
         std::ofstream marker(
             "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\Dll6_runtime.marker",
@@ -545,10 +1058,15 @@ DWORD WINAPI InitializeThread(LPVOID) {
     if (stopHeroDiscoveryEvent) {
         heroDiscoveryThread = CreateThread(nullptr, 0, HeroDiscoveryWorker, nullptr, 0, nullptr);
         farmTargetThread = CreateThread(nullptr, 0, FarmTargetWorker, nullptr, 0, nullptr);
-        // DX11 ESP is intentionally independent from the unresolved native
-        // glow experiment. Do not mutate game render properties in the stable
-        // build.
+        if (heroDiscoveryThread)
+            SetThreadPriority(heroDiscoveryThread, THREAD_PRIORITY_BELOW_NORMAL);
+        if (farmTargetThread)
+            SetThreadPriority(farmTargetThread, THREAD_PRIORITY_BELOW_NORMAL);
+        // Glow is handled by the native PlayerOutline hook. The legacy
+        // CGlowProperty worker is intentionally disabled because it competes
+        // with the outline renderer and creates a jittering second layer.
     }
+    InstallModelGlowHook();
     // UserCmd serializer hook disabled: restore stable pre-silent behavior.
     printf("[!] CUserCmd_to_network silent hook disabled\n");
     const auto userCmdFunctions = ResolveUserCmdFunctions(clientBase);
@@ -575,6 +1093,7 @@ DWORD WINAPI InitializeThread(LPVOID) {
     }
     printf("[+] CreateMove hook: %s\n", InstallCreateMoveHook(userCmdFunctions) ? "installed" : "not installed");
     printf("[+] Input lock hooks: %s\n", InstallInputLockHooks() ? "installed" : "not installed");
+    printf("[+] Free camera origin patch: signature ready\n");
     printf("[+] Sound event hook: %s\n", InstallSoundEventHook() ? "installed" : "not installed");
     SetupHooks();
     return 0;

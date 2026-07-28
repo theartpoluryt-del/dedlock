@@ -1,6 +1,17 @@
 #include "shared.h"
 #include <fstream>
+#include <shared_mutex>
 #include <cctype>
+#include <atomic>
+
+namespace {
+void LogNativeGlow(const char* message) {
+    std::ofstream log(
+        "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\native_glow.log",
+        std::ios::app);
+    if (log) log << message << '\n';
+}
+}
 
 BOOL CALLBACK FindGameWindowCallback(HWND window, LPARAM lParam) {
     auto* data = reinterpret_cast<WindowSearchData*>(lParam);
@@ -142,6 +153,26 @@ bool GetEntityPosition(uintptr_t entity, Vector3& position) {
            (std::fabs(position.x) > 0.01f || std::fabs(position.y) > 0.01f || std::fabs(position.z) > 0.01f);
 }
 
+bool GetEntityRenderPosition(uintptr_t entity, Vector3& position) {
+    const uintptr_t sceneNode =
+        Read<uintptr_t>(entity + Offsets::GameSceneNode);
+    if (sceneNode) {
+        position =
+            Read<Vector3>(sceneNode + Offsets::SceneNodeRenderOrigin);
+        if (std::isfinite(position.x) && std::isfinite(position.y) &&
+            std::isfinite(position.z) &&
+            std::fabs(position.x) < 100000.0f &&
+            std::fabs(position.y) < 100000.0f &&
+            std::fabs(position.z) < 100000.0f &&
+            (std::fabs(position.x) > 0.01f ||
+             std::fabs(position.y) > 0.01f ||
+             std::fabs(position.z) > 0.01f)) {
+            return true;
+        }
+    }
+    return GetEntityPosition(entity, position);
+}
+
 bool GetXpOrbPosition(uintptr_t entity, Vector3& position) {
     const uintptr_t sceneNode = Read<uintptr_t>(entity + Offsets::GameSceneNode);
     if (sceneNode) {
@@ -204,7 +235,13 @@ bool GetEntityScreenBounds(uintptr_t entity, const Vector3& origin, const Matrix
     if (!projected || !std::isfinite(left) || !std::isfinite(top) ||
         !std::isfinite(right) || !std::isfinite(bottom)) return false;
     const float height = bottom - top;
-    if (height < 4.0f || height > ImGui::GetIO().DisplaySize.y * 1.5f) return false;
+    const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
+    const float width = right - left;
+    const float maxCoordinate = (std::max)(displaySize.x, displaySize.y) * 4.0f;
+    if (height < 4.0f || width < 2.0f ||
+        height > displaySize.y * 1.5f || width > displaySize.x * 1.5f ||
+        std::fabs(left) > maxCoordinate || std::fabs(right) > maxCoordinate ||
+        std::fabs(top) > maxCoordinate || std::fabs(bottom) > maxCoordinate) return false;
 
     // The collision capsule stops short of the head and feet on several hero
     // models. Keep the projected horizontal bounds, but compensate vertically
@@ -215,7 +252,9 @@ bool GetEntityScreenBounds(uintptr_t entity, const Vector3& origin, const Matrix
     left -= margin;
     right += margin;
     return std::isfinite(left) && std::isfinite(top) && std::isfinite(right) &&
-           std::isfinite(bottom) && right > left && bottom > top;
+           std::isfinite(bottom) && right > left && bottom > top &&
+           right - left <= displaySize.x * 1.5f &&
+           bottom - top <= displaySize.y * 1.5f;
 }
 
 std::string GetEntityClassName(uintptr_t entity) {
@@ -223,9 +262,9 @@ std::string GetEntityClassName(uintptr_t entity) {
     const uintptr_t vtable = Read<uintptr_t>(entity);
     if (!vtable) return {};
     static std::unordered_map<uintptr_t, std::string> classCache;
-    static std::mutex classCacheMutex;
+    static std::shared_mutex classCacheMutex;
     {
-        std::lock_guard<std::mutex> lock(classCacheMutex);
+        std::shared_lock<std::shared_mutex> lock(classCacheMutex);
         const auto cached = classCache.find(vtable);
         if (cached != classCache.end()) return cached->second;
     }
@@ -242,53 +281,76 @@ std::string GetEntityClassName(uintptr_t entity) {
         typeName.push_back(character);
     }
     {
-        std::lock_guard<std::mutex> lock(classCacheMutex);
-        if (classCache.size() < 512) classCache.emplace(vtable, typeName);
+        std::unique_lock<std::shared_mutex> lock(classCacheMutex);
+        if (classCache.size() < 4096) classCache.emplace(vtable, typeName);
     }
     return typeName;
 }
 
 bool NotifyGlowTypeChanged(uintptr_t glow) {
-    using GlowTypeChangedFn = void(__fastcall*)(void*);
-    const auto onGlowTypeChanged = reinterpret_cast<GlowTypeChangedFn>(clientBase + Offsets::OnGlowTypeChanged);
+    if (!glow) return false;
+    const uintptr_t entity = glow - Offsets::Glow;
     __try {
-        onGlowTypeChanged(reinterpret_cast<void*>(glow));
+        // The fixed callback moved with the client build and currently
+        // raises an exception. Use the validated native wrapper discovered
+        // from the live client image instead.
+        Write<bool>(glow + Offsets::GlowEligible, true);
+        Write<bool>(glow + Offsets::IsGlowing, true);
+        if (!RegisterNativeGlow(entity)) {
+            LogNativeGlow("native wrapper failed");
+            return false;
+        }
+        LogNativeGlow("native wrapper ok");
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogNativeGlow("native wrapper exception");
         return false;
     }
 }
 
 void ApplyHeroGlow(uintptr_t entity) {
+    static std::atomic_bool firstGlowLogged = false;
+    if (!firstGlowLogged.exchange(true)) {
+        LogNativeGlow("ApplyHeroGlow reached");
+    }
     const uintptr_t glow = entity + Offsets::Glow;
     bool shouldNotify = false;
 
-    // Keep the property values refreshed. The engine can reset CGlowProperty
-    // while the pawn is being spawned or when its network state changes.
+    // The client can reset m_iGlowType after a network update even though the
+    // property object remains alive. Re-register whenever the complete-model
+    // glow pass is no longer active.
     {
         std::lock_guard lock(glowMutex);
-        if (registeredGlows.find(entity) == registeredGlows.end() &&
+        const int currentType = Read<int>(glow + Offsets::GlowType);
+        if (currentType != 1 &&
             queuedGlows.insert(entity).second) {
             shouldNotify = true;
         }
     }
 
-    Write<Vector3>(glow + Offsets::GlowColor, { 0.0f, 1.0f, 0.15f });
-    // Types 1-3 are submitted to the renderer; 3 is the full model-outline pass.
-    Write<int>(glow + Offsets::GlowType, 3);
-    // Zero means no team restriction for the glow pass.
-    // The renderer evaluates this against the observing player's team. Team 0
-    // registers the property but does not expose it to the local camera.
-    Write<int>(glow + Offsets::GlowTeam, 2);
-    Write<int>(glow + Offsets::GlowRange, 100000);
+    Write<Vector3>(glow + Offsets::GlowColor, { 0.10f, 1.0f, 0.18f });
+    Write<int>(glow + Offsets::GlowType, 1);
+    Write<int>(glow + Offsets::GlowTeam, -1);
+    Write<int>(glow + Offsets::GlowRange, 0);
     Write<int>(glow + Offsets::GlowRangeMin, 0);
-    Write<ColorRGBA>(glow + Offsets::GlowColorOverride, { 0, 255, 38, 255 });
+    Write<ColorRGBA>(glow + Offsets::GlowColorOverride, { 26, 255, 46, 255 });
     Write<bool>(glow + Offsets::GlowFlashing, false);
-    Write<float>(glow + Offsets::GlowTime, 0.0f);
+    Write<float>(glow + Offsets::GlowTime, 1.0f);
     Write<float>(glow + Offsets::GlowStartTime, 0.0f);
-    Write<bool>(glow + Offsets::IsEligibleForScreenHighlight, true);
+    Write<bool>(glow + Offsets::GlowEligible, true);
     Write<bool>(glow + Offsets::IsGlowing, true);
+    Write<float>(entity + Offsets::GlowBackfaceMult, 1.0f);
+
+    // Register only after the property has its final values. The native
+    // wrapper snapshots the current CGlowProperty state when it adds the
+    // entity to the renderer's highlight list.
+    if (nativeGlowReady && shouldNotify) {
+        const bool registered = RegisterNativeGlow(entity);
+        if (registered) LogNativeGlow("worker native wrapper ok");
+        else LogNativeGlow("worker native wrapper failed");
+    }
+
 
     // Direct field writes are not enough: the engine adds the property to its
     // render list from this network-change callback.
@@ -389,7 +451,10 @@ void RefreshHeroPawns() {
     std::sort(found.begin(), found.end());
     found.erase(std::unique(found.begin(), found.end()), found.end());
     const size_t pawnCount = found.size();
-    {
+    // Do not publish a transient empty scan. During entity-table updates the
+    // renderer can briefly expose no valid positions; replacing the live list
+    // in that window makes the native outline disappear for a frame.
+    if (!found.empty()) {
         std::lock_guard<std::mutex> lock(heroPawnsMutex);
         heroPawns = std::move(found);
     }
@@ -687,11 +752,20 @@ void RefreshFarmTargets() {
     constexpr uintptr_t tableOffset = Offsets::EntityChunks;
     std::unordered_set<uintptr_t> seen;
     if (root) {
-        for (uint32_t chunkIndex = 0; chunkIndex <= (Offsets::MaxEntityIndex >> Offsets::HandleChunkShift); ++chunkIndex) {
+        const int reportedHighest = Read<int>(root + Offsets::HighestEntityIndex);
+        const uint32_t highestEntityIndex =
+            reportedHighest > 0 && reportedHighest <= static_cast<int>(Offsets::HandleIndexMask)
+                ? static_cast<uint32_t>(reportedHighest)
+                : Offsets::HandleIndexMask;
+        const uint32_t highestChunk = highestEntityIndex >> Offsets::HandleChunkShift;
+        for (uint32_t chunkIndex = 0; chunkIndex <= highestChunk; ++chunkIndex) {
                 const uintptr_t chunk = Read<uintptr_t>(root + tableOffset +
                     Offsets::EntityChunkStride * chunkIndex);
                 if (!chunk) continue;
-                for (uint32_t slot = 0; slot <= Offsets::HandleChunkMask; ++slot) {
+                const uint32_t highestSlot = chunkIndex == highestChunk
+                    ? (highestEntityIndex & Offsets::HandleChunkMask)
+                    : Offsets::HandleChunkMask;
+                for (uint32_t slot = 0; slot <= highestSlot; ++slot) {
                     const uintptr_t identity = chunk + Offsets::EntityStride * slot;
                     const uint32_t storedHandle = Read<uint32_t>(identity + 0x10);
                     const uint32_t expectedIndex = (chunkIndex << Offsets::HandleChunkShift) | slot;
@@ -831,7 +905,11 @@ DWORD WINAPI FarmTargetWorker(LPVOID) {
     while (!stopHeroDiscoveryEvent ||
            WaitForSingleObject(stopHeroDiscoveryEvent, 0) != WAIT_OBJECT_0) {
         RefreshFarmTargets();
-        Sleep(16);
+        // Entity additions/removals are delivered through the event queue;
+        // the table scan only needs to refresh positions and validate stale
+        // slots. Scanning it every 16 ms needlessly competes with rendering
+        // during teamfights, so leave a small CPU budget for the game.
+        Sleep(50);
     }
     return 0;
 }
@@ -868,6 +946,7 @@ DWORD WINAPI GlowApplyWorker(LPVOID) {
                 if (glowEnabled) {
                     ApplyHeroGlow(pawn);
                 } else {
+                    Write<bool>(pawn + Offsets::Glow + Offsets::GlowEligible, false);
                     Write<bool>(pawn + Offsets::Glow + Offsets::IsGlowing, false);
                     Write<int>(pawn + Offsets::Glow + Offsets::GlowType, 0);
                 }
@@ -876,7 +955,7 @@ DWORD WINAPI GlowApplyWorker(LPVOID) {
 
         // The renderer clears m_bGlowing after consuming it. Reassert it on
         // the render cadence while keeping the expensive pawn scan at 1 Hz.
-        if (WaitForSingleObject(stopHeroDiscoveryEvent, 16) == WAIT_OBJECT_0) break;
+        if (WaitForSingleObject(stopHeroDiscoveryEvent, 50) == WAIT_OBJECT_0) break;
     }
     return 0;
 }

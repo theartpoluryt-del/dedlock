@@ -1,4 +1,5 @@
 #include "shared.h"
+#include <fstream>
 
 void SetMenuOpen(bool open) {
     menuOpen = open;
@@ -123,6 +124,511 @@ std::string ReadPlayerName(uintptr_t controller) {
     return name;
 }
 
+struct CollisionDiagnosticSnapshot {
+    bool valid{};
+    std::string hero;
+    Vector3 position{};
+    Vector3 mins{};
+    Vector3 maxs{};
+    Vector3 specifiedMins{};
+    Vector3 specifiedMaxs{};
+    Vector3 surroundingMins{};
+    Vector3 surroundingMaxs{};
+    Vector3 capsuleCenter1{};
+    Vector3 capsuleCenter2{};
+    float boundingRadius{};
+    uint8_t solidFlags{};
+    uint8_t solidType{};
+    float capsuleRadius{};
+    uint32_t flags{};
+    uint8_t moveType{};
+    uint8_t actualMoveType{};
+    uint8_t collisionGroup{};
+    bool toggleDuck{};
+    bool ducked{};
+    bool colliding{};
+};
+
+CollisionDiagnosticSnapshot collisionSnapshot{};
+
+struct OriginalHullState {
+    uintptr_t pawn{};
+    uintptr_t collision{};
+    Vector3 specifiedMins{};
+    Vector3 specifiedMaxs{};
+    Vector3 surroundingMins{};
+    Vector3 surroundingMaxs{};
+    Vector3 maxs{};
+    float boundingRadius{};
+    uint8_t solidFlags{};
+    uint8_t solidType{};
+    uintptr_t modifierProperty{};
+    uint32_t modifierEnabledState{};
+    uint32_t modifierTunnelState{};
+    uint32_t modifierEnabledPredictedState{};
+    uint32_t modifierTunnelPredictedState{};
+    uint8_t modifierStatesDirty{};
+    bool modifierCaptured{};
+    bool captured{};
+};
+
+// EModifierState values from the current server/client schema.
+// 278 = MODIFIER_STATE_IS_TINY_CHARACTER
+// 289 = MODIFIER_STATE_ALLOW_IN_TUNNELS_NO_DUCK
+constexpr uint32_t kTinyCharacterState = 278;
+constexpr uint32_t kTunnelState = 289;
+constexpr uint32_t kModifierStateWordOffset = 0x1E4;
+constexpr uint32_t kModifierPredictedStateWordOffset = 0x234;
+constexpr uint32_t kModifierDirtyOffset = 0x1C4;
+
+void SetTunnelModifierStates(uintptr_t modifierProperty,
+                             OriginalHullState& original) {
+    if (!modifierProperty) return;
+    if (!original.modifierCaptured ||
+        original.modifierProperty != modifierProperty) {
+        original.modifierProperty = modifierProperty;
+        original.modifierEnabledState =
+            Read<uint32_t>(modifierProperty + kModifierStateWordOffset +
+                           sizeof(uint32_t) * (kTinyCharacterState / 32));
+        original.modifierTunnelState =
+            Read<uint32_t>(modifierProperty + kModifierStateWordOffset +
+                           sizeof(uint32_t) * (kTunnelState / 32));
+        original.modifierEnabledPredictedState =
+            Read<uint32_t>(modifierProperty + kModifierPredictedStateWordOffset +
+                           sizeof(uint32_t) * (kTinyCharacterState / 32));
+        original.modifierTunnelPredictedState =
+            Read<uint32_t>(modifierProperty + kModifierPredictedStateWordOffset +
+                           sizeof(uint32_t) * (kTunnelState / 32));
+        original.modifierStatesDirty =
+            Read<uint8_t>(modifierProperty + kModifierDirtyOffset);
+        original.modifierCaptured = true;
+    }
+
+    const uint32_t tunnelBit = 1u << (kTunnelState % 32);
+    const uintptr_t enabledTunnelWord = modifierProperty + kModifierStateWordOffset +
+        sizeof(uint32_t) * (kTunnelState / 32);
+    const uintptr_t predictedTunnelWord = modifierProperty +
+        kModifierPredictedStateWordOffset +
+        sizeof(uint32_t) * (kTunnelState / 32);
+    Write<uint32_t>(enabledTunnelWord,
+                    Read<uint32_t>(enabledTunnelWord) | tunnelBit);
+    Write<uint32_t>(predictedTunnelWord,
+                    Read<uint32_t>(predictedTunnelWord) | tunnelBit);
+    Write<uint8_t>(modifierProperty + kModifierDirtyOffset, 1);
+}
+
+void RestoreTunnelModifierStates(OriginalHullState& original) {
+    if (!original.modifierCaptured || !original.modifierProperty) return;
+    const uintptr_t enabledTinyWord = original.modifierProperty +
+        kModifierStateWordOffset +
+        sizeof(uint32_t) * (kTinyCharacterState / 32);
+    const uintptr_t enabledTunnelWord = original.modifierProperty +
+        kModifierStateWordOffset +
+        sizeof(uint32_t) * (kTunnelState / 32);
+    const uintptr_t predictedTinyWord = original.modifierProperty +
+        kModifierPredictedStateWordOffset +
+        sizeof(uint32_t) * (kTinyCharacterState / 32);
+    const uintptr_t predictedTunnelWord = original.modifierProperty +
+        kModifierPredictedStateWordOffset +
+        sizeof(uint32_t) * (kTunnelState / 32);
+    Write<uint32_t>(enabledTinyWord, original.modifierEnabledState);
+    Write<uint32_t>(enabledTunnelWord, original.modifierTunnelState);
+    Write<uint32_t>(predictedTinyWord, original.modifierEnabledPredictedState);
+    Write<uint32_t>(predictedTunnelWord, original.modifierTunnelPredictedState);
+    Write<uint8_t>(original.modifierProperty + kModifierDirtyOffset,
+                   original.modifierStatesDirty);
+    original.modifierProperty = 0;
+    original.modifierCaptured = false;
+}
+
+OriginalHullState originalHull{};
+OriginalHullState originalServerHull{};
+uintptr_t cachedServerEntitySystem{};
+uintptr_t cachedServerModule{};
+size_t cachedServerModuleSize{};
+ULONGLONG lastServerEntitySystemSearch{};
+bool serverHullActive{};
+bool tunnelEligibilityActive{};
+std::unordered_map<uintptr_t, uint8_t> originalTunnelFlags;
+std::unordered_map<uintptr_t, uint8_t> originalServerTunnelFlags;
+
+std::string ReadModuleClassName(
+    uintptr_t entity, uintptr_t moduleBase, size_t moduleSize);
+
+void RestoreTunnelEligibility() {
+    for (const auto& [entity, original] : originalTunnelFlags) {
+        if (GetEntityClassName(entity).find("CitadelTunnelTrigger") ==
+            std::string::npos)
+            continue;
+        Write<uint8_t>(entity + 0xA80, original);
+    }
+    originalTunnelFlags.clear();
+    for (const auto& [entity, original] : originalServerTunnelFlags) {
+        if (ReadModuleClassName(
+                entity, cachedServerModule, cachedServerModuleSize)
+                .find("CitadelTunnelTrigger") == std::string::npos)
+            continue;
+        Write<uint8_t>(entity + 0x8E9, original);
+    }
+    originalServerTunnelFlags.clear();
+    tunnelEligibilityActive = false;
+}
+
+void UpdateTunnelEligibility() {
+    if (!remSizedHull || !clientBase) {
+        RestoreTunnelEligibility();
+        return;
+    }
+
+    static ULONGLONG lastScan{};
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastScan < 100ull) return;
+    lastScan = now;
+
+    const uintptr_t root =
+        Read<uintptr_t>(clientBase + Offsets::GameEntitySystem);
+    if (!root) {
+        return;
+    }
+    const int reportedHighest = Read<int>(root + Offsets::HighestEntityIndex);
+    const uint32_t highest =
+        reportedHighest > 0 &&
+        reportedHighest <= static_cast<int>(Offsets::HandleIndexMask)
+        ? static_cast<uint32_t>(reportedHighest)
+        : Offsets::HandleIndexMask;
+
+
+    for (uint32_t chunkIndex = 0;
+         chunkIndex <= (highest >> Offsets::HandleChunkShift);
+         ++chunkIndex) {
+        const uintptr_t chunk = Read<uintptr_t>(
+            root + Offsets::EntityChunks +
+            sizeof(uintptr_t) * chunkIndex);
+        if (!chunk) continue;
+        const uint32_t slotLimit =
+            chunkIndex == (highest >> Offsets::HandleChunkShift)
+            ? highest & Offsets::HandleChunkMask
+            : Offsets::HandleChunkMask;
+        for (uint32_t slot = 0; slot <= slotLimit; ++slot) {
+            const uintptr_t identity =
+                chunk + Offsets::EntityStride * slot;
+            const uint32_t handle = Read<uint32_t>(identity + 0x10);
+            const uint32_t expected =
+                (chunkIndex << Offsets::HandleChunkShift) | slot;
+            if ((handle & Offsets::HandleIndexMask) != expected) continue;
+            const uintptr_t entity = Read<uintptr_t>(identity);
+            if (!entity) continue;
+            if (GetEntityClassName(entity).find("CitadelTunnelTrigger") ==
+                std::string::npos)
+                continue;
+
+            if (!originalTunnelFlags.contains(entity)) {
+                originalTunnelFlags.emplace(entity,
+                    Read<uint8_t>(entity + 0xA80));
+            }
+            Write<uint8_t>(entity + 0xA80, 0);
+            tunnelEligibilityActive = true;
+        }
+    }
+}
+
+void UpdateServerTunnelEligibility(uintptr_t entitySystem) {
+    if (!entitySystem || !cachedServerModule) return;
+    static ULONGLONG lastScan{};
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastScan < 100ull) return;
+    lastScan = now;
+    const int reportedHighest = Read<int>(
+        entitySystem + Offsets::HighestEntityIndex);
+    const uint32_t highest =
+        reportedHighest > 0 &&
+        reportedHighest <= static_cast<int>(Offsets::HandleIndexMask)
+        ? static_cast<uint32_t>(reportedHighest)
+        : Offsets::HandleIndexMask;
+
+    for (uint32_t chunkIndex = 0;
+         chunkIndex <= (highest >> Offsets::HandleChunkShift);
+         ++chunkIndex) {
+        const uintptr_t chunk = Read<uintptr_t>(
+            entitySystem + Offsets::EntityChunks +
+            sizeof(uintptr_t) * chunkIndex);
+        if (!chunk) continue;
+        const uint32_t slotLimit =
+            chunkIndex == (highest >> Offsets::HandleChunkShift)
+            ? highest & Offsets::HandleChunkMask
+            : Offsets::HandleChunkMask;
+        for (uint32_t slot = 0; slot <= slotLimit; ++slot) {
+            const uintptr_t identity =
+                chunk + Offsets::EntityStride * slot;
+            const uint32_t handle = Read<uint32_t>(identity + 0x10);
+            const uint32_t expected =
+                (chunkIndex << Offsets::HandleChunkShift) | slot;
+            if ((handle & Offsets::HandleIndexMask) != expected) continue;
+            const uintptr_t entity = Read<uintptr_t>(identity);
+            if (!entity) continue;
+            if (ReadModuleClassName(
+                    entity, cachedServerModule, cachedServerModuleSize)
+                    .find("CitadelTunnelTrigger") == std::string::npos)
+                continue;
+
+            if (!originalServerTunnelFlags.contains(entity)) {
+                originalServerTunnelFlags.emplace(
+                    entity, Read<uint8_t>(entity + 0x8E9));
+            }
+            Write<uint8_t>(entity + 0x8E9, 0);
+            tunnelEligibilityActive = true;
+        }
+    }
+}
+
+bool IsSaneHull(const Vector3& mins, const Vector3& maxs, float radius) {
+    return std::isfinite(mins.x) && std::isfinite(mins.y) &&
+        std::isfinite(mins.z) && std::isfinite(maxs.x) &&
+        std::isfinite(maxs.y) && std::isfinite(maxs.z) &&
+        std::isfinite(radius) &&
+        mins.x >= -128.0f && mins.x <= 0.0f &&
+        mins.y >= -128.0f && mins.y <= 0.0f &&
+        mins.z >= -32.0f && mins.z <= 32.0f &&
+        maxs.x >= 1.0f && maxs.x <= 128.0f &&
+        maxs.y >= 1.0f && maxs.y <= 128.0f &&
+        maxs.z >= 20.0f && maxs.z <= 160.0f &&
+        radius >= 1.0f && radius <= 160.0f;
+}
+
+uint32_t FindClientEntityIndex(uintptr_t target) {
+    if (!target || !clientBase) return 0xFFFFFFFFu;
+    const uintptr_t root =
+        Read<uintptr_t>(clientBase + Offsets::GameEntitySystem);
+    if (!root) return 0xFFFFFFFFu;
+
+    for (uint32_t chunkIndex = 0;
+         chunkIndex <= (Offsets::HandleIndexMask >>
+                        Offsets::HandleChunkShift);
+         ++chunkIndex) {
+        const uintptr_t chunk = Read<uintptr_t>(
+            root + Offsets::EntityChunks +
+            sizeof(uintptr_t) * chunkIndex);
+        if (!chunk) continue;
+        for (uint32_t slot = 0; slot <= Offsets::HandleChunkMask; ++slot) {
+            const uintptr_t identity =
+                chunk + Offsets::EntityStride * slot;
+            if (Read<uintptr_t>(identity) != target) continue;
+            return (chunkIndex << Offsets::HandleChunkShift) | slot;
+        }
+    }
+    return 0xFFFFFFFFu;
+}
+
+std::string ReadModuleClassName(
+    uintptr_t entity, uintptr_t moduleBase, size_t moduleSize) {
+    if (!entity || !moduleBase || !moduleSize) return {};
+    const uintptr_t vtable = Read<uintptr_t>(entity);
+    if (vtable < moduleBase || vtable >= moduleBase + moduleSize) return {};
+    const uintptr_t locator = Read<uintptr_t>(vtable - sizeof(uintptr_t));
+    if (locator < moduleBase || locator >= moduleBase + moduleSize) return {};
+    const uint32_t typeRva = Read<uint32_t>(locator + 0x0C);
+    if (typeRva >= moduleSize) return {};
+
+    std::string result;
+    result.reserve(96);
+    for (uintptr_t i = 0; i < 96; ++i) {
+        const char c = Read<char>(moduleBase + typeRva + 0x10 + i);
+        if (!c) break;
+        if (static_cast<unsigned char>(c) < 0x20 ||
+            static_cast<unsigned char>(c) > 0x7E) return {};
+        result.push_back(c);
+    }
+    return result;
+}
+
+uintptr_t ResolveServerEntityIndex(
+    uintptr_t entitySystem, uint32_t index) {
+    if (!entitySystem || index > Offsets::HandleIndexMask) return 0;
+    const uintptr_t chunk = Read<uintptr_t>(
+        entitySystem + Offsets::EntityChunks +
+        sizeof(uintptr_t) * (index >> Offsets::HandleChunkShift));
+    if (!chunk) return 0;
+    const uintptr_t identity =
+        chunk + Offsets::EntityStride *
+        (index & Offsets::HandleChunkMask);
+    const uint32_t storedHandle = Read<uint32_t>(identity + 0x10);
+    if ((storedHandle & Offsets::HandleIndexMask) != index) return 0;
+    return Read<uintptr_t>(identity);
+}
+
+bool ValidateServerPawn(
+    uintptr_t entitySystem, uint32_t index, uintptr_t& pawn,
+    uintptr_t& collision) {
+    pawn = ResolveServerEntityIndex(entitySystem, index);
+    if (!pawn) return false;
+    const std::string className = ReadModuleClassName(
+        pawn, cachedServerModule, cachedServerModuleSize);
+    if (className.find("CCitadelPlayerPawn") == std::string::npos)
+        return false;
+
+    // The server CBaseEntity layout is not the client layout. In the current
+    // server build m_pCollision is +0x3C8 and points at the model entity's
+    // embedded CCollisionProperty at +0x5F8.
+    collision = Read<uintptr_t>(pawn + 0x3C8);
+    if (!collision || collision != pawn + 0x5F8) return false;
+    const Vector3 mins = Read<Vector3>(collision + Offsets::CollisionMins);
+    const Vector3 maxs = Read<Vector3>(collision + Offsets::CollisionMaxs);
+    const float radius = Read<float>(collision + 0x60);
+    return IsSaneHull(mins, maxs, radius);
+}
+
+uintptr_t FindServerEntitySystem(uint32_t localIndex) {
+    const HMODULE server = GetModuleHandleW(L"server.dll");
+    if (!server) return 0;
+    MODULEINFO info{};
+    if (!GetModuleInformation(
+            GetCurrentProcess(), server, &info, sizeof(info)))
+        return 0;
+
+    cachedServerModule = reinterpret_cast<uintptr_t>(server);
+    cachedServerModuleSize = info.SizeOfImage;
+    static uintptr_t scannedModule{};
+    static size_t scannedModuleSize{};
+    static std::vector<uintptr_t> candidateGlobals;
+    if (scannedModule != cachedServerModule ||
+        scannedModuleSize != cachedServerModuleSize) {
+        scannedModule = cachedServerModule;
+        scannedModuleSize = cachedServerModuleSize;
+        candidateGlobals.clear();
+        const auto* image = reinterpret_cast<const uint8_t*>(
+            cachedServerModule);
+        constexpr uint8_t pattern[] = {
+            0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x0D
+        };
+
+        for (size_t i = 0;
+             i + sizeof(pattern) + sizeof(int32_t) <
+                 cachedServerModuleSize;
+             ++i) {
+            bool matches = true;
+            for (size_t j = 0; j < sizeof(pattern); ++j) {
+                if (image[i + j] != pattern[j]) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (!matches) continue;
+
+            const int32_t displacement =
+                Read<int32_t>(
+                    cachedServerModule + i + sizeof(pattern));
+            const uintptr_t globalAddress =
+                cachedServerModule + i + sizeof(pattern) +
+                sizeof(displacement) + displacement;
+            if (globalAddress < cachedServerModule ||
+                globalAddress + sizeof(uintptr_t) >
+                    cachedServerModule + cachedServerModuleSize)
+                continue;
+            if (std::find(
+                    candidateGlobals.begin(), candidateGlobals.end(),
+                    globalAddress) == candidateGlobals.end())
+                candidateGlobals.push_back(globalAddress);
+        }
+    }
+
+    for (const uintptr_t globalAddress : candidateGlobals) {
+        const uintptr_t candidate = Read<uintptr_t>(globalAddress);
+        uintptr_t pawn{};
+        uintptr_t collision{};
+        if (ValidateServerPawn(
+                candidate, localIndex, pawn, collision))
+            return candidate;
+    }
+    return 0;
+}
+
+CollisionDiagnosticSnapshot ReadCollisionDiagnostic() {
+    CollisionDiagnosticSnapshot snapshot{};
+    const uintptr_t pawn = currentLocalPawn;
+    const uintptr_t collision =
+        pawn ? Read<uintptr_t>(pawn + Offsets::CollisionProperty) : 0;
+    if (!pawn || !collision) return snapshot;
+
+    snapshot.hero = ReadHeroName(pawn);
+    GetEntityPosition(pawn, snapshot.position);
+    snapshot.mins = Read<Vector3>(collision + 0x40);
+    snapshot.maxs = Read<Vector3>(collision + 0x4C);
+    snapshot.solidFlags = Read<uint8_t>(collision + 0x5A);
+    snapshot.solidType = Read<uint8_t>(collision + 0x5B);
+    snapshot.collisionGroup = Read<uint8_t>(collision + 0x5E);
+    snapshot.boundingRadius = Read<float>(collision + 0x60);
+    snapshot.specifiedMins = Read<Vector3>(collision + 0x64);
+    snapshot.specifiedMaxs = Read<Vector3>(collision + 0x70);
+    snapshot.surroundingMaxs = Read<Vector3>(collision + 0x7C);
+    snapshot.surroundingMins = Read<Vector3>(collision + 0x88);
+    snapshot.capsuleCenter1 = Read<Vector3>(collision + 0x94);
+    snapshot.capsuleCenter2 = Read<Vector3>(collision + 0xA0);
+    snapshot.capsuleRadius = Read<float>(collision + 0xAC);
+    snapshot.flags = Read<uint32_t>(pawn + 0x400);
+    snapshot.moveType = Read<uint8_t>(pawn + 0x521);
+    snapshot.actualMoveType = Read<uint8_t>(pawn + 0x522);
+
+    const uintptr_t movement = Read<uintptr_t>(pawn + 0xF28);
+    if (movement) {
+        snapshot.toggleDuck = Read<bool>(movement + 0x2A0);
+        snapshot.ducked = Read<bool>(movement + 0x2A1);
+        snapshot.colliding = Read<bool>(movement + 0x2BC);
+    }
+    snapshot.valid =
+        std::isfinite(snapshot.mins.x) &&
+        std::isfinite(snapshot.maxs.z) &&
+        std::isfinite(snapshot.capsuleRadius);
+    return snapshot;
+}
+
+void UpdateCollisionDiagnostic() {
+    if (!collisionDiagnostics) return;
+
+    static ULONGLONG lastSample = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastSample < 100) return;
+    lastSample = now;
+
+    collisionSnapshot = ReadCollisionDiagnostic();
+    if (!collisionSnapshot.valid) return;
+
+    std::ofstream log(
+        "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\collision_diagnostic.csv",
+        std::ios::app);
+    if (!log) return;
+    static bool headerWritten = false;
+    if (!headerWritten) {
+        log << "time_ms,hero,pos_x,pos_y,pos_z,mins_x,mins_y,mins_z,"
+               "maxs_x,maxs_y,maxs_z,bounding_radius,capsule_radius,"
+               "cap1_x,cap1_y,cap1_z,cap2_x,cap2_y,cap2_z,"
+               "specified_min_x,specified_min_y,specified_min_z,"
+               "specified_max_x,specified_max_y,specified_max_z,"
+               "surrounding_min_x,surrounding_min_y,surrounding_min_z,"
+               "surrounding_max_x,surrounding_max_y,surrounding_max_z,"
+               "flags,move_type,actual_move_type,solid_flags,solid_type,"
+               "collision_group,toggle_duck,ducked,colliding\n";
+        headerWritten = true;
+    }
+    const auto& s = collisionSnapshot;
+    log << now << ',' << s.hero << ','
+        << s.position.x << ',' << s.position.y << ',' << s.position.z << ','
+        << s.mins.x << ',' << s.mins.y << ',' << s.mins.z << ','
+        << s.maxs.x << ',' << s.maxs.y << ',' << s.maxs.z << ','
+        << s.boundingRadius << ',' << s.capsuleRadius << ','
+        << s.capsuleCenter1.x << ',' << s.capsuleCenter1.y << ',' << s.capsuleCenter1.z << ','
+        << s.capsuleCenter2.x << ',' << s.capsuleCenter2.y << ',' << s.capsuleCenter2.z << ','
+        << s.specifiedMins.x << ',' << s.specifiedMins.y << ',' << s.specifiedMins.z << ','
+        << s.specifiedMaxs.x << ',' << s.specifiedMaxs.y << ',' << s.specifiedMaxs.z << ','
+        << s.surroundingMins.x << ',' << s.surroundingMins.y << ',' << s.surroundingMins.z << ','
+        << s.surroundingMaxs.x << ',' << s.surroundingMaxs.y << ',' << s.surroundingMaxs.z << ','
+        << s.flags << ',' << static_cast<unsigned>(s.moveType) << ','
+        << static_cast<unsigned>(s.actualMoveType) << ','
+        << static_cast<unsigned>(s.solidFlags) << ','
+        << static_cast<unsigned>(s.solidType) << ','
+        << static_cast<unsigned>(s.collisionGroup) << ','
+        << s.toggleDuck << ',' << s.ducked << ',' << s.colliding << '\n';
+}
+
 // The camera object still lives at the old data anchor.  Its view and
 // projection matrices are stored consecutively in the render-camera state.
 bool ReadCurrentViewMatrix(Matrix4x4& matrix) {
@@ -156,6 +662,190 @@ bool ReadCameraWorldPosition(Vector3& position) {
     return std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z);
 }
 
+void RestoreStoredHull() {
+    if (!originalHull.captured) return;
+    if (Read<uintptr_t>(
+            originalHull.pawn + Offsets::CollisionProperty) ==
+        originalHull.collision) {
+        Write<Vector3>(
+            originalHull.collision + Offsets::CollisionMaxs,
+            originalHull.maxs);
+        Write<Vector3>(originalHull.collision + 0x64,
+                       originalHull.specifiedMins);
+        Write<Vector3>(originalHull.collision + 0x70,
+                       originalHull.specifiedMaxs);
+        Write<Vector3>(originalHull.collision + 0x7C,
+                       originalHull.surroundingMaxs);
+        Write<Vector3>(originalHull.collision + 0x88,
+                       originalHull.surroundingMins);
+        Write<float>(
+            originalHull.collision + 0x60,
+            originalHull.boundingRadius);
+    }
+    RestoreTunnelModifierStates(originalHull);
+    originalHull = {};
+}
+
+void RestoreStoredServerHull() {
+    if (!originalServerHull.captured) return;
+    if (Read<uintptr_t>(originalServerHull.pawn + 0x3C8) ==
+        originalServerHull.collision) {
+        Write<Vector3>(
+            originalServerHull.collision + Offsets::CollisionMaxs,
+            originalServerHull.maxs);
+        Write<Vector3>(originalServerHull.collision + 0x64,
+                       originalServerHull.specifiedMins);
+        Write<Vector3>(originalServerHull.collision + 0x70,
+                       originalServerHull.specifiedMaxs);
+        Write<Vector3>(originalServerHull.collision + 0x7C,
+                       originalServerHull.surroundingMaxs);
+        Write<Vector3>(originalServerHull.collision + 0x88,
+                       originalServerHull.surroundingMins);
+        Write<float>(
+            originalServerHull.collision + 0x60,
+            originalServerHull.boundingRadius);
+    }
+    RestoreTunnelModifierStates(originalServerHull);
+    originalServerHull = {};
+}
+
+}
+
+void RestoreRemSizedHull() {
+    RestoreTunnelEligibility();
+    RestoreStoredHull();
+    RestoreStoredServerHull();
+    cachedServerEntitySystem = 0;
+    serverHullActive = false;
+}
+
+void UpdateRemSizedHull() {
+    serverHullActive = false;
+    UpdateTunnelEligibility();
+    if (!remSizedHull || !currentLocalPawn) {
+        RestoreStoredHull();
+        RestoreStoredServerHull();
+        cachedServerEntitySystem = 0;
+        return;
+    }
+
+    const uintptr_t collision =
+        Read<uintptr_t>(currentLocalPawn + Offsets::CollisionProperty);
+    if (!collision) {
+        RestoreStoredHull();
+        return;
+    }
+
+    if (!originalHull.captured ||
+        originalHull.pawn != currentLocalPawn ||
+        originalHull.collision != collision) {
+        RestoreStoredHull();
+        originalHull.pawn = currentLocalPawn;
+        originalHull.collision = collision;
+        originalHull.maxs =
+            Read<Vector3>(collision + Offsets::CollisionMaxs);
+        originalHull.specifiedMins = Read<Vector3>(collision + 0x64);
+        originalHull.specifiedMaxs = Read<Vector3>(collision + 0x70);
+        originalHull.surroundingMaxs = Read<Vector3>(collision + 0x7C);
+        originalHull.surroundingMins = Read<Vector3>(collision + 0x88);
+        originalHull.boundingRadius = Read<float>(collision + 0x60);
+        originalHull.solidFlags = Read<uint8_t>(collision + 0x5A);
+        originalHull.solidType = Read<uint8_t>(collision + 0x5B);
+        originalHull.captured =
+            std::isfinite(originalHull.maxs.z) &&
+            originalHull.maxs.z >= 40.0f &&
+            std::isfinite(originalHull.boundingRadius);
+    }
+    if (!originalHull.captured) return;
+
+    Vector3 remMaxs = originalHull.maxs;
+    remMaxs.x = 16.0f;
+    remMaxs.y = 16.0f;
+    remMaxs.z = 40.0f;
+    Write<Vector3>(collision + Offsets::CollisionMaxs, remMaxs);
+    const Vector3 remMins{-16.0f, -16.0f, 0.0f};
+    Write<Vector3>(collision + 0x64, remMins);
+    Write<Vector3>(collision + 0x70, remMaxs);
+    Write<Vector3>(collision + 0x7C, remMaxs);
+    Write<Vector3>(collision + 0x88, remMins);
+    Write<float>(collision + 0x60, 30.1993f);
+    SetTunnelModifierStates(
+        Read<uintptr_t>(currentLocalPawn + 0x348), originalHull);
+
+    static uintptr_t indexedClientPawn{};
+    static uint32_t localIndex = 0xFFFFFFFFu;
+    if (indexedClientPawn != currentLocalPawn) {
+        RestoreStoredServerHull();
+        cachedServerEntitySystem = 0;
+        indexedClientPawn = currentLocalPawn;
+        localIndex = FindClientEntityIndex(currentLocalPawn);
+    }
+    if (localIndex == 0xFFFFFFFFu) return;
+
+    uintptr_t serverPawn{};
+    uintptr_t serverCollision{};
+    if (!ValidateServerPawn(
+            cachedServerEntitySystem, localIndex,
+            serverPawn, serverCollision)) {
+        RestoreStoredServerHull();
+        cachedServerEntitySystem = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now - lastServerEntitySystemSearch < 1000ull) return;
+        lastServerEntitySystemSearch = now;
+        cachedServerEntitySystem = FindServerEntitySystem(localIndex);
+        if (!ValidateServerPawn(
+                cachedServerEntitySystem, localIndex,
+                serverPawn, serverCollision))
+            return;
+    }
+
+    UpdateServerTunnelEligibility(cachedServerEntitySystem);
+
+    if (!originalServerHull.captured ||
+        originalServerHull.pawn != serverPawn ||
+        originalServerHull.collision != serverCollision) {
+        RestoreStoredServerHull();
+        originalServerHull.pawn = serverPawn;
+        originalServerHull.collision = serverCollision;
+        originalServerHull.maxs =
+            Read<Vector3>(
+                serverCollision + Offsets::CollisionMaxs);
+        originalServerHull.specifiedMins =
+            Read<Vector3>(serverCollision + 0x64);
+        originalServerHull.specifiedMaxs =
+            Read<Vector3>(serverCollision + 0x70);
+        originalServerHull.surroundingMaxs =
+            Read<Vector3>(serverCollision + 0x7C);
+        originalServerHull.surroundingMins =
+            Read<Vector3>(serverCollision + 0x88);
+        originalServerHull.boundingRadius =
+            Read<float>(serverCollision + 0x60);
+        originalServerHull.solidFlags = Read<uint8_t>(serverCollision + 0x5A);
+        originalServerHull.solidType = Read<uint8_t>(serverCollision + 0x5B);
+        const Vector3 mins =
+            Read<Vector3>(
+                serverCollision + Offsets::CollisionMins);
+        originalServerHull.captured = IsSaneHull(
+            mins, originalServerHull.maxs,
+            originalServerHull.boundingRadius);
+    }
+    if (!originalServerHull.captured) return;
+
+    Vector3 serverRemMaxs = originalServerHull.maxs;
+    serverRemMaxs.x = 16.0f;
+    serverRemMaxs.y = 16.0f;
+    serverRemMaxs.z = 40.0f;
+    Write<Vector3>(
+        serverCollision + Offsets::CollisionMaxs,
+        serverRemMaxs);
+    Write<Vector3>(serverCollision + 0x64, remMins);
+    Write<Vector3>(serverCollision + 0x70, serverRemMaxs);
+    Write<Vector3>(serverCollision + 0x7C, serverRemMaxs);
+    Write<Vector3>(serverCollision + 0x88, remMins);
+    Write<float>(serverCollision + 0x60, 30.1993f);
+    SetTunnelModifierStates(
+        Read<uintptr_t>(serverPawn + 0x3D0), originalServerHull);
+    serverHullActive = true;
 }
 
 std::vector<PlayerData> GetPlayers() {
@@ -225,6 +915,16 @@ std::vector<PlayerData> GetPlayers() {
         currentLocalPawnHandle = 0xFFFFFFFFu;
     }
     const uint8_t localTeam = currentLocalPawn ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
+    // Bone-world calculation is one of the most expensive calls in the
+    // render path.  ESP boxes only need the scene origin; calculate bones
+    // when a feature actually consumes them.
+    const bool aimKeyDown = (GetAsyncKeyState(aimAssistKey) & 0x8000) != 0;
+    const bool farmKeyDown = (GetAsyncKeyState(farmAssistKey) & 0x8000) != 0;
+    const bool aimNeedsBones = aimAssist &&
+        (aimToggleMode ? aimToggleActive : aimKeyDown);
+    const bool farmNeedsBones = farmAssist &&
+        (farmToggleMode ? farmToggleActive : farmKeyDown);
+    const bool needPlayerBones = drawBones || aimNeedsBones || farmNeedsBones;
 
     for (const uintptr_t entity : pawns) {
         const int health = Read<int>(entity + Offsets::Health);
@@ -238,9 +938,12 @@ std::vector<PlayerData> GetPlayers() {
         if (localTeam != 0 && team == localTeam) continue;
 
         Vector3 pos{};
-        if (!GetEntityPosition(entity, pos)) continue;
+        // Visual ESP must follow the interpolated render transform. AbsOrigin
+        // advances at the network tick rate and makes boxes/text visibly step.
+        if (!GetEntityRenderPosition(entity, pos)) continue;
 
         PlayerData player;
+        player.entity = entity;
         player.pos = pos;
         const uintptr_t collision = Read<uintptr_t>(entity + Offsets::CollisionProperty);
         const Vector3 collisionMins = Read<Vector3>(collision + Offsets::CollisionMins);
@@ -253,10 +956,12 @@ std::vector<PlayerData> GetPlayers() {
         player.modelMinZ = validBounds ? collisionMins.z : 0.0f;
         player.modelMaxZ = validBounds ? collisionMaxs.z : 80.0f;
         player.modelHeight = player.modelMaxZ - player.modelMinZ;
-        player.hasHeadBone = GetEntityBonePosition(entity, "head", player.headPos);
-        player.hasBodyBone = GetEntityBonePosition(entity, "spine_2", player.bodyPos);
-        if (!player.hasBodyBone) player.hasBodyBone = GetEntityBonePosition(entity, "spine_0", player.bodyPos);
-        if (drawBones) GetEntityBoneSkeleton(entity, player.bones);
+        if (needPlayerBones) {
+            player.hasHeadBone = GetEntityBonePosition(entity, "head", player.headPos);
+            player.hasBodyBone = GetEntityBonePosition(entity, "spine_2", player.bodyPos);
+            if (!player.hasBodyBone) player.hasBodyBone = GetEntityBonePosition(entity, "spine_0", player.bodyPos);
+            if (drawBones) GetEntityBoneSkeleton(entity, player.bones);
+        }
         player.health = health;
         player.maxHealth = Read<int>(entity + Offsets::MaxHealth);
         const uintptr_t controller = ResolveEntity(Read<uint32_t>(entity + Offsets::PawnController));
@@ -322,19 +1027,32 @@ void RenderESP(const std::vector<PlayerData>& players) {
                           orbStatusColor, orbStatus);
     }
     if (drawSpectatorList) {
-    // Enumerate player controllers directly. Spectators use
-    // C_CitadelObserverPawn, which is intentionally not part of heroPawns.
-    std::vector<std::string> spectators;
-    std::unordered_set<std::string> spectatorNames;
-    const uintptr_t entityRoot = clientBase
-        ? Read<uintptr_t>(clientBase + Offsets::GameEntitySystem) : 0;
-    if (entityRoot) {
+        static std::vector<std::string> cachedSpectators;
+        static ULONGLONG lastSpectatorScan = 0;
+        const ULONGLONG spectatorNow = GetTickCount64();
+        if (spectatorNow - lastSpectatorScan >= 1000) {
+            // Enumerate player controllers directly. Spectators use
+            // C_CitadelObserverPawn, which is intentionally not part of heroPawns.
+            std::vector<std::string> refreshedSpectators;
+            std::unordered_set<std::string> spectatorNames;
+            const uintptr_t entityRoot = clientBase
+                ? Read<uintptr_t>(clientBase + Offsets::GameEntitySystem) : 0;
+            if (entityRoot) {
+        const int reportedHighest = Read<int>(entityRoot + Offsets::HighestEntityIndex);
+        const uint32_t highestEntityIndex =
+            reportedHighest > 0 && reportedHighest <= static_cast<int>(Offsets::HandleIndexMask)
+                ? static_cast<uint32_t>(reportedHighest)
+                : Offsets::HandleIndexMask;
+        const uint32_t highestChunk = highestEntityIndex >> Offsets::HandleChunkShift;
         for (uint32_t chunkIndex = 0;
-             chunkIndex <= (Offsets::MaxEntityIndex >> Offsets::HandleChunkShift); ++chunkIndex) {
+             chunkIndex <= highestChunk; ++chunkIndex) {
             const uintptr_t chunk = Read<uintptr_t>(entityRoot + Offsets::EntityChunks +
                 Offsets::EntityChunkStride * chunkIndex);
             if (!chunk) continue;
-            for (uint32_t slot = 0; slot <= Offsets::HandleChunkMask; ++slot) {
+            const uint32_t highestSlot = chunkIndex == highestChunk
+                ? (highestEntityIndex & Offsets::HandleChunkMask)
+                : Offsets::HandleChunkMask;
+            for (uint32_t slot = 0; slot <= highestSlot; ++slot) {
                 const uintptr_t identity = chunk + Offsets::EntityStride * slot;
                 const uint32_t handle = Read<uint32_t>(identity + 0x10);
                 const uint32_t expectedIndex = (chunkIndex << Offsets::HandleChunkShift) | slot;
@@ -350,12 +1068,21 @@ void RenderESP(const std::vector<PlayerData>& players) {
                 const uint8_t observerMode = Read<uint8_t>(observerServices + Offsets::ObserverMode);
                 const uint32_t observerTarget = Read<uint32_t>(observerServices + Offsets::ObserverTarget);
                 if (observerMode == 0 || observerTarget == 0xFFFFFFFFu) continue;
+                // A spectator list must contain only controllers currently
+                // observing the local pawn. Previously every observer in the
+                // match was shown, regardless of their selected target.
+                const uintptr_t observedPawn = ResolveEntity(observerTarget);
+                if (!observedPawn || observedPawn != currentLocalPawn) continue;
                 std::string name = ReadPlayerName(controller);
                 if (name.empty()) name = "Unknown";
-                if (spectatorNames.insert(name).second) spectators.push_back(std::move(name));
+                if (spectatorNames.insert(name).second) refreshedSpectators.push_back(std::move(name));
             }
         }
-    }
+            }
+            cachedSpectators = std::move(refreshedSpectators);
+            lastSpectatorScan = spectatorNow;
+        }
+        const auto& spectators = cachedSpectators;
     if (drawSpectatorList) {
         float spectatorY = statusPosition.y + 58.0f;
         const char* title = "SPECTATOR LIST";
@@ -422,7 +1149,16 @@ void RenderESP(const std::vector<PlayerData>& players) {
             }
             if (!projected) projected = WorldToScreen(position, screen, currentViewMatrix);
             if (!projected || !std::isfinite(position.x) || !std::isfinite(position.y) ||
-                !std::isfinite(position.z)) continue;
+                !std::isfinite(position.z) || !std::isfinite(screen.x) ||
+                !std::isfinite(screen.y)) continue;
+            const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
+            // WorldToScreen can return a finite but enormous point for an
+            // entity behind the camera. Never let an off-screen orb create a
+            // full-screen ImGui circle.
+            const float screenGuard = (std::max)(displaySize.x, displaySize.y) * 2.0f;
+            if (displaySize.x <= 0.0f || displaySize.y <= 0.0f ||
+                std::fabs(screen.x) > screenGuard ||
+                std::fabs(screen.y) > screenGuard) continue;
             if (projected) {
                 std::lock_guard<std::mutex> lock(orbTargetsMutex);
                 for (auto& cachedOrb : orbTargets) {
@@ -468,6 +1204,9 @@ void RenderESP(const std::vector<PlayerData>& players) {
                             };
                             Vector2 edge{};
                             if (!WorldToScreen(corner, edge, currentViewMatrix)) continue;
+                            if (!std::isfinite(edge.x) || !std::isfinite(edge.y) ||
+                                std::fabs(edge.x) > screenGuard ||
+                                std::fabs(edge.y) > screenGuard) continue;
                             outlineRadius = (std::max)(outlineRadius,
                                 std::sqrt((edge.x - screen.x) * (edge.x - screen.x) +
                                           (edge.y - screen.y) * (edge.y - screen.y)));
@@ -476,6 +1215,10 @@ void RenderESP(const std::vector<PlayerData>& players) {
                 }
             }
             outlineRadius *= 0.4f;
+            // A corrupted collision bound or a projection crossing the near
+            // plane must never turn the orb marker into a screen-sized fill.
+            if (!std::isfinite(outlineRadius) || outlineRadius <= 0.0f) continue;
+            outlineRadius = std::clamp(outlineRadius, 4.0f, 96.0f);
             const float fillRadius = outlineRadius * 0.64f;
             if (IsXpOrbAttackable(orb.entity)) {
                 drawList->AddCircleFilled(point, fillRadius, orbColor, 24);
@@ -487,6 +1230,19 @@ void RenderESP(const std::vector<PlayerData>& players) {
     }
 
     if (drawCreepEsp && currentViewMatrixReady) {
+        struct SmoothedCreepBox {
+            float left{}, top{}, right{}, bottom{};
+            ULONGLONG lastSeen{};
+            bool initialized{};
+        };
+        static std::unordered_map<uintptr_t, SmoothedCreepBox>
+            smoothedCreepBoxes;
+        const ULONGLONG creepSmoothingNow = GetTickCount64();
+        const float creepDt =
+            std::clamp(ImGui::GetIO().DeltaTime, 0.001f, 0.050f);
+        const float creepSmoothing =
+            1.0f - std::exp(-140.0f * creepDt);
+
         std::vector<FarmTarget> creeps;
         {
             std::lock_guard<std::mutex> lock(farmTargetsMutex);
@@ -501,7 +1257,7 @@ void RenderESP(const std::vector<PlayerData>& players) {
             // must be refreshed every frame so moving creeps do not leave stale
             // boxes behind.
             Vector3 livePosition{};
-            if (!GetEntityPosition(creep.entity, livePosition)) continue;
+            if (!GetEntityRenderPosition(creep.entity, livePosition)) continue;
             const uintptr_t sceneNode = Read<uintptr_t>(creep.entity + Offsets::GameSceneNode);
             if (!sceneNode || Read<uint8_t>(sceneNode + Offsets::SceneNodeDormant) != 0) continue;
             creep.pos = livePosition;
@@ -512,19 +1268,9 @@ void RenderESP(const std::vector<PlayerData>& players) {
             if (creep.health <= 0 || lifeState != 0 || npcState == 5 || npcState == 6 ||
                 Read<uint8_t>(creep.entity + Offsets::FadeCorpse) != 0) continue;
 
-            // A stale entity slot can retain the NPC class and a positive
-            // health value after its render object is gone. Require a valid
-            // model bone before drawing the diagnostic box.
-            Vector3 headPosition{};
-            if (!GetEntityBonePosition(creep.entity, "head", headPosition)) continue;
-            const float headDeltaX = headPosition.x - creep.pos.x;
-            const float headDeltaY = headPosition.y - creep.pos.y;
-            const float headDeltaZ = headPosition.z - creep.pos.z;
-            const float headDistanceSquared = headDeltaX * headDeltaX +
-                                              headDeltaY * headDeltaY +
-                                              headDeltaZ * headDeltaZ;
-            if (!std::isfinite(headDistanceSquared) || headDistanceSquared > 300.0f * 300.0f ||
-                headDeltaZ < 8.0f || headDeltaZ > 180.0f) continue;
+            // Scene-node state, life state and NPC state above are sufficient
+            // to reject stale slots. Calling CalcWorldSpaceBones for every
+            // creep here makes Creep ESP scale very poorly in large fights.
             // Creep collision bounds are not reliable for diagnostics: on some
             // units they describe a separate collision object, not the render
             // model. Project a conservative box around the scene-node origin.
@@ -551,8 +1297,49 @@ void RenderESP(const std::vector<PlayerData>& players) {
                 right = (std::max)(right, screen.x);
                 bottom = (std::max)(bottom, screen.y);
             }
-            if (!projected || right <= left || bottom <= top) continue;
+            const float creepWidth = right - left;
+            const float creepHeight = bottom - top;
+            const float maxCoordinate = (std::max)(displaySize.x, displaySize.y) * 4.0f;
+            if (!projected || !std::isfinite(left) || !std::isfinite(top) ||
+                !std::isfinite(right) || !std::isfinite(bottom) ||
+                creepWidth < 2.0f || creepHeight < 4.0f ||
+                creepWidth > displaySize.x * 1.5f ||
+                creepHeight > displaySize.y * 1.5f ||
+                std::fabs(left) > maxCoordinate || std::fabs(right) > maxCoordinate ||
+                std::fabs(top) > maxCoordinate || std::fabs(bottom) > maxCoordinate) continue;
             liveCreeps.push_back(creep);
+
+            const float rawCenterX = (left + right) * 0.5f;
+            const float rawCenterY = (top + bottom) * 0.5f;
+            auto& smooth = smoothedCreepBoxes[creep.entity];
+            const float oldCenterX = (smooth.left + smooth.right) * 0.5f;
+            const float oldCenterY = (smooth.top + smooth.bottom) * 0.5f;
+            const bool stale = !smooth.initialized ||
+                creepSmoothingNow - smooth.lastSeen > 250 ||
+                std::fabs(rawCenterX - oldCenterX) > 500.0f ||
+                std::fabs(rawCenterY - oldCenterY) > 500.0f;
+            if (stale) {
+                smooth.left = left;
+                smooth.top = top;
+                smooth.right = right;
+                smooth.bottom = bottom;
+                smooth.initialized = true;
+            } else {
+                smooth.left += (left - smooth.left) * creepSmoothing;
+                smooth.top += (top - smooth.top) * creepSmoothing;
+                smooth.right += (right - smooth.right) * creepSmoothing;
+                smooth.bottom += (bottom - smooth.bottom) * creepSmoothing;
+            }
+            smooth.lastSeen = creepSmoothingNow;
+            const float originOffsetX =
+                (smooth.left + smooth.right) * 0.5f - rawCenterX;
+            const float originOffsetY =
+                (smooth.top + smooth.bottom) * 0.5f - rawCenterY;
+            left = smooth.left;
+            top = smooth.top;
+            right = smooth.right;
+            bottom = smooth.bottom;
+
             const uint8_t localTeam = currentLocalPawn
                 ? Read<uint8_t>(currentLocalPawn + Offsets::Team)
                 : 0;
@@ -565,7 +1352,10 @@ void RenderESP(const std::vector<PlayerData>& players) {
 
             Vector2 originScreen{};
             if (WorldToScreen(creep.pos, originScreen, currentViewMatrix)) {
-                drawList->AddCircleFilled(ImVec2(originScreen.x, originScreen.y), 3.0f, color, 12);
+                drawList->AddCircleFilled(
+                    ImVec2(originScreen.x + originOffsetX,
+                           originScreen.y + originOffsetY),
+                    3.0f, color, 12);
             }
             const float dx = creep.pos.x - currentLocalPosition.x;
             const float dy = creep.pos.y - currentLocalPosition.y;
@@ -591,6 +1381,13 @@ void RenderESP(const std::vector<PlayerData>& players) {
             drawList->AddRectFilled(ImVec2(barLeft, bottom - (bottom - top) * healthPercent),
                                     ImVec2(barLeft + barWidth, bottom), healthColor);
         }
+        for (auto it = smoothedCreepBoxes.begin();
+             it != smoothedCreepBoxes.end();) {
+            if (creepSmoothingNow - it->second.lastSeen > 1000)
+                it = smoothedCreepBoxes.erase(it);
+            else
+                ++it;
+        }
         {
             std::lock_guard<std::mutex> lock(farmTargetsMutex);
             farmTargets = std::move(liveCreeps);
@@ -603,19 +1400,69 @@ void RenderESP(const std::vector<PlayerData>& players) {
     const bool localOnScreen = currentLocalPositionReady &&
                                WorldToScreen(currentLocalPosition, localScreen, currentViewMatrix);
 
+    struct SmoothedEspBox {
+        float left{}, top{}, right{}, bottom{};
+        ULONGLONG lastSeen{};
+        bool initialized{};
+    };
+    static std::unordered_map<uintptr_t, SmoothedEspBox> smoothedBoxes;
+    const ULONGLONG smoothingNow = GetTickCount64();
+    const float dt = std::clamp(ImGui::GetIO().DeltaTime, 0.001f, 0.050f);
+    // A short time constant removes network-step shimmer without making the
+    // box trail far behind the render model.
+    const float smoothing = 1.0f - std::exp(-140.0f * dt);
+
     for (const auto& player : players) {
-        const float screenX = (player.boxLeft + player.boxRight) * 0.5f;
-        const float screenY = player.boxBottom;
-        const float boxTop = player.boxTop;
-        const float boxHeight = player.boxBottom - player.boxTop;
-        const float boxWidth = player.boxRight - player.boxLeft;
+        auto& smooth = smoothedBoxes[player.entity];
+        const float rawCenterX = (player.boxLeft + player.boxRight) * 0.5f;
+        const float rawCenterY = (player.boxTop + player.boxBottom) * 0.5f;
+        const float oldCenterX = (smooth.left + smooth.right) * 0.5f;
+        const float oldCenterY = (smooth.top + smooth.bottom) * 0.5f;
+        const bool stale = !smooth.initialized ||
+            smoothingNow - smooth.lastSeen > 250 ||
+            std::fabs(rawCenterX - oldCenterX) > 500.0f ||
+            std::fabs(rawCenterY - oldCenterY) > 500.0f;
+        if (stale) {
+            smooth.left = player.boxLeft;
+            smooth.top = player.boxTop;
+            smooth.right = player.boxRight;
+            smooth.bottom = player.boxBottom;
+            smooth.initialized = true;
+        } else {
+            smooth.left +=
+                (player.boxLeft - smooth.left) * smoothing;
+            smooth.top +=
+                (player.boxTop - smooth.top) * smoothing;
+            smooth.right +=
+                (player.boxRight - smooth.right) * smoothing;
+            smooth.bottom +=
+                (player.boxBottom - smooth.bottom) * smoothing;
+        }
+        smooth.lastSeen = smoothingNow;
+
+        const float screenX = (smooth.left + smooth.right) * 0.5f;
+        const float screenY = smooth.bottom;
+        const float boxTop = smooth.top;
+        const float boxHeight = smooth.bottom - smooth.top;
+        const float boxWidth = smooth.right - smooth.left;
+        const float screenOffsetX = screenX - rawCenterX;
+        const float screenOffsetY =
+            (smooth.top + smooth.bottom) * 0.5f - rawCenterY;
+        const uint8_t localTeam = currentLocalPawn
+            ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
+        const bool ally = localTeam != 0 && player.team == localTeam;
 
         if (drawBones) {
             for (const auto& bone : player.bones) {
                 Vector2 start{}, end{};
                 if (WorldToScreen(bone.start, start, currentViewMatrix) &&
                     WorldToScreen(bone.end, end, currentViewMatrix)) {
-                    drawList->AddLine(ImVec2(start.x, start.y), ImVec2(end.x, end.y), ImColor(255, 220, 40, 220), 1.5f);
+                    drawList->AddLine(
+                        ImVec2(start.x + screenOffsetX,
+                               start.y + screenOffsetY),
+                        ImVec2(end.x + screenOffsetX,
+                               end.y + screenOffsetY),
+                        ImColor(255, 220, 40, 220), 1.5f);
                 }
             }
         }
@@ -639,8 +1486,8 @@ void RenderESP(const std::vector<PlayerData>& players) {
 
         if (drawBoxes) {
             drawList->AddRect(
-                ImVec2(player.boxLeft, boxTop),
-                ImVec2(player.boxRight, screenY),
+                ImVec2(smooth.left, boxTop),
+                ImVec2(smooth.right, screenY),
                 ImColor(255, 0, 0, 255), 1.0f, 0, 1.0f
             );
         }
@@ -650,7 +1497,7 @@ void RenderESP(const std::vector<PlayerData>& players) {
                                             ? std::clamp(static_cast<float>(player.health) / player.maxHealth, 0.0f, 1.0f)
                                             : 0.0f;
             constexpr float barWidth = 4.0f;
-            const float barLeft = player.boxLeft - 7.0f;
+            const float barLeft = smooth.left - 7.0f;
 
             // A vertical bar stays readable at every distance and shows loss from the top.
             drawList->AddRectFilled(
@@ -681,6 +1528,12 @@ void RenderESP(const std::vector<PlayerData>& players) {
                 distText.c_str()
             );
         }
+    }
+    for (auto it = smoothedBoxes.begin(); it != smoothedBoxes.end();) {
+        if (smoothingNow - it->second.lastSeen > 1000)
+            it = smoothedBoxes.erase(it);
+        else
+            ++it;
     }
 }
 
@@ -795,6 +1648,14 @@ void RenderMenu(size_t playerCount) {
         if (ImGui::CollapsingHeader("Misc", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Checkbox("Auto parry (F)", &autoParry);
             ImGui::Checkbox("Spectator list", &drawSpectatorList);
+            ImGui::Checkbox("Free cam", &freeCam);
+            ImGui::SameLine();
+            if (ImGui::Button(freeCamKeyCapture ? "Press free cam key..." : AimKeyName(freeCamKey)))
+                freeCamKeyCapture = true;
+            ImGui::SameLine();
+            ImGui::TextUnformatted("Free cam bind");
+            ImGui::SliderFloat("Free cam speed", &freeCamSpeed,
+                               50.0f, 5000.0f, "%.0f units/s");
         }
         ImGui::EndTable();
     }

@@ -1,11 +1,13 @@
 #include "shared.h"
+bool freeCam=false;
 #include <fstream>
 #include <sstream>
 volatile ULONGLONG lastSilentAttackAppliedAt = 0;
 volatile LONG autoOrbAttackAppliedCount = 0;
-uintptr_t clientBase=0; bool menuOpen=false,drawEsp=true,drawBoxes=true,drawHealth=true,drawHealthValues=true,drawNames=true,drawDistance=true,drawSnaplines=false,drawFovCircle=true,drawFarmFovCircle=false,drawBones=false,drawCreepEsp=false,farmAssist=false,autoLastHitOrbs=false,drawOrbEsp=false,drawSpectatorList=false,glowEnabled=true,aimAssist=true,autoParry=true,imguiInitialized=false,consoleAttached=false; float aimFov=180.0f,farmFov=180.0f,aimSmooth=6.0f,fovCircleAlpha=110.0f,farmFovAlpha=110.0f,snaplineAlpha=180.0f; bool aimVisibilityCheck=true; Vector3 currentLocalPosition{}; bool currentLocalPositionReady=false; Vector3 currentCameraPosition{}; bool currentCameraPositionReady=false; uintptr_t currentLocalPawn=0; uint32_t currentLocalPawnHandle=0xFFFFFFFFu; std::mutex meleeObjectsMutex; std::vector<uintptr_t> meleeObjects; std::mutex silentAnglesMutex; Vector3 pendingSilentAngles{}; bool pendingSilentAnglesReady=false,pendingSilentAttack=false; std::mutex humanSilentMutex,creepSilentMutex,orbSilentMutex; Vector3 pendingHumanAngles{},pendingCreepAngles{},pendingOrbAngles{}; bool pendingHumanReady=false,pendingCreepReady=false,pendingOrbReady=false,pendingOrbAttack=false; std::mutex farmTargetsMutex; std::vector<FarmTarget> farmTargets; std::mutex orbTargetsMutex; std::vector<OrbTarget> orbTargets;
+uintptr_t clientBase=0; bool menuOpen=false,drawEsp=true,drawBoxes=true,drawHealth=true,drawHealthValues=true,drawNames=true,drawDistance=true,drawSnaplines=false,drawFovCircle=true,drawFarmFovCircle=false,drawBones=false,drawCreepEsp=false,farmAssist=false,autoLastHitOrbs=false,drawOrbEsp=false,drawSpectatorList=false,collisionDiagnostics=false,remSizedHull=false,glowEnabled=true,aimAssist=true,autoParry=true,imguiInitialized=false,consoleAttached=false; float aimFov=180.0f,farmFov=180.0f,aimSmooth=6.0f,fovCircleAlpha=110.0f,farmFovAlpha=110.0f,snaplineAlpha=180.0f; bool aimVisibilityCheck=true; Vector3 currentLocalPosition{}; bool currentLocalPositionReady=false; Vector3 currentCameraPosition{}; bool currentCameraPositionReady=false; uintptr_t currentLocalPawn=0; uint32_t currentLocalPawnHandle=0xFFFFFFFFu; std::mutex meleeObjectsMutex; std::vector<uintptr_t> meleeObjects; std::mutex silentAnglesMutex; Vector3 pendingSilentAngles{}; bool pendingSilentAnglesReady=false,pendingSilentAttack=false; std::mutex humanSilentMutex,creepSilentMutex,orbSilentMutex; Vector3 pendingHumanAngles{},pendingCreepAngles{},pendingOrbAngles{}; bool pendingHumanReady=false,pendingCreepReady=false,pendingOrbReady=false,pendingOrbAttack=false; std::mutex farmTargetsMutex; std::vector<FarmTarget> farmTargets; std::mutex orbTargetsMutex; std::vector<OrbTarget> orbTargets;
 ID3D11Texture2D* depthStaging=nullptr; UINT depthWidth=0,depthHeight=0; DXGI_FORMAT depthFormat=DXGI_FORMAT_UNKNOWN; bool depthSnapshotReady=false; int depthDiagnosticState=-1; Matrix4x4 currentViewMatrix{}; bool currentViewMatrixReady=false;
 ID3D11Device* pDevice=nullptr; ID3D11DeviceContext* pContext=nullptr; ID3D11RenderTargetView* pRenderTargetView=nullptr; HWND gameWindow=nullptr; WNDPROC oWndProc=nullptr; HMODULE moduleHandle=nullptr; void** presentVTable=nullptr; volatile LONG unloadRequested=0,unloadThreadStarted=0; std::mutex glowMutex,heroPawnsMutex; std::unordered_set<uintptr_t> registeredGlows,queuedGlows; EspStatus espStatus; std::unordered_map<uintptr_t,bool> combatVTables; std::vector<uintptr_t> heroVTables,heroPawns; HANDLE heroDiscoveryThread=nullptr,glowApplyThread=nullptr,farmTargetThread=nullptr,stopHeroDiscoveryEvent=nullptr; PresentFn oPresent=nullptr;
+bool humanAimTargetFound = false;
 bool aimSilentMode = false;
 AimTargetMode aimTargetMode = AimTargetMode::Closest;
 int aimAssistKey = VK_RBUTTON;
@@ -26,6 +28,9 @@ bool autoLastHitOrbsKeyCapture = false;
 bool autoLastHitOrbsActive = false;
 int autoLastHitOrbsKey = VK_XBUTTON2;
 bool orbAimVisibilityCheck = true;
+int freeCamKey = VK_F6;
+float freeCamSpeed = 450.0f;
+bool freeCamKeyCapture = false;
 bool orbEntityEventsAvailable = false;
 
 namespace {
@@ -59,6 +64,9 @@ void LoadConfig() {
         else if (key == "drawCreepEsp") drawCreepEsp = value;
         else if (key == "drawOrbEsp") drawOrbEsp = value;
         else if (key == "drawSpectatorList") drawSpectatorList = value;
+        else if (key == "freeCam") freeCam = value;
+        else if (key == "freeCamKey") freeCamKey = static_cast<int>(number);
+        else if (key == "freeCamSpeed") freeCamSpeed = static_cast<float>(number);
         else if (key == "farmAssist") farmAssist = value;
         else if (key == "autoLastHitOrbs") autoLastHitOrbs = value;
         else if (key == "autoLastHitOrbsAutoFire") autoLastHitOrbsAutoFire = value;
@@ -102,6 +110,9 @@ void SaveConfig() {
            << "drawCreepEsp " << drawCreepEsp << '\n'
            << "drawOrbEsp " << drawOrbEsp << '\n'
            << "drawSpectatorList " << drawSpectatorList << '\n'
+           << "freeCam " << freeCam << '\n'
+           << "freeCamKey " << freeCamKey << '\n'
+           << "freeCamSpeed " << freeCamSpeed << '\n'
            << "farmAssist " << farmAssist << '\n'
            << "autoLastHitOrbs " << autoLastHitOrbs << '\n'
            << "autoLastHitOrbsAutoFire " << autoLastHitOrbsAutoFire << '\n'
