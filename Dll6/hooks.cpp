@@ -75,7 +75,7 @@ void* createMoveTarget = nullptr;
 
 // Current Deadlock camera-origin writer. This signature resolves the only
 // instructions in the current client image that store all three axes into
-// ViewMatrix + 0x28. Free cam temporarily NOPs those two stores, exactly like
+// ViewMatrix + 0xC0. Free cam temporarily NOPs those two stores, exactly like
 // the Source 2 external-freecam technique, and restores them on disable.
 constexpr const char* CameraOriginWriterPattern =
     "F2 0F 11 05 ? ? ? ? 41 8B 46 08 89 05 ? ? ? ? "
@@ -87,9 +87,10 @@ std::array<uint8_t, 6> cameraOriginWriterZBytes{};
 std::mutex cameraOriginPatchMutex;
 bool cameraOriginWritersPatched = false;
 
-// Verified against the live current client: vtable RVA 0x22F5F88 and active
-// camera at manager + 0x28.
-constexpr uintptr_t CitadelCameraManagerRva = 0x3252E30;
+// Verified against the current client image in IDA on 2026-07-29:
+// CCitadelCameraManager singleton/global at RVA 0x3254060, active camera at
+// manager + 0x28. The manager vtable is currently RVA 0x22F66E8.
+constexpr uintptr_t CitadelCameraManagerRva = 0x3254060;
 constexpr const char* CreateFreeCameraPattern =
     "40 53 48 83 EC 20 48 8B D9 B9 F0 00 00 00 E8 ? ? ? ? "
     "48 85 C0 74 ? 48 8B D3 48 8B C8 48 83 C4 20 5B E9";
@@ -140,7 +141,7 @@ bool PatchCameraOriginWriters() {
     if (cameraOriginWritersPatched) return true;
 
     const uintptr_t expectedOrigin =
-        clientBase + Offsets::ViewMatrix + 0x28;
+        clientBase + Offsets::ViewMatrix + Offsets::CameraOrigin;
     uintptr_t xy = 0;
     uintptr_t z = 0;
     uintptr_t searchFrom = clientBase;
@@ -358,10 +359,14 @@ void __fastcall hkFreeCameraUpdate(uintptr_t camera) {
 bool EnsureFreeCameraUpdateHook(uintptr_t camera) {
     if (freeCameraUpdateTarget && originalFreeCameraUpdate)
         return true;
+    if (!camera) return false;
     const uintptr_t vtable = Read<uintptr_t>(camera);
+    if (!vtable) return false;
+    // Current CFreeCamera vtable: slot 3 is the per-frame camera update
+    // (IDA RVA 0x16057F0 in this client).
     const uintptr_t updateAddress =
         Read<uintptr_t>(vtable + 3 * sizeof(uintptr_t));
-    if (!vtable || !updateAddress)
+    if (!updateAddress)
         return false;
 
     const MH_STATUS initStatus = MH_Initialize();
@@ -390,6 +395,7 @@ bool ActivateBuiltInFreeCamera() {
 
     const uintptr_t manager = clientBase + CitadelCameraManagerRva;
     const uintptr_t managerVtable = Read<uintptr_t>(manager);
+    if (!managerVtable) return false;
     const uintptr_t switchAddress =
         Read<uintptr_t>(managerVtable + 9 * sizeof(uintptr_t));
     const uintptr_t factoryAddress =
@@ -406,18 +412,15 @@ bool ActivateBuiltInFreeCamera() {
         std::isfinite(freeCameraStartAngles.x) &&
         std::isfinite(freeCameraStartAngles.y) &&
         std::isfinite(freeCameraStartAngles.z);
-    Vector3 thirdPersonStart = currentCameraPosition;
-    bool thirdPersonStartReady = currentCameraPositionReady &&
+    // The ESP view-matrix origin is not guaranteed to be the active
+    // third-person camera origin. Copy the live player's camera object before
+    // switching cameras; this preserves the exact position above the pawn and
+    // the direction the player is currently looking.
+    Vector3 thirdPersonStart = Read<Vector3>(oldCamera + 0x38);
+    bool thirdPersonStartReady =
         std::isfinite(thirdPersonStart.x) &&
         std::isfinite(thirdPersonStart.y) &&
         std::isfinite(thirdPersonStart.z);
-    if (!thirdPersonStartReady) {
-        thirdPersonStart = Read<Vector3>(oldCamera + 0x38);
-        thirdPersonStartReady =
-            std::isfinite(thirdPersonStart.x) &&
-            std::isfinite(thirdPersonStart.y) &&
-            std::isfinite(thirdPersonStart.z);
-    }
 
     if (builtInFreeCamera) {
         if (!EnsureFreeCameraUpdateHook(builtInFreeCamera))
@@ -441,6 +444,16 @@ bool ActivateBuiltInFreeCamera() {
         if (destructor)
             reinterpret_cast<DestroyCameraFn>(destructor)(newCamera, 1);
         return false;
+    }
+
+    if (thirdPersonStartReady)
+        Write<Vector3>(newCamera + 0x38, thirdPersonStart);
+    if (freeCameraStartAnglesReady) {
+        Write<float>(newCamera + 0xC4, freeCameraStartAngles.x);
+        Write<float>(newCamera + 0xCC, freeCameraStartAngles.y);
+        Write<float>(newCamera + 0x44, freeCameraStartAngles.x);
+        Write<float>(newCamera + 0x48, freeCameraStartAngles.y);
+        Write<float>(newCamera + 0x4C, freeCameraStartAngles.z);
     }
 
     auto switchCamera = reinterpret_cast<SwitchCameraFn>(switchAddress);
@@ -634,63 +647,146 @@ uintptr_t GetCurrentUserCmd() {
 
 void PatchInputHistory(uintptr_t userCmd, const Vector3& angles);
 
+int RotateSubtickMovement(CBaseUserCmdPB* base, float cosine, float sine) {
+    if (!base) return 0;
+
+    // CreateMove stores changes of the analog movement vector in the
+    // already-created CSubtickMoveStep messages. Rotating only
+    // CBaseUserCmdPB::forwardmove/leftmove is therefore undone as those
+    // subticks are replayed. Rotate every existing delta by the same basis
+    // change. Do not append protobuf messages: this process and the game use
+    // different descriptor pools.
+    const int count = base->subtick_moves_size();
+    if (count <= 0 || count > 64) return 0;
+
+    int patched = 0;
+    for (int i = 0; i < count; ++i) {
+        auto* step = base->mutable_subtick_moves(i);
+        if (!step ||
+            (!step->has_analog_forward_delta() &&
+             !step->has_analog_left_delta())) {
+            continue;
+        }
+
+        const float forward = step->has_analog_forward_delta()
+            ? step->analog_forward_delta()
+            : 0.0f;
+        const float left = step->has_analog_left_delta()
+            ? step->analog_left_delta()
+            : 0.0f;
+        if (!std::isfinite(forward) || !std::isfinite(left))
+            continue;
+
+        // Source uses a positive "leftmove" axis. Convert the movement vector
+        // from the visible-camera basis into the silent-yaw basis.
+        step->set_analog_forward_delta(
+            forward * cosine - left * sine);
+        step->set_analog_left_delta(
+            forward * sine + left * cosine);
+        ++patched;
+    }
+    return patched;
+}
+
+bool UserCmdHasAttack(const CUserCmd* command) {
+    if (!command) return false;
+    const auto attackMask = static_cast<std::uint64_t>(InputBitMask::Attack);
+    if ((command->buttonStates.buttonState1 & attackMask) != 0) return true;
+    if (!command->cmd.has_base()) return false;
+    const auto& base = command->cmd.base();
+    return base.has_buttons_pb() &&
+        (base.buttons_pb().buttonstate1() & attackMask) != 0;
+}
+
+bool GetPendingSilentInputAngle(Vector3& angles) {
+    const bool physicalAttack = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    if (aimSilentMode && physicalAttack) {
+        std::lock_guard<std::mutex> lock(humanSilentMutex);
+        if (pendingHumanReady) {
+            angles = pendingHumanAngles;
+            return true;
+        }
+    }
+    if (autoLastHitOrbs) {
+        std::lock_guard<std::mutex> lock(orbSilentMutex);
+        if (pendingOrbReady && pendingOrbAttack) {
+            angles = pendingOrbAngles;
+            return true;
+        }
+    }
+    if (farmSilentMode && physicalAttack) {
+        std::lock_guard<std::mutex> lock(creepSilentMutex);
+        if (pendingCreepReady) {
+            angles = pendingCreepAngles;
+            return true;
+        }
+    }
+    return false;
+}
+
 void ApplyPendingUserCmdAngles(uintptr_t userCmd) {
     if (!userCmd || (!aimSilentMode && !farmSilentMode && !autoLastHitOrbs)) return;
+    auto* command = reinterpret_cast<CUserCmd*>(userCmd);
+    const auto attackMask = static_cast<std::uint64_t>(InputBitMask::Attack);
+
+    // Silent must not rotate ordinary movement commands. The native button
+    // state is populated by the game's real input path before CreateMove.
+    const bool commandHasAttack = UserCmdHasAttack(command);
+
     Vector3 angles{};
     bool attack = false;
     bool ready = false;
     {
-        if (autoLastHitOrbs) {
+        // A held player shot has priority over autonomous orb/farm helpers.
+        // Keep the selected angle alive for every CreateMove command while the
+        // render-side target remains valid; consuming it once left later
+        // subtick shots with the old camera angle.
+        if (aimSilentMode && commandHasAttack) {
+            std::lock_guard<std::mutex> lock(humanSilentMutex);
+            if (pendingHumanReady) {
+                angles = pendingHumanAngles;
+                ready = true;
+            }
+        }
+        if (!ready && autoLastHitOrbs) {
             std::lock_guard<std::mutex> lock(orbSilentMutex);
-            if (pendingOrbReady) {
+            if (pendingOrbReady && (pendingOrbAttack || commandHasAttack)) {
                 angles = pendingOrbAngles;
                 attack = pendingOrbAttack;
-                pendingOrbReady = false;
+                // Attack is a pulse, but the angle must remain valid for all
+                // commands until AutoLastHitOrbs drops or changes the target.
                 pendingOrbAttack = false;
                 ready = true;
             }
         }
-        if (!ready && aimSilentMode) {
-            std::lock_guard<std::mutex> lock(humanSilentMutex);
-            if (pendingHumanReady) {
-                angles = pendingHumanAngles;
-                pendingHumanReady = false;
-                ready = true;
-            }
-        }
-        if (!ready && farmSilentMode) {
+        if (!ready && farmSilentMode && commandHasAttack) {
             std::lock_guard<std::mutex> lock(creepSilentMutex);
             if (pendingCreepReady) {
                 angles = pendingCreepAngles;
-                pendingCreepReady = false;
                 ready = true;
             }
         }
     }
     if (!ready) return;
 
-    auto* command = reinterpret_cast<CUserCmd*>(userCmd);
-    auto* viewAngles = command->cmd.mutable_ang_camera_angles();
-    if (!viewAngles) return;
-    viewAngles->set_x(angles.x);
-    viewAngles->set_y(angles.y);
-    viewAngles->set_z(angles.z);
+    if (auto* viewAngles = command->cmd.mutable_ang_camera_angles()) {
+        viewAngles->set_x(angles.x);
+        viewAngles->set_y(angles.y);
+        viewAngles->set_z(angles.z);
+    }
     command->cmd.clear_view_delta_x();
     command->cmd.clear_view_delta_y();
+    PatchInputHistory(userCmd, angles);
     if (attack) {
-        const auto attackMask = static_cast<std::uint64_t>(InputBitMask::Attack);
+        // Do not synthesize OS mouse input. Also do not append protobuf child
+        // messages here: the game and this DLL have different descriptor
+        // pools, which makes add_subtick_moves() fatal. Set the native and
+        // already-existing protobuf button state only.
         command->buttonStates.buttonState1 |= attackMask;
         command->buttonStates.buttonState2 |= attackMask;
         command->buttonStates.buttonState3 |= attackMask;
-
-        // The network serializer reads the protobuf button block. On ticks
-        // without physical input it may be absent, so merely changing the
-        // native CInButtonState is not enough to produce an attack command.
-        // Materialize both optional messages before setting the attack bit.
-        auto* base = command->cmd.mutable_base();
-        if (base) {
-            auto* buttons = base->mutable_buttons_pb();
-            if (buttons) {
+        if (auto* base = command->cmd.mutable_base()) {
+            if (auto* buttons = base->mutable_buttons_pb()) {
                 buttons->set_buttonstate1(buttons->buttonstate1() | attackMask);
                 buttons->set_buttonstate2(buttons->buttonstate2() | attackMask);
                 buttons->set_buttonstate3(buttons->buttonstate3() | attackMask);
@@ -721,7 +817,110 @@ void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3
     const auto callCount = ++createMoveCalls;
     const uintptr_t userCmd = GetCurrentUserCmd();
     if (userCmd) ++userCmdResolvedCalls;
+
+    // The original CreateMove calls its input updater before copying these
+    // fields, so pre-hook writes are overwritten. Correct both the freshly
+    // updated CInput state and the command it just produced.
+    // Current client CreateMove (RVA 0x1613BE0) copies:
+    //   CInput+0x270 -> CBaseUserCmdPB.forwardmove
+    //   CInput+0x274 -> CBaseUserCmdPB.leftmove
+    //   CInput+0x688 -> command camera QAngle
+    constexpr uintptr_t InputForwardMoveOffset = 0x270;
+    constexpr uintptr_t InputLeftMoveOffset = 0x274;
+    constexpr uintptr_t InputViewAnglesOffset = 0x688;
+    Vector3 silentAngles{};
+    bool correctionRequested = false;
+    bool correctionApplied = false;
+    float sourceForward = 0.0f;
+    float sourceLeft = 0.0f;
+    float correctedForward = 0.0f;
+    float correctedLeft = 0.0f;
+    float cameraYaw = 0.0f;
+    int subtickMovesPatched = 0;
+    bool commandCameraYaw = false;
+    if (input && userCmd && GetPendingSilentInputAngle(silentAngles)) {
+        correctionRequested = true;
+        sourceForward = Read<float>(input + InputForwardMoveOffset);
+        sourceLeft = Read<float>(input + InputLeftMoveOffset);
+        // Capture the angle produced by the game's own CreateMove before
+        // ApplyPendingUserCmdAngles replaces it with the silent angle. This
+        // is the same angle the native movement command was built against;
+        // render-camera data is not part of the movement coordinate system.
+        auto* command = reinterpret_cast<CUserCmd*>(userCmd);
+        if (command->cmd.has_ang_camera_angles()) {
+            cameraYaw = command->cmd.ang_camera_angles().y();
+            commandCameraYaw = std::isfinite(cameraYaw) &&
+                std::fabs(cameraYaw) <= 360.0f;
+        }
+        if (!commandCameraYaw) {
+            cameraYaw = Read<Vector3>(input + InputViewAnglesOffset).y;
+            commandCameraYaw = std::isfinite(cameraYaw) &&
+                std::fabs(cameraYaw) <= 360.0f;
+        }
+        if (commandCameraYaw && std::isfinite(silentAngles.y) &&
+            std::fabs(silentAngles.y) <= 360.0f) {
+            const float radians =
+                (cameraYaw - silentAngles.y) * 0.017453292519943295f;
+            const float cosine = std::cos(radians);
+            const float sine = std::sin(radians);
+            correctedForward =
+                sourceForward * cosine - sourceLeft * sine;
+            correctedLeft =
+                sourceForward * sine + sourceLeft * cosine;
+            Write<float>(input + InputForwardMoveOffset, correctedForward);
+            Write<float>(input + InputLeftMoveOffset, correctedLeft);
+            auto* command = reinterpret_cast<CUserCmd*>(userCmd);
+            if (auto* base = command->cmd.mutable_base()) {
+                base->set_forwardmove(correctedForward);
+                base->set_leftmove(correctedLeft);
+                subtickMovesPatched =
+                    RotateSubtickMovement(base, cosine, sine);
+            }
+            correctionApplied = true;
+        }
+    }
     ApplyPendingUserCmdAngles(userCmd);
+    static ULONGLONG lastMovementLog = 0;
+    const ULONGLONG movementNow = GetTickCount64();
+    const bool movementKeyDown =
+        (GetAsyncKeyState('W') & 0x8000) != 0 ||
+        (GetAsyncKeyState('A') & 0x8000) != 0 ||
+        (GetAsyncKeyState('S') & 0x8000) != 0 ||
+        (GetAsyncKeyState('D') & 0x8000) != 0;
+    if (movementKeyDown && movementNow - lastMovementLog >= 100) {
+        lastMovementLog = movementNow;
+        float commandForward = 0.0f;
+        float commandLeft = 0.0f;
+        float commandYaw = 0.0f;
+        if (userCmd) {
+            const auto* command = reinterpret_cast<const CUserCmd*>(userCmd);
+            if (command->cmd.has_base()) {
+                commandForward = command->cmd.base().forwardmove();
+                commandLeft = command->cmd.base().leftmove();
+            }
+            if (command->cmd.has_ang_camera_angles())
+                commandYaw = command->cmd.ang_camera_angles().y();
+        }
+        static std::mutex movementLogMutex;
+        std::lock_guard<std::mutex> movementLogLock(movementLogMutex);
+        std::ofstream movementLog(
+            "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\movement_runtime.log",
+            std::ios::app);
+        if (movementLog) {
+            movementLog << "requested=" << correctionRequested
+                        << " applied=" << correctionApplied
+                        << " input=0x" << std::hex << input
+                        << " cmd=0x" << userCmd << std::dec
+                        << " cameraYaw=" << cameraYaw
+                        << " silentYaw=" << silentAngles.y
+                        << " cameraSource=" << (commandCameraYaw ? "command" : "invalid")
+                        << " source=" << sourceForward << ',' << sourceLeft
+                        << " corrected=" << correctedForward << ',' << correctedLeft
+                        << " subticks=" << subtickMovesPatched
+                        << " cmdMove=" << commandForward << ',' << commandLeft
+                        << " cmdYaw=" << commandYaw << '\n';
+        }
+    }
     static bool freeCamKeyLastDown = false;
     const bool freeCamKeyDown = IsGameFocused() && !menuOpen && freeCamKey > 0 &&
         ((GetAsyncKeyState(freeCamKey) & 0x8000) != 0);
@@ -768,10 +967,35 @@ void LogSilentHook(const char* text) {
     if (log) log << text << '\n';
 }
 
+bool GetPendingSerializedAngles(Vector3& angles) {
+    const uintptr_t userCmd = GetCurrentUserCmd();
+    if (!userCmd || !UserCmdHasAttack(reinterpret_cast<const CUserCmd*>(userCmd))) return false;
+
+    if (aimSilentMode) {
+        std::lock_guard<std::mutex> lock(humanSilentMutex);
+        if (pendingHumanReady) {
+            angles = pendingHumanAngles;
+            return true;
+        }
+    }
+    if (autoLastHitOrbs) {
+        std::lock_guard<std::mutex> lock(orbSilentMutex);
+        if (pendingOrbReady && pendingOrbAttack) {
+            angles = pendingOrbAngles;
+            return true;
+        }
+    }
+    if (farmSilentMode) {
+        std::lock_guard<std::mutex> lock(creepSilentMutex);
+        if (pendingCreepReady) {
+            angles = pendingCreepAngles;
+            return true;
+        }
+    }
+    return false;
+}
+
 uintptr_t __fastcall hkUserCmdToNetwork(uintptr_t a1, uintptr_t a2, uintptr_t a3) {
-    // Silent is now handled by paired mouse movement in aim.cpp. Keep the
-    // serializer untouched so it cannot modify ordinary input or fight the
-    // camera restoration step.
     if (freeCam)
         ClearFreeCameraMovement(
             freeCameraUserCmd.load(std::memory_order_acquire));
@@ -1030,6 +1254,27 @@ DWORD WINAPI InitializeThread(LPVOID) {
 
     if (!clientBase) return 0;
 
+    // Resolve build-dependent globals from the current client image before
+    // any entity worker starts. This is the pattern-based finder used by the
+    // reference project; the brittle live-schema walker stays disabled.
+    bool patternOffsetsReady = false;
+    for (int attempt = 0; attempt < 50 && !patternOffsetsReady; ++attempt) {
+        patternOffsetsReady = InitializePatternOffsets();
+        if (!patternOffsetsReady) Sleep(100);
+    }
+    printf("[+] Pattern offsets: %s\n", patternOffsetsReady ? "ready" : "fallback");
+
+    // Update schema-backed member offsets before entity discovery starts.
+    // The schema walker mirrors the embedded CSchemaList layout used by the
+    // reference project and keeps the last known value for missing fields.
+    bool schemaOffsetsReady = false;
+    for (int attempt = 0; attempt < 20 && !schemaOffsetsReady; ++attempt) {
+        schemaOffsetsReady = InitializeRuntimeOffsets();
+        if (!schemaOffsetsReady) Sleep(100);
+    }
+    printf("[+] Schema offsets: %s\n",
+           schemaOffsetsReady ? "ready" : "fallback");
+
     const bool nativeGlowFound = InitializeNativeGlow();
     printf("[Glow] native registration: %s\n",
            nativeGlowFound ? "ready" : "unavailable");
@@ -1067,7 +1312,8 @@ DWORD WINAPI InitializeThread(LPVOID) {
         // with the outline renderer and creates a jittering second layer.
     }
     InstallModelGlowHook();
-    // UserCmd serializer hook disabled: restore stable pre-silent behavior.
+    // Keep the serializer untouched. Silent is applied in CreateMove, where
+    // the current command and movement values are available together.
     printf("[!] CUserCmd_to_network silent hook disabled\n");
     const auto userCmdFunctions = ResolveUserCmdFunctions(clientBase);
     runtimeUserCmdFunctions = userCmdFunctions;

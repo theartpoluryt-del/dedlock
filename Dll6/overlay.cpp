@@ -193,20 +193,24 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    // Visibility is checked by the native physics trace in aim.cpp.  Do not
-    // copy/map the complete depth texture here: on teamfights this stalls the
-    // render queue and can cost several frames at a time.  Keep the old depth
-    // helpers available for diagnostics, but do not run them in Present.
+    // Keep a depth snapshot for visibility. The current physics filter can
+    // report a clear ray for world geometry, while the depth buffer still
+    // gives a reliable screen-space occlusion result.
     // Entity discovery and assist logic are heavier than ImGui drawing. Keep
     // one coherent snapshot and update it at a bounded cadence so high-refresh
     // Present calls do not starve the render path.
-    static ULONGLONG lastVisualSnapshot = 0;
     static ULONGLONG lastAssistUpdate = 0;
     static std::vector<PlayerData> visualSnapshot;
     const ULONGLONG now = GetTickCount64();
-    if (lastVisualSnapshot == 0 || now - lastVisualSnapshot >= 4) {
-        visualSnapshot = GetPlayers();
-        lastVisualSnapshot = now;
+    // Rebuild the visual snapshot on every Present so ESP positions are
+    // refreshed once per rendered frame, including 144 Hz displays.
+    const std::vector<PlayerData> nextSnapshot = GetPlayers();
+    static ULONGLONG lastNonEmptySnapshot = 0;
+    if (!nextSnapshot.empty()) {
+        visualSnapshot = nextSnapshot;
+        lastNonEmptySnapshot = now;
+    } else if (lastNonEmptySnapshot == 0 || now - lastNonEmptySnapshot > 150) {
+        visualSnapshot.clear();
     }
     if (lastAssistUpdate == 0 || now - lastAssistUpdate >= 16) {
         AutoParry(visualSnapshot);

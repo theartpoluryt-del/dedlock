@@ -634,9 +634,9 @@ void UpdateCollisionDiagnostic() {
 bool ReadCurrentViewMatrix(Matrix4x4& matrix) {
     if (!clientBase) return false;
 
-    const uintptr_t camera = clientBase + 0x3799830;
-    const Matrix4x4 view = Read<Matrix4x4>(camera + 0x80);
-    const Matrix4x4 projection = Read<Matrix4x4>(camera + 0xC0);
+    const uintptr_t camera = clientBase + Offsets::ViewMatrix;
+    const Matrix4x4 view = Read<Matrix4x4>(camera + Offsets::ViewMatrixView);
+    const Matrix4x4 projection = Read<Matrix4x4>(camera + Offsets::ViewMatrixProjection);
 
     for (int row = 0; row < 4; ++row) {
         for (int column = 0; column < 4; ++column) {
@@ -658,7 +658,8 @@ bool ReadCurrentViewMatrix(Matrix4x4& matrix) {
 
 bool ReadCameraWorldPosition(Vector3& position) {
     if (!clientBase) return false;
-    position = Read<Vector3>(clientBase + 0x3799830 + 0x28);
+    position = Read<Vector3>(
+        clientBase + Offsets::ViewMatrix + Offsets::CameraOrigin);
     return std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z);
 }
 
@@ -935,7 +936,7 @@ std::vector<PlayerData> GetPlayers() {
 
         const uint8_t team = Read<uint8_t>(entity + Offsets::Team);
         if (team != 2 && team != 3) continue;
-        if (localTeam != 0 && team == localTeam) continue;
+        if (localTeam != 0 && team == localTeam && !drawTeammates) continue;
 
         Vector3 pos{};
         // Visual ESP must follow the interpolated render transform. AbsOrigin
@@ -968,6 +969,7 @@ std::vector<PlayerData> GetPlayers() {
         if (controller) {
             const int liveMaxHealth = Read<int>(controller + Offsets::ControllerPlayerData + Offsets::PlayerDataHealthMax);
             if (liveMaxHealth > 0 && liveMaxHealth < 100000) player.maxHealth = liveMaxHealth;
+            player.playerName = ReadPlayerName(controller);
         }
         player.team = team;
         player.heroName = ReadHeroName(entity);
@@ -1240,8 +1242,9 @@ void RenderESP(const std::vector<PlayerData>& players) {
         const ULONGLONG creepSmoothingNow = GetTickCount64();
         const float creepDt =
             std::clamp(ImGui::GetIO().DeltaTime, 0.001f, 0.050f);
-        const float creepSmoothing =
-            1.0f - std::exp(-140.0f * creepDt);
+        // No positional filter: the box must stay on the current render
+        // transform and never trail the creep model.
+        const float creepSmoothing = 1.0f;
 
         std::vector<FarmTarget> creeps;
         {
@@ -1264,12 +1267,10 @@ void RenderESP(const std::vector<PlayerData>& players) {
             creep.health = Read<int>(creep.entity + Offsets::Health);
             creep.maxHealth = Read<int>(creep.entity + Offsets::MaxHealth);
             const uint8_t lifeState = Read<uint8_t>(creep.entity + Offsets::LifeState);
-            const uint32_t npcState = Read<uint32_t>(creep.entity + Offsets::NPCState);
-            if (creep.health <= 0 || lifeState != 0 || npcState == 5 || npcState == 6 ||
-                Read<uint8_t>(creep.entity + Offsets::FadeCorpse) != 0) continue;
+            if (creep.health <= 0 || lifeState != 0) continue;
 
-            // Scene-node state, life state and NPC state above are sufficient
-            // to reject stale slots. Calling CalcWorldSpaceBones for every
+            // Scene-node state and life state above are sufficient to reject
+            // stale slots. Calling CalcWorldSpaceBones for every
             // creep here makes Creep ESP scale very poorly in large fights.
             // Creep collision bounds are not reliable for diagnostics: on some
             // units they describe a separate collision object, not the render
@@ -1408,9 +1409,28 @@ void RenderESP(const std::vector<PlayerData>& players) {
     static std::unordered_map<uintptr_t, SmoothedEspBox> smoothedBoxes;
     const ULONGLONG smoothingNow = GetTickCount64();
     const float dt = std::clamp(ImGui::GetIO().DeltaTime, 0.001f, 0.050f);
-    // A short time constant removes network-step shimmer without making the
-    // box trail far behind the render model.
-    const float smoothing = 1.0f - std::exp(-140.0f * dt);
+    // No positional filter: keep the box on the current render transform with
+    // zero intentional latency.
+    const float smoothing = 1.0f;
+    const auto makeColor = [](const float color[4]) {
+        return ImColor(color[0], color[1], color[2], color[3]);
+    };
+    const auto addCornerBox = [&](ImDrawList* list, float left, float top,
+                                  float right, float bottom, ImU32 color) {
+        const float width = right - left;
+        const float height = bottom - top;
+        const float length = std::clamp(cornerBoxLength, 0.05f, 0.50f) *
+            (std::min)(width, height);
+        const float thickness = std::clamp(boxThickness, 0.5f, 4.0f);
+        list->AddLine(ImVec2(left, top), ImVec2(left + length, top), color, thickness);
+        list->AddLine(ImVec2(left, top), ImVec2(left, top + length), color, thickness);
+        list->AddLine(ImVec2(right - length, top), ImVec2(right, top), color, thickness);
+        list->AddLine(ImVec2(right, top), ImVec2(right, top + length), color, thickness);
+        list->AddLine(ImVec2(left, bottom - length), ImVec2(left, bottom), color, thickness);
+        list->AddLine(ImVec2(left, bottom), ImVec2(left + length, bottom), color, thickness);
+        list->AddLine(ImVec2(right - length, bottom), ImVec2(right, bottom), color, thickness);
+        list->AddLine(ImVec2(right, bottom - length), ImVec2(right, bottom), color, thickness);
+    };
 
     for (const auto& player : players) {
         auto& smooth = smoothedBoxes[player.entity];
@@ -1451,6 +1471,9 @@ void RenderESP(const std::vector<PlayerData>& players) {
         const uint8_t localTeam = currentLocalPawn
             ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
         const bool ally = localTeam != 0 && player.team == localTeam;
+        const ImColor boxColor = makeColor(ally ? teammateBoxColor : enemyBoxColor);
+        const ImColor nameColor = makeColor(ally ? teammateNameColor : enemyNameColor);
+        const ImColor healthColor = makeColor(ally ? teammateHealthColor : enemyHealthColor);
 
         if (drawBones) {
             for (const auto& bone : player.bones) {
@@ -1475,21 +1498,31 @@ void RenderESP(const std::vector<PlayerData>& players) {
             drawList->AddLine(lineStart, ImVec2(screenX, screenY), ImColor(255, 255, 255, alpha), 1.0f);
         }
 
-        if (drawNames) {
-            const ImVec2 nameSize = ImGui::CalcTextSize(player.heroName.c_str());
-            drawList->AddText(
-                ImVec2(screenX - nameSize.x * 0.5f, boxTop - 30.0f),
-                ImColor(255, 0, 0, 255),
-                player.heroName.c_str()
-            );
-        }
+        // Stack all header lines above the box. This prevents HP, player name,
+        // and hero name from occupying the same y-coordinate.
+        float headerY = boxTop - 17.0f;
+        const auto drawHeaderLine = [&](const std::string& text,
+                                        ImColor color) {
+            if (text.empty()) return;
+            const ImVec2 size = ImGui::CalcTextSize(text.c_str());
+            const ImVec2 position(screenX - size.x * 0.5f, headerY);
+            drawList->AddText(ImVec2(position.x + 1.0f, position.y + 1.0f),
+                              ImColor(0, 0, 0, 190), text.c_str());
+            drawList->AddText(position, color, text.c_str());
+            headerY -= 14.0f;
+        };
+        if (drawPlayerNames) drawHeaderLine(player.playerName, nameColor);
+        if (drawNames) drawHeaderLine(player.heroName, nameColor);
 
         if (drawBoxes) {
-            drawList->AddRect(
-                ImVec2(smooth.left, boxTop),
-                ImVec2(smooth.right, screenY),
-                ImColor(255, 0, 0, 255), 1.0f, 0, 1.0f
-            );
+            if (cornerBoxes) {
+                addCornerBox(drawList, smooth.left, boxTop, smooth.right,
+                             screenY, boxColor);
+            } else {
+                drawList->AddRect(ImVec2(smooth.left, boxTop),
+                                  ImVec2(smooth.right, screenY), boxColor,
+                                  0.0f, 0, boxThickness);
+            }
         }
 
         if (drawHealth) {
@@ -1506,8 +1539,6 @@ void RenderESP(const std::vector<PlayerData>& players) {
                 ImColor(50, 50, 50, 200)
             );
 
-            ImColor healthColor = healthPercent > 0.5f ? ImColor(0, 255, 0, 255) : ImColor(255, 0, 0, 255);
-
             drawList->AddRectFilled(
                 ImVec2(barLeft, screenY - boxHeight * healthPercent),
                 ImVec2(barLeft + barWidth, screenY),
@@ -1516,7 +1547,7 @@ void RenderESP(const std::vector<PlayerData>& players) {
 
             if (drawHealthValues) {
                 const std::string healthText = std::to_string(player.health) + "/" + std::to_string(player.maxHealth);
-                drawList->AddText(ImVec2(barLeft - 4.0f, boxTop - 14.0f), ImColor(255, 255, 255, 220), healthText.c_str());
+                drawHeaderLine(healthText, ImColor(255, 255, 255, 230));
             }
         }
 
@@ -1549,9 +1580,23 @@ void RenderMenu(size_t playerCount) {
         if (ImGui::CollapsingHeader("Visuals", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Checkbox("ESP", &drawEsp);
             ImGui::Checkbox("Boxes", &drawBoxes);
+            ImGui::Checkbox("Corner boxes", &cornerBoxes);
+            ImGui::Checkbox("Show teammates", &drawTeammates);
+            ImGui::SliderFloat("Box thickness", &boxThickness, 0.5f, 4.0f, "%.1f");
+            ImGui::SliderFloat("Corner length", &cornerBoxLength, 0.10f, 0.50f, "%.2f");
+            if (ImGui::TreeNode("ESP colors")) {
+                ImGui::ColorEdit4("Enemy box", enemyBoxColor, ImGuiColorEditFlags_NoInputs);
+                ImGui::ColorEdit4("Teammate box", teammateBoxColor, ImGuiColorEditFlags_NoInputs);
+                ImGui::ColorEdit4("Enemy name", enemyNameColor, ImGuiColorEditFlags_NoInputs);
+                ImGui::ColorEdit4("Teammate name", teammateNameColor, ImGuiColorEditFlags_NoInputs);
+                ImGui::ColorEdit4("Enemy health", enemyHealthColor, ImGuiColorEditFlags_NoInputs);
+                ImGui::ColorEdit4("Teammate health", teammateHealthColor, ImGuiColorEditFlags_NoInputs);
+                ImGui::TreePop();
+            }
             ImGui::Checkbox("Health Bars", &drawHealth);
-            ImGui::Checkbox("Health Values", &drawHealthValues);
-            ImGui::Checkbox("Hero Names", &drawNames);
+            ImGui::Checkbox("Health", &drawHealthValues);
+            ImGui::Checkbox("Hero Name", &drawNames);
+            ImGui::Checkbox("Player Name", &drawPlayerNames);
             ImGui::Checkbox("Distance", &drawDistance);
             ImGui::Checkbox("Snaplines", &drawSnaplines);
             ImGui::Checkbox("Bones", &drawBones);

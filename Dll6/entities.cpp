@@ -430,15 +430,25 @@ void RefreshHeroPawns() {
                         const uintptr_t entity = Read<uintptr_t>(identity);
                         if (!entity || !seen.insert(entity).second) continue;
 
+                        bool heroVTableMatch = false;
                         if (haveHeroVTables) {
                             const uintptr_t vtable = Read<uintptr_t>(entity);
-                            if (std::find(heroVTables.begin(), heroVTables.end(), vtable) == heroVTables.end()) continue;
+                            heroVTableMatch =
+                                std::find(heroVTables.begin(), heroVTables.end(),
+                                          vtable) != heroVTables.end();
+                            if (!heroVTableMatch) continue;
                         }
 
                         const int health = Read<int>(entity + Offsets::Health);
                         const uint8_t team = Read<uint8_t>(entity + Offsets::Team);
                         if (health < 0 || health > 10000 || (team != 2 && team != 3)) continue;
-                        if (GetEntityClassName(entity).find("CitadelPlayerPawn") == std::string::npos) continue;
+                        // A discovered hero vtable is already an exact RTTI
+                        // match. Do not reject it because a second RTTI walk
+                        // transiently fails while modules/entities initialize.
+                        if (!heroVTableMatch &&
+                            GetEntityClassName(entity).find("CitadelPlayerPawn") ==
+                                std::string::npos)
+                            continue;
 
                         Vector3 position{};
                         if (GetEntityPosition(entity, position)) found.push_back(entity);
@@ -817,10 +827,10 @@ void RefreshFarmTargets() {
                         const bool hasMotionPosition = GetEntityPosition(entity, motionPosition);
                         if (!hasMotionPosition) motionPosition = position;
 
-                        // Compare adjacent scans exactly. The first scan
-                        // establishes the previous coordinates; if the next
-                        // scan reports the same coordinates, the orb is
-                        // already gone and must not remain in ESP.
+                        // Networked orb coordinates can legitimately remain
+                        // unchanged for several worker scans. Requiring a few
+                        // stationary samples avoids flickering the target out
+                        // between snapshots while still pruning stale slots.
                         // Entity pointers are recycled by the game. The
                         // handle identifies the current orb lifetime, so a
                         // newly spawned orb must not inherit the old orb's
@@ -853,6 +863,10 @@ void RefreshFarmTargets() {
                             }
                         }
                         motion.lastSeen = now;
+                        // Two consecutive scans with the same coordinates are
+                        // the disappearance signal used by the orb tracker.
+                        // Keep this filter authoritative: ESP and aim both
+                        // consume orbTargets produced below.
                         if (motion.stationarySamples >= 1) continue;
 
                         foundOrbs.push_back({ entity, position,
@@ -873,8 +887,6 @@ void RefreshFarmTargets() {
                     if (!sceneNode || Read<uint8_t>(sceneNode + Offsets::SceneNodeDormant) != 0) continue;
                     const int health = Read<int>(entity + Offsets::Health);
                     if (health <= 0 || health > 100000 || Read<uint8_t>(entity + Offsets::LifeState) != 0) continue;
-                    const uint32_t npcState = Read<uint32_t>(entity + Offsets::NPCState);
-                    if (npcState == 5 || npcState == 6 || Read<uint8_t>(entity + Offsets::FadeCorpse) != 0) continue;
                     Vector3 position{};
                     if (!GetEntityPosition(entity, position)) continue;
                     FarmTarget target{};

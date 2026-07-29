@@ -72,23 +72,6 @@ void ResolveBoneFunctions() {
     boneFunctions.getBoneIdByName = reinterpret_cast<GetBoneIdByNameFn>(boneId);
 }
 
-Vector3 CalculateAimAngles(const Vector3& source, const Vector3& target) {
-    constexpr float RadToDeg = 57.29577951308232f;
-    const float dx = target.x - source.x;
-    const float dy = target.y - source.y;
-    const float dz = target.z - source.z;
-    const float horizontal = std::sqrt(dx * dx + dy * dy);
-    if (!std::isfinite(horizontal) || !std::isfinite(dz) || horizontal < 0.001f) {
-        return {};
-    }
-
-    Vector3 angles{};
-    angles.x = -std::atan2(dz, horizontal) * RadToDeg;
-    angles.y = std::atan2(dy, dx) * RadToDeg;
-    angles.z = 0.0f;
-    return angles;
-}
-
 Vector3 NormalizeAimAngles(Vector3 angles) {
     while (angles.x > 89.0f) angles.x -= 180.0f;
     while (angles.x < -89.0f) angles.x += 180.0f;
@@ -101,6 +84,11 @@ Vector3 NormalizeAimAngles(Vector3 angles) {
 void ClearPendingSilentAngles() {
     std::lock_guard<std::mutex> lock(humanSilentMutex);
     pendingHumanReady = false;
+}
+
+void ClearPendingCreepAngles() {
+    std::lock_guard<std::mutex> lock(creepSilentMutex);
+    pendingCreepReady = false;
 }
 
 bool silentFlickActive = false;
@@ -142,14 +130,15 @@ static UINT depthSnapshotRowPitch = 0;
 // Source 2 client physics trace entry points identified in client.dll.i64.
 // These are relative to the client module base and are kept together so the
 // game-trace path can be disabled cleanly if the client build changes.
-constexpr uintptr_t PhysicsTraceWrapperRva = 0x149F7E0;
-constexpr uintptr_t PhysicsTraceContextRva = 0x2E8BC50;
-constexpr uintptr_t PhysicsRayShapeInitRva = 0x026FA40;
-constexpr uintptr_t TraceResultInitRva = 0x1E913B0;
-constexpr uintptr_t RayShapeGlobalRva = 0x021D1F28;
-constexpr uintptr_t TraceFilterGroupRva = 0x14611D0;
-constexpr uintptr_t TraceFilterLayerRva = 0x146E270;
-constexpr uintptr_t TraceFilterVtableRva = 0x021D2768;
+constexpr uintptr_t PhysicsTraceWrapperRva = 0x14A0120;
+constexpr uintptr_t PhysicsTraceContextRva = 0x2E8CCE0;
+constexpr uintptr_t PhysicsRayShapeInitRva = 0x026FA80;
+constexpr uintptr_t TraceResultInitRva = 0x1E91D30;
+constexpr uintptr_t RayShapeGlobalRva = 0x021D1F08;
+constexpr uintptr_t TraceFilterConstructorRva = 0x1047720;
+constexpr uintptr_t TraceFilterGroupRva = 0x1461B10;
+constexpr uintptr_t TraceFilterLayerRva = 0x146EBB0;
+constexpr uintptr_t TraceFilterVtableRva = 0x021D2748;
 
 bool InvertMatrix(const Matrix4x4& matrix, Matrix4x4& inverse) {
     const float* m = &matrix.m[0][0];
@@ -323,14 +312,14 @@ bool GetCameraTraceStart(Vector3& start) {
     return true;
 }
 
-bool PhysicsTraceVisible(const Vector3& start, const Vector3& end) {
+bool PhysicsTraceVisible(const Vector3& start, const Vector3& end,
+                         uintptr_t targetEntity) {
     if (!clientBase || !currentLocalPositionReady) return false;
 
     using ShapeInitFn = uintptr_t(__fastcall*)(void*, const void*);
     using ResultInitFn = uintptr_t(__fastcall*)(void*);
     using TraceFn = bool(__fastcall*)(void*, void*, const Vector3*, const Vector3*, void*, void*);
-    using TraceFilterGroupFn = uint32_t(__fastcall*)(uintptr_t);
-    using TraceFilterLayerFn = uint16_t(__fastcall*)(uintptr_t);
+    using TraceFilterConstructorFn = void(__fastcall*)(void*, uintptr_t, int);
 
     const uintptr_t physics = Read<uintptr_t>(clientBase + PhysicsTraceContextRva);
     if (!physics) return false;
@@ -344,25 +333,24 @@ bool PhysicsTraceVisible(const Vector3& start, const Vector3& end) {
     // though the remaining filter fields look valid.
     *reinterpret_cast<uintptr_t*>(filter) = clientBase + TraceFilterVtableRva;
     *reinterpret_cast<uint64_t*>(filter + 8) = 0xC1001;
-    *reinterpret_cast<uint32_t*>(filter + 32) = 0;
-    *reinterpret_cast<int32_t*>(filter + 36) = -1;
-    *reinterpret_cast<int32_t*>(filter + 40) = -1;
-    *reinterpret_cast<int32_t*>(filter + 44) = -1;
-    *reinterpret_cast<uint32_t*>(filter + 50) = 0xFFFF0000u;
-    *reinterpret_cast<uint16_t*>(filter + 54) = 256;
-    filter[56] = 3;
-    filter[57] = 0x49;
-    *reinterpret_cast<uint64_t*>(filter + 64) = 0;
+    *reinterpret_cast<uint64_t*>(filter + 0x10) = 0;
+    *reinterpret_cast<uint64_t*>(filter + 0x18) = 0;
+    *reinterpret_cast<int64_t*>(filter + 0x20) = -1;
+    *reinterpret_cast<int64_t*>(filter + 0x28) = -1;
+    *reinterpret_cast<uint32_t*>(filter + 0x30) = 0;
+    *reinterpret_cast<uint32_t*>(filter + 0x34) = 0x0100FFFFu;
+    filter[0x38] = 3;
+    filter[0x39] = 0x49;
+    filter[0x40] = 0;
 
     __try {
         auto initShape = reinterpret_cast<ShapeInitFn>(clientBase + PhysicsRayShapeInitRva);
         auto initResult = reinterpret_cast<ResultInitFn>(clientBase + TraceResultInitRva);
         auto trace = reinterpret_cast<TraceFn>(clientBase + PhysicsTraceWrapperRva);
-        auto filterGroup = reinterpret_cast<TraceFilterGroupFn>(clientBase + TraceFilterGroupRva);
-        auto filterLayer = reinterpret_cast<TraceFilterLayerFn>(clientBase + TraceFilterLayerRva);
+        auto filterCtor = reinterpret_cast<TraceFilterConstructorFn>(
+            clientBase + TraceFilterConstructorRva);
 
-        *reinterpret_cast<uint32_t*>(filter + 32) = filterGroup(0);
-        *reinterpret_cast<uint16_t*>(filter + 48) = filterLayer(0);
+        filterCtor(filter, currentLocalPawn, 0);
 
         initShape(shape, reinterpret_cast<const void*>(clientBase + RayShapeGlobalRva));
         initResult(result);
@@ -373,10 +361,18 @@ bool PhysicsTraceVisible(const Vector3& start, const Vector3& end) {
 
         const float fraction = *reinterpret_cast<const float*>(result + 172);
         const bool startSolid = *reinterpret_cast<const bool*>(result + 183);
-        return std::isfinite(fraction) && fraction >= 0.995f && !startSolid;
+        const uintptr_t hitEntity =
+            *reinterpret_cast<const uintptr_t*>(result + 8);
+        // A stale/partially initialized trace result must not remove every
+        // target from the aim list. Only a valid native result may veto aim.
+        if (!std::isfinite(fraction) || fraction < 0.0f || fraction > 1.0f)
+            return true;
+        if (startSolid) return true;
+        return fraction >= 0.995f ||
+            (targetEntity && hitEntity == targetEntity);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
+        return true;
     }
 }
 
@@ -509,6 +505,49 @@ bool IsDepthBufferPopulated() {
     return false;
 }
 
+bool IsDepthPointVisible(const Vector3& point) {
+    if (!depthSnapshotReady || !currentViewMatrixReady) return false;
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    if (display.x <= 0.0f || display.y <= 0.0f) return false;
+
+    const float clipX = currentViewMatrix.m[0][0] * point.x +
+        currentViewMatrix.m[0][1] * point.y + currentViewMatrix.m[0][2] * point.z +
+        currentViewMatrix.m[0][3];
+    const float clipY = currentViewMatrix.m[1][0] * point.x +
+        currentViewMatrix.m[1][1] * point.y + currentViewMatrix.m[1][2] * point.z +
+        currentViewMatrix.m[1][3];
+    const float clipZ = currentViewMatrix.m[2][0] * point.x +
+        currentViewMatrix.m[2][1] * point.y + currentViewMatrix.m[2][2] * point.z +
+        currentViewMatrix.m[2][3];
+    const float w = currentViewMatrix.m[3][0] * point.x +
+        currentViewMatrix.m[3][1] * point.y + currentViewMatrix.m[3][2] * point.z +
+        currentViewMatrix.m[3][3];
+    if (!std::isfinite(clipX) || !std::isfinite(clipY) || !std::isfinite(clipZ) ||
+        !std::isfinite(w) || w <= 0.01f) return false;
+
+    const float screenX = display.x * 0.5f + clipX / w * display.x * 0.5f;
+    const float screenY = display.y * 0.5f - clipY / w * display.y * 0.5f;
+    const float targetDepth = clipZ / w * 0.5f + 0.5f;
+    if (!std::isfinite(screenX) || !std::isfinite(screenY) ||
+        !std::isfinite(targetDepth) || targetDepth < 0.0f || targetDepth > 1.0f)
+        return false;
+
+    // Use a small neighborhood: a single depth pixel can belong to a thin
+    // model part or be unsettled while the render target is changing.
+    constexpr float offsets[][2] = {{0, 0}, {-2, 0}, {2, 0}, {0, -2}, {0, 2}};
+    bool sampled = false;
+    float nearestSceneDepth = 1.0f;
+    for (const auto& offset : offsets) {
+        float sceneDepth = 0.0f;
+        if (!ReadDepthAt(screenX + offset[0], screenY + offset[1], sceneDepth)) continue;
+        if (sceneDepth <= 0.001f) continue;
+        sampled = true;
+        nearestSceneDepth = (std::min)(nearestSceneDepth, sceneDepth);
+    }
+    if (!sampled) return false;
+    return targetDepth <= nearestSceneDepth + 0.025f;
+}
+
 bool GetAimPointScreen(const PlayerData& player, float height, Vector2& screen) {
     if (!currentViewMatrixReady) return false;
     const Vector3 aimPoint{ player.pos.x, player.pos.y, player.pos.z + height };
@@ -524,10 +563,15 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
     farmToggleLastDown = configuredFarmKeyDown;
     if (!farmAssist) {
         farmToggleActive = false;
+        ClearPendingCreepAngles();
         return;
     }
     const bool farmAiming = farmToggleMode ? farmToggleActive : configuredFarmKeyDown;
-    if (menuOpen || !currentViewMatrixReady || !farmAiming) return;
+    if (!farmSilentMode) ClearPendingCreepAngles();
+    if (menuOpen || !currentViewMatrixReady || !farmAiming) {
+        ClearPendingCreepAngles();
+        return;
+    }
 
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     const float cx = display.x * 0.5f;
@@ -536,11 +580,13 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
     // only when it found a live target inside Human FOV (including its
     // visibility rules). A player merely present on screen must not suppress
     // creep aim.
-    if (humanAimTargetFound) return;
+    if (humanAimTargetFound) {
+        ClearPendingCreepAngles();
+        return;
+    }
 
     FarmTarget best{};
     Vector2 bestScreen{};
-    Vector3 bestWorld{};
     float bestDistance = farmFov * farmFov;
     const uint8_t localTeam = currentLocalPawn
         ? Read<uint8_t>(currentLocalPawn + Offsets::Team)
@@ -559,10 +605,7 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
     for (const auto& target : targetSnapshot) {
         if (localTeam != 0 && target.team == localTeam) continue;
         if (!target.entity || Read<int>(target.entity + Offsets::Health) <= 0 ||
-            Read<uint8_t>(target.entity + Offsets::LifeState) != 0 ||
-            Read<uint32_t>(target.entity + Offsets::NPCState) == 5 ||
-            Read<uint32_t>(target.entity + Offsets::NPCState) == 6 ||
-            Read<uint8_t>(target.entity + Offsets::FadeCorpse) != 0) continue;
+            Read<uint8_t>(target.entity + Offsets::LifeState) != 0) continue;
         Vector2 screen{};
         const Vector3 approximatePoint{ target.pos.x, target.pos.y, target.pos.z + 24.0f };
         if (!WorldToScreen(approximatePoint, screen, currentViewMatrix)) continue;
@@ -584,7 +627,8 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
                        candidate.target.pos.z + 24.0f };
         // Only nearby screen candidates reach this expensive engine call.
         GetEntityBonePosition(candidate.target.entity, "head", point);
-        if (aimVisibilityCheck && traceAvailable && !IsWorldAimPointVisible(point)) continue;
+        if (aimVisibilityCheck && traceAvailable &&
+            !IsWorldAimPointVisible(point, candidate.target.entity)) continue;
         Vector2 screen{};
         if (!WorldToScreen(point, screen, currentViewMatrix)) continue;
         const float dx = screen.x - cx;
@@ -592,7 +636,6 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
         const float distance = dx * dx + dy * dy;
         if (distance >= bestDistance) continue;
         best = candidate.target;
-        bestWorld = point;
         bestScreen = screen;
         bestDistance = distance;
         // Candidates are ordered by their inexpensive screen estimate. The
@@ -601,18 +644,16 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
         break;
     }
     if (!best.entity) {
-        if (farmSilentMode) RestoreSilentFlick();
+        ClearPendingCreepAngles();
         return;
     }
 
     if (farmSilentMode) {
-        const Vector3 cameraOrigin = currentCameraPositionReady
-            ? currentCameraPosition : currentLocalPosition;
-        const Vector3 commandAngles = CalculateAimAngles(cameraOrigin, bestWorld);
-        if (std::isfinite(commandAngles.x) && std::isfinite(commandAngles.y)) {
-        std::lock_guard<std::mutex> lock(creepSilentMutex);
-        pendingCreepAngles = commandAngles;
-        pendingCreepReady = true;
+        Vector3 commandAngles{};
+        if (GetAimAnglesFromScreen(bestScreen.x, bestScreen.y, commandAngles)) {
+            std::lock_guard<std::mutex> lock(creepSilentMutex);
+            pendingCreepAngles = commandAngles;
+            pendingCreepReady = true;
         }
         return;
     }
@@ -681,7 +722,8 @@ void AutoLastHitOrbs() {
             if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) continue;
             const bool traceAvailable = clientBase &&
                 Read<uintptr_t>(clientBase + PhysicsTraceContextRva) != 0;
-            if (orbAimVisibilityCheck && traceAvailable && !IsWorldAimPointVisible(point)) continue;
+            if (orbAimVisibilityCheck && traceAvailable &&
+                !IsWorldAimPointVisible(point, orb.entity)) continue;
             Vector2 screen{};
             if (!WorldToScreen(point, screen, currentViewMatrix)) continue;
             if (screen.x < 0.0f || screen.y < 0.0f ||
@@ -771,18 +813,15 @@ bool IsAimPointVisible(const PlayerData& player, float height, float screenX, fl
     if (!Read<uintptr_t>(clientBase + PhysicsTraceContextRva)) return false;
     Vector3 traceStart = currentLocalPosition;
     traceStart.z += 64.0f;
-    // TraceShape's bool is a hit flag, not a success flag. PhysicsTraceVisible
-    // intentionally ignores that return value and evaluates the populated
-    // fraction/startSolid result instead.
-    return PhysicsTraceVisible(traceStart, aimPoint);
+    return PhysicsTraceVisible(traceStart, aimPoint, player.entity);
 }
 
-bool IsWorldAimPointVisible(const Vector3& point) {
+bool IsWorldAimPointVisible(const Vector3& point, uintptr_t targetEntity) {
     if (!clientBase || !currentLocalPositionReady) return false;
     if (!Read<uintptr_t>(clientBase + PhysicsTraceContextRva)) return false;
     Vector3 traceStart = currentLocalPosition;
     traceStart.z += 64.0f;
-    return PhysicsTraceVisible(traceStart, point);
+    return PhysicsTraceVisible(traceStart, point, targetEntity);
 }
 
 void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
@@ -804,14 +843,16 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     const ImVec2 size = ImGui::GetIO().DisplaySize;
     const float cx = size.x * 0.5f;
     const float cy = size.y * 0.5f;
+    const uint8_t localTeam = currentLocalPawn
+        ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
     const PlayerData* best = nullptr;
     Vector2 bestAimScreen{};
-    float bestAimHeight = 54.0f;
     float bestDistance = aimFov * aimFov;
     size_t visibleTargets = 0;
     size_t testedTargets = 0;
 
     for (const auto& player : players) {
+        if (localTeam != 0 && player.team == localTeam) continue;
         const float modelHeight = player.modelHeight > 20.0f ? player.modelHeight : 80.0f;
         const float modelMinZ = std::isfinite(player.modelMinZ) ? player.modelMinZ : 0.0f;
         const float fallbackHead = modelMinZ + modelHeight * 0.92f;
@@ -836,7 +877,6 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         }
         bool targetVisible = false;
         Vector2 visibleAimScreen{};
-        float visibleAimHeight = 54.0f;
         float visibleDistance = FLT_MAX;
         for (int candidateIndex = 0; candidateIndex < candidateCount; ++candidateIndex) {
             const Vector3 point = candidates[candidateIndex].point;
@@ -848,13 +888,12 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
             if (distance >= bestDistance) continue;
             ++testedTargets;
             if (useDepthWallCheck && (candidates[candidateIndex].bone
-                ? !IsWorldAimPointVisible(point)
+                ? !IsWorldAimPointVisible(point, player.entity)
                 : !IsAimPointVisible(player, point.z - player.pos.z, aimScreen.x, aimScreen.y))) continue;
             targetVisible = true;
             if (distance < visibleDistance) {
                 visibleDistance = distance;
                 visibleAimScreen = aimScreen;
-                visibleAimHeight = point.z - player.pos.z;
             }
         }
         if (targetVisible) {
@@ -864,12 +903,12 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
                 best = &player;
                 // Store the point that passed the depth test for the final move.
                 bestAimScreen = visibleAimScreen;
-                bestAimHeight = visibleAimHeight;
             }
         }
     }
 
     if (!best) {
+        if (aimSilentMode) ClearPendingSilentAngles();
         return;
     }
     humanAimTargetFound = true;
@@ -879,23 +918,22 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     const float smooth = aimSilentMode ? 1.0f : (aimSmooth < 1.0f ? 1.0f : aimSmooth);
     const LONG moveX = static_cast<LONG>((targetX - cx) / smooth);
     const LONG moveY = static_cast<LONG>((targetY - cy) / smooth);
+    if (aimSilentMode) {
+        Vector3 commandAngles{};
+        if (GetAimAnglesFromScreen(targetX, targetY, commandAngles)) {
+            std::lock_guard<std::mutex> lock(humanSilentMutex);
+            pendingHumanAngles = commandAngles;
+            pendingHumanReady = true;
+        }
+        return;
+    }
     if (moveX || moveY) {
-        if (aimSilentMode) {
-            Vector3 commandAngles{};
-            if (GetAimAnglesFromScreen(targetX, targetY, commandAngles)) {
-                std::lock_guard<std::mutex> lock(humanSilentMutex);
-                pendingHumanAngles = commandAngles;
-                pendingHumanReady = true;
-            }
-        }
-        if (!aimSilentMode) {
-            INPUT input{};
-            input.type = INPUT_MOUSE;
-            input.mi.dwFlags = MOUSEEVENTF_MOVE;
-            input.mi.dx = moveX;
-            input.mi.dy = moveY;
-            SendInput(1, &input, sizeof(INPUT));
-        }
+        INPUT input{};
+        input.type = INPUT_MOUSE;
+        input.mi.dwFlags = MOUSEEVENTF_MOVE;
+        input.mi.dx = moveX;
+        input.mi.dy = moveY;
+        SendInput(1, &input, sizeof(INPUT));
     }
 }
 

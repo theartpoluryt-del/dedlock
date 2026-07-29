@@ -32,6 +32,17 @@ int freeCamKey = VK_F6;
 float freeCamSpeed = 450.0f;
 bool freeCamKeyCapture = false;
 bool orbEntityEventsAvailable = false;
+bool drawTeammates = false;
+bool drawPlayerNames = false;
+bool cornerBoxes = true;
+float enemyBoxColor[4] = {0.20f, 1.00f, 0.10f, 1.00f};
+float teammateBoxColor[4] = {0.20f, 0.60f, 1.00f, 1.00f};
+float enemyNameColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
+float teammateNameColor[4] = {0.35f, 0.75f, 1.00f, 1.00f};
+float enemyHealthColor[4] = {0.20f, 1.00f, 0.25f, 1.00f};
+float teammateHealthColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
+float boxThickness = 1.20f;
+float cornerBoxLength = 0.24f;
 
 namespace {
 std::string ConfigPath() {
@@ -62,6 +73,35 @@ void LoadConfig() {
         else if (key == "drawFarmFovCircle") drawFarmFovCircle = value;
         else if (key == "drawBones") drawBones = value;
         else if (key == "drawCreepEsp") drawCreepEsp = value;
+        else if (key == "drawTeammates") drawTeammates = value;
+        else if (key == "drawPlayerNames") drawPlayerNames = value;
+        else if (key == "cornerBoxes") cornerBoxes = value;
+        else if (key == "boxThickness") boxThickness = static_cast<float>(number);
+        else if (key == "cornerBoxLength") cornerBoxLength = static_cast<float>(number);
+        else if (key == "enemyBoxR") enemyBoxColor[0] = static_cast<float>(number);
+        else if (key == "enemyBoxG") enemyBoxColor[1] = static_cast<float>(number);
+        else if (key == "enemyBoxB") enemyBoxColor[2] = static_cast<float>(number);
+        else if (key == "enemyBoxA") enemyBoxColor[3] = static_cast<float>(number);
+        else if (key == "teammateBoxR") teammateBoxColor[0] = static_cast<float>(number);
+        else if (key == "teammateBoxG") teammateBoxColor[1] = static_cast<float>(number);
+        else if (key == "teammateBoxB") teammateBoxColor[2] = static_cast<float>(number);
+        else if (key == "teammateBoxA") teammateBoxColor[3] = static_cast<float>(number);
+        else if (key == "enemyNameR") enemyNameColor[0] = static_cast<float>(number);
+        else if (key == "enemyNameG") enemyNameColor[1] = static_cast<float>(number);
+        else if (key == "enemyNameB") enemyNameColor[2] = static_cast<float>(number);
+        else if (key == "enemyNameA") enemyNameColor[3] = static_cast<float>(number);
+        else if (key == "teammateNameR") teammateNameColor[0] = static_cast<float>(number);
+        else if (key == "teammateNameG") teammateNameColor[1] = static_cast<float>(number);
+        else if (key == "teammateNameB") teammateNameColor[2] = static_cast<float>(number);
+        else if (key == "teammateNameA") teammateNameColor[3] = static_cast<float>(number);
+        else if (key == "enemyHealthR") enemyHealthColor[0] = static_cast<float>(number);
+        else if (key == "enemyHealthG") enemyHealthColor[1] = static_cast<float>(number);
+        else if (key == "enemyHealthB") enemyHealthColor[2] = static_cast<float>(number);
+        else if (key == "enemyHealthA") enemyHealthColor[3] = static_cast<float>(number);
+        else if (key == "teammateHealthR") teammateHealthColor[0] = static_cast<float>(number);
+        else if (key == "teammateHealthG") teammateHealthColor[1] = static_cast<float>(number);
+        else if (key == "teammateHealthB") teammateHealthColor[2] = static_cast<float>(number);
+        else if (key == "teammateHealthA") teammateHealthColor[3] = static_cast<float>(number);
         else if (key == "drawOrbEsp") drawOrbEsp = value;
         else if (key == "drawSpectatorList") drawSpectatorList = value;
         else if (key == "freeCam") freeCam = value;
@@ -108,6 +148,35 @@ void SaveConfig() {
            << "drawFarmFovCircle " << drawFarmFovCircle << '\n'
            << "drawBones " << drawBones << '\n'
            << "drawCreepEsp " << drawCreepEsp << '\n'
+           << "drawTeammates " << drawTeammates << '\n'
+           << "drawPlayerNames " << drawPlayerNames << '\n'
+           << "cornerBoxes " << cornerBoxes << '\n'
+           << "boxThickness " << boxThickness << '\n'
+           << "cornerBoxLength " << cornerBoxLength << '\n'
+           << "enemyBoxR " << enemyBoxColor[0] << '\n'
+           << "enemyBoxG " << enemyBoxColor[1] << '\n'
+           << "enemyBoxB " << enemyBoxColor[2] << '\n'
+           << "enemyBoxA " << enemyBoxColor[3] << '\n'
+           << "teammateBoxR " << teammateBoxColor[0] << '\n'
+           << "teammateBoxG " << teammateBoxColor[1] << '\n'
+           << "teammateBoxB " << teammateBoxColor[2] << '\n'
+           << "teammateBoxA " << teammateBoxColor[3] << '\n'
+           << "enemyNameR " << enemyNameColor[0] << '\n'
+           << "enemyNameG " << enemyNameColor[1] << '\n'
+           << "enemyNameB " << enemyNameColor[2] << '\n'
+           << "enemyNameA " << enemyNameColor[3] << '\n'
+           << "teammateNameR " << teammateNameColor[0] << '\n'
+           << "teammateNameG " << teammateNameColor[1] << '\n'
+           << "teammateNameB " << teammateNameColor[2] << '\n'
+           << "teammateNameA " << teammateNameColor[3] << '\n'
+           << "enemyHealthR " << enemyHealthColor[0] << '\n'
+           << "enemyHealthG " << enemyHealthColor[1] << '\n'
+           << "enemyHealthB " << enemyHealthColor[2] << '\n'
+           << "enemyHealthA " << enemyHealthColor[3] << '\n'
+           << "teammateHealthR " << teammateHealthColor[0] << '\n'
+           << "teammateHealthG " << teammateHealthColor[1] << '\n'
+           << "teammateHealthB " << teammateHealthColor[2] << '\n'
+           << "teammateHealthA " << teammateHealthColor[3] << '\n'
            << "drawOrbEsp " << drawOrbEsp << '\n'
            << "drawSpectatorList " << drawSpectatorList << '\n'
            << "freeCam " << freeCam << '\n'
