@@ -148,7 +148,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
       <AdditionalLibraryDirectories>$(ProjectDir)minhook-1.3.4\lib;$(ProjectDir)protobuf</AdditionalLibraryDirectories>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;libMinHook.x64.lib;libprotobuf.lib</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;d2d1.lib;dwrite.lib;windowscodecs.lib;ole32.lib;libMinHook.x64.lib;libprotobuf.lib</AdditionalDependencies>
     </Link>
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -156,6 +156,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="framework.h" />
+    <ClInclude Include="menu_d2d.h" />
+    <ClInclude Include="resource.h" />
     <ClInclude Include="shared.h" />
     <ClInclude Include="usercmd.hpp" />
     <ClInclude Include="usercmd_runtime.hpp" />
@@ -173,6 +175,9 @@
     <ClInclude Include="imgui-1.92.8\imstb_truetype.h" />
   </ItemGroup>
   <ItemGroup>
+    <ResourceCompile Include="resources.rc" />
+  </ItemGroup>
+  <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="globals.cpp" />
     <ClCompile Include="aim.cpp" />
@@ -184,6 +189,7 @@
     <ClCompile Include="melee_hook.cpp" />
     <ClCompile Include="sound_hook.cpp" />
     <ClCompile Include="model_glow.cpp" />
+    <ClCompile Include="menu_d2d.cpp" />
     <ClCompile Include="runtime_offsets.cpp" />
     <ClCompile Include="C:\Users\artpo\source\repos\Dll6\Dll6\work\Andromeda-DeadLock-Base-1.2.0\Andromeda-DeadLock-Base\Andromeda-DeadLock\DeadLock\Protobuf\gameevents.pb.cc" />
     <ClCompile Include="usercmd_runtime.cpp" />

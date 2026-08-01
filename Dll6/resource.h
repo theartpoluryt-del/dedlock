@@ -1,0 +1,7 @@
+#pragma once
+
+#define IDR_DEADLOCK_LOGO 101
+#define IDR_ICON_EYE 102
+#define IDR_ICON_CROSSHAIR 103
+#define IDR_ICON_SPROUT 104
+#define IDR_ICON_SETTINGS 105

@@ -251,7 +251,7 @@ void AutoParry(const std::vector<PlayerData>&) {
             uint32_t pawnEntityIndex = 0;
             const uintptr_t identity = Read<uintptr_t>(pawn + 0x10);
             if (identity)
-                pawnEntityIndex = Read<uint32_t>(identity + 0x10) & Offsets::HandleIndexMask;
+                pawnEntityIndex = Read<uint32_t>(identity + Offsets::EntityHandleOffset) & Offsets::HandleIndexMask;
 
             std::lock_guard<std::mutex> lock(parrySoundMutex);
             const auto soundIt = meleeSoundUntil.find(pawnEntityIndex);
@@ -312,7 +312,7 @@ void AutoParry(const std::vector<PlayerData>&) {
             // a second parry while its 600 ms signal window is still active.
             const uintptr_t identity = Read<uintptr_t>(pawn + 0x10);
             const uint32_t pawnEntityIndex = identity
-                ? Read<uint32_t>(identity + 0x10) & Offsets::HandleIndexMask
+                ? Read<uint32_t>(identity + Offsets::EntityHandleOffset) & Offsets::HandleIndexMask
                 : 0;
             if (pawnEntityIndex) {
                 std::lock_guard<std::mutex> lock(parrySoundMutex);
@@ -362,7 +362,7 @@ void AutoParry(const std::vector<PlayerData>&) {
         if (!isEnemy(pawn)) continue;
 
         const uintptr_t identity = Read<uintptr_t>(pawn + 0x10);
-        const uint32_t pawnHandle = identity ? Read<uint32_t>(identity + 0x10) : 0xFFFFFFFFu;
+        const uint32_t pawnHandle = identity ? Read<uint32_t>(identity + Offsets::EntityHandleOffset) : 0xFFFFFFFFu;
         if (distance <= 180.0f && now - lastDiagnostic < 30) {
             printf("[Parry] enemy pawn=0x%p handle=0x%X distance=%.1f\n",
                    reinterpret_cast<void*>(pawn), pawnHandle, distance);

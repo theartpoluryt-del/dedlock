@@ -1,0 +1,7 @@
+#include "resource.h"
+
+IDR_DEADLOCK_LOGO RCDATA "assets\\deadlock_logo_exact.png"
+IDR_ICON_EYE RCDATA "assets\\icons\\eye.png"
+IDR_ICON_CROSSHAIR RCDATA "assets\\icons\\crosshair.png"
+IDR_ICON_SPROUT RCDATA "assets\\icons\\sprout.png"
+IDR_ICON_SETTINGS RCDATA "assets\\icons\\settings.png"

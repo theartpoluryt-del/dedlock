@@ -24,6 +24,7 @@ uintptr_t FindPattern(uintptr_t base, std::size_t size, const char* pattern) {
     const auto bytes = ParsePattern(pattern);
     if (bytes.empty() || bytes.size() > size) return 0;
 
+    uintptr_t found = 0;
     for (std::size_t i = 0; i <= size - bytes.size(); ++i) {
         bool match = true;
         for (std::size_t j = 0; j < bytes.size(); ++j) {
@@ -32,9 +33,11 @@ uintptr_t FindPattern(uintptr_t base, std::size_t size, const char* pattern) {
                 break;
             }
         }
-        if (match) return base + i;
+        if (!match) continue;
+        if (found) return 0;
+        found = base + i;
     }
-    return 0;
+    return found;
 }
 
 uintptr_t ResolveRipRelative(uintptr_t instruction, std::size_t displacementOffset, std::size_t instructionLength) {

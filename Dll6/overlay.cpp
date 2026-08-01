@@ -1,5 +1,57 @@
 #include "shared.h"
 #include <fstream>
+#include <MinHook.h>
+#include "menu_d2d.h"
+
+using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(
+    ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*,
+    ID3D11DepthStencilView*);
+
+static OMSetRenderTargetsFn originalOMSetRenderTargets = nullptr;
+static void* omSetRenderTargetsTarget = nullptr;
+
+void STDMETHODCALLTYPE hkOMSetRenderTargets(
+    ID3D11DeviceContext* context, UINT numViews,
+    ID3D11RenderTargetView* const* renderTargetViews,
+    ID3D11DepthStencilView* depthStencilView) {
+    TrackGameDepthStencil(depthStencilView);
+    if (originalOMSetRenderTargets) {
+        originalOMSetRenderTargets(
+            context, numViews, renderTargetViews, depthStencilView);
+    }
+}
+
+bool InstallDepthCaptureHook() {
+    if (originalOMSetRenderTargets) return true;
+    if (!pContext) return false;
+    void** vtable = *reinterpret_cast<void***>(pContext);
+    if (!vtable || !vtable[33]) return false;
+    omSetRenderTargetsTarget = vtable[33];
+    if (MH_CreateHook(
+            omSetRenderTargetsTarget,
+            reinterpret_cast<void*>(&hkOMSetRenderTargets),
+            reinterpret_cast<void**>(&originalOMSetRenderTargets)) != MH_OK) {
+        omSetRenderTargetsTarget = nullptr;
+        originalOMSetRenderTargets = nullptr;
+        return false;
+    }
+    if (MH_EnableHook(omSetRenderTargetsTarget) != MH_OK) {
+        MH_RemoveHook(omSetRenderTargetsTarget);
+        omSetRenderTargetsTarget = nullptr;
+        originalOMSetRenderTargets = nullptr;
+        return false;
+    }
+    return true;
+}
+
+void RemoveDepthCaptureHook() {
+    if (omSetRenderTargetsTarget) {
+        MH_DisableHook(omSetRenderTargetsTarget);
+        MH_RemoveHook(omSetRenderTargetsTarget);
+    }
+    omSetRenderTargetsTarget = nullptr;
+    originalOMSetRenderTargets = nullptr;
+}
 
 void RestorePresentHook() {
     if (!presentVTable || !oPresent) return;
@@ -17,12 +69,18 @@ void RestorePresentHook() {
 void ShutdownOverlay() {
     SaveConfig();
     freeCam = false;
+    freeCamActive = false;
     RemoveUserCmdHook();
     RemoveInputLockHooks();
     RemoveSoundEventHook();
     RemoveModelGlowHook();
     RemoveOrbEntityHooks();
     RemoveMeleeStateMonitor();
+    RemoveDepthCaptureHook();
+    ShutdownD2DMenu();
+    // All project hooks have been disabled and removed above. Reset MinHook
+    // itself so a later reinjection cannot retain trampolines into this DLL.
+    MH_Uninitialize();
     if (stopHeroDiscoveryEvent) SetEvent(stopHeroDiscoveryEvent);
     if (heroDiscoveryThread) {
         WaitForSingleObject(heroDiscoveryThread, 2000);
@@ -137,12 +195,25 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             return oPresent(pSwapChain, SyncInterval, Flags);
         }
         gameWindow = desc.OutputWindow;
+        InstallDepthCaptureHook();
 
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
         io.LogFilename = nullptr;
-        io.Fonts->AddFontDefault();
+        ImFontConfig fontConfig{};
+        fontConfig.OversampleH = 3;
+        fontConfig.OversampleV = 2;
+        fontConfig.PixelSnapH = false;
+        ImFont* uiFont = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\segoeui.ttf", 18.0f, &fontConfig,
+            io.Fonts->GetGlyphRangesCyrillic());
+        ImFont* uiFontBold = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\segoeuib.ttf", 22.0f, &fontConfig,
+            io.Fonts->GetGlyphRangesCyrillic());
+        if (!uiFont) uiFont = io.Fonts->AddFontDefault();
+        if (!uiFontBold) uiFontBold = uiFont;
+        io.FontDefault = uiFont;
         ImGui::StyleColorsDark();
 
         if (!ImGui_ImplWin32_Init(gameWindow)) {
@@ -202,6 +273,12 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     static ULONGLONG lastAssistUpdate = 0;
     static std::vector<PlayerData> visualSnapshot;
     const ULONGLONG now = GetTickCount64();
+    static ULONGLONG lastDepthSnapshot = 0;
+    if (lastDepthSnapshot == 0 || now - lastDepthSnapshot >= 16) {
+        CaptureDepthSnapshot();
+        ArmGameDepthCapture();
+        lastDepthSnapshot = now;
+    }
     // Rebuild the visual snapshot on every Present so ESP positions are
     // refreshed once per rendered frame, including 144 Hz displays.
     const std::vector<PlayerData> nextSnapshot = GetPlayers();
@@ -220,13 +297,39 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         lastAssistUpdate = now;
     }
     RenderESP(visualSnapshot);
-    RenderMenu(visualSnapshot.size());
+    // Target acquisition and visibility tracing are bounded above. Camera
+    // interpolation remains per-frame; the gameplay camera hook consumes it.
+    UpdateVisibleAimCamera();
+    const bool d2dMenuReady = PrepareD2DMenu(pSwapChain);
+    const bool softwareD2DMenu = d2dMenuReady && UsesSoftwareD2DMenu();
+    std::size_t sessionPlayerCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(heroPawnsMutex);
+        for (const uintptr_t pawn : heroPawns) {
+            if (!pawn || pawn == currentLocalPawn) continue;
+            const int health = Read<int>(pawn + Offsets::Health);
+            const uint8_t lifeState =
+                Read<uint8_t>(pawn + Offsets::LifeState);
+            const uint8_t team = Read<uint8_t>(pawn + Offsets::Team);
+            if (health > 0 && lifeState == 0 &&
+                (team == 2 || team == 3))
+                ++sessionPlayerCount;
+        }
+    }
+    if (!d2dMenuReady)
+        RenderMenu(sessionPlayerCount);
+    else if (softwareD2DMenu)
+        RenderD2DMenu(sessionPlayerCount);
 
     ImGui::EndFrame();
     ImGui::Render();
 
     pContext->OMSetRenderTargets(1, &pRenderTargetView, nullptr);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    if (d2dMenuReady && !softwareD2DMenu) {
+        pContext->OMSetRenderTargets(0, nullptr, nullptr);
+        RenderD2DMenu(visualSnapshot.size());
+    }
 
     return oPresent(pSwapChain, SyncInterval, Flags);
 }

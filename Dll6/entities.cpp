@@ -5,6 +5,8 @@
 #include <atomic>
 
 namespace {
+std::unordered_map<uintptr_t, int> registeredGlowMode;
+
 void LogNativeGlow(const char* message) {
     std::ofstream log(
         "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\native_glow.log",
@@ -70,7 +72,7 @@ uintptr_t ResolveEntity(uint32_t handle) {
             if (!chunk) continue;
             const uintptr_t identity =
                 chunk + Offsets::EntityStride * (index & Offsets::HandleChunkMask);
-            if (Read<uint32_t>(identity + 0x10) != handle) continue;
+            if (Read<uint32_t>(identity + Offsets::EntityHandleOffset) != handle) continue;
             return Read<uintptr_t>(identity);
         }
     }
@@ -95,7 +97,7 @@ void DebugEntityHandle(uint32_t handle) {
                 root + tableOffset + Offsets::EntityChunkStride * (index >> Offsets::HandleChunkShift));
             if (!chunk) continue;
             const uintptr_t identity = chunk + Offsets::EntityStride * (index & Offsets::HandleChunkMask);
-            const uint32_t storedHandle = Read<uint32_t>(identity + 0x10);
+            const uint32_t storedHandle = Read<uint32_t>(identity + Offsets::EntityHandleOffset);
             const uintptr_t entity = Read<uintptr_t>(identity);
             printf("[Parry] table root=%zu off=0x%llX chunk=0x%p identity=0x%p stored=0x%X entity=0x%p class=%s\n",
                    rootIndex, static_cast<unsigned long long>(tableOffset),
@@ -322,21 +324,42 @@ void ApplyHeroGlow(uintptr_t entity) {
     // glow pass is no longer active.
     {
         std::lock_guard lock(glowMutex);
+        const int targetGlowType = glowMode == 1 ? 2 : 1;
         const int currentType = Read<int>(glow + Offsets::GlowType);
-        if (currentType != 1 &&
+        const auto modeIt = registeredGlowMode.find(entity);
+        const bool modeChanged = modeIt == registeredGlowMode.end() ||
+            modeIt->second != glowMode;
+        if ((currentType != targetGlowType || modeChanged) &&
             queuedGlows.insert(entity).second) {
             shouldNotify = true;
         }
+        if (shouldNotify) registeredGlowMode[entity] = glowMode;
     }
 
-    Write<Vector3>(glow + Offsets::GlowColor, { 0.10f, 1.0f, 0.18f });
-    Write<int>(glow + Offsets::GlowType, 1);
+    const uint8_t localTeam = currentLocalPawn
+        ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
+    const uint8_t entityTeam = Read<uint8_t>(entity + Offsets::Team);
+    const bool ally = localTeam >= 2 && localTeam <= 3 && entityTeam == localTeam;
+    const float* glowColor = ally ? teammateGlowColor : enemyGlowColor;
+    const int health = Read<int>(entity + Offsets::Health);
+    const int maxHealth = Read<int>(entity + Offsets::MaxHealth);
+    const float healthAlpha = maxHealth > 0
+        ? std::clamp(static_cast<float>(health) / maxHealth, 0.0f, 1.0f) : 0.0f;
+    const float glowAlpha = glowMode == 0
+        ? glowColor[3] * healthAlpha : 1.0f;
+    Write<Vector3>(glow + Offsets::GlowColor,
+                   { glowColor[0], glowColor[1], glowColor[2] });
+    Write<int>(glow + Offsets::GlowType, glowMode == 1 ? 2 : 1);
     Write<int>(glow + Offsets::GlowTeam, -1);
     Write<int>(glow + Offsets::GlowRange, 0);
     Write<int>(glow + Offsets::GlowRangeMin, 0);
-    Write<ColorRGBA>(glow + Offsets::GlowColorOverride, { 26, 255, 46, 255 });
+    Write<ColorRGBA>(glow + Offsets::GlowColorOverride,
+                     { static_cast<uint8_t>(std::clamp(glowColor[0], 0.0f, 1.0f) * 255.0f),
+                       static_cast<uint8_t>(std::clamp(glowColor[1], 0.0f, 1.0f) * 255.0f),
+                       static_cast<uint8_t>(std::clamp(glowColor[2], 0.0f, 1.0f) * 255.0f),
+                       static_cast<uint8_t>(std::clamp(glowAlpha, 0.0f, 1.0f) * 255.0f) });
     Write<bool>(glow + Offsets::GlowFlashing, false);
-    Write<float>(glow + Offsets::GlowTime, 1.0f);
+    Write<float>(glow + Offsets::GlowTime, glowMode == 1 ? 0.0f : 1.0f);
     Write<float>(glow + Offsets::GlowStartTime, 0.0f);
     Write<bool>(glow + Offsets::GlowEligible, true);
     Write<bool>(glow + Offsets::IsGlowing, true);
@@ -450,8 +473,11 @@ void RefreshHeroPawns() {
                                 std::string::npos)
                             continue;
 
-                        Vector3 position{};
-                        if (GetEntityPosition(entity, position)) found.push_back(entity);
+                        // Entity-system membership, hero type, team and health
+                        // identify the pawn. Do not require a scene-node
+                        // position here: Source 2 may stop publishing render
+                        // transforms for objects outside the current camera.
+                        found.push_back(entity);
                     }
                 }
             }
@@ -598,7 +624,7 @@ std::string GetEntityDesignerName(uint32_t handle) {
             if (!chunk) continue;
             const uintptr_t identity = chunk + Offsets::EntityStride *
                 (index & Offsets::HandleChunkMask);
-            if (Read<uint32_t>(identity + 0x10) != handle) continue;
+            if (Read<uint32_t>(identity + Offsets::EntityHandleOffset) != handle) continue;
             const uintptr_t name = Read<uintptr_t>(identity + 0x20);
             if (!name) return {};
             std::string result;
@@ -715,7 +741,7 @@ void RefreshFarmTargets() {
     const bool configuredFarmKeyDown = (GetAsyncKeyState(farmAssistKey) & 0x8000) != 0;
     const bool farmActive = farmAssist &&
         (farmToggleMode ? farmToggleActive : configuredFarmKeyDown);
-    if (!farmActive && !drawCreepEsp && !autoLastHitOrbs && !drawOrbEsp) {
+    if (!farmActive && !creepEspEnabled && !autoLastHitOrbs && !drawOrbEsp) {
         std::lock_guard lock(farmTargetsMutex);
         farmTargets.clear();
         std::lock_guard orbLock(orbTargetsMutex);
@@ -759,7 +785,7 @@ void RefreshFarmTargets() {
     // speculative auxiliary tables: that multiplies the work and can make
     // the render thread compete with the worker for CPU time.
     const uintptr_t root = Read<uintptr_t>(clientBase + Offsets::GameEntitySystem);
-    constexpr uintptr_t tableOffset = Offsets::EntityChunks;
+    const uintptr_t tableOffset = Offsets::EntityChunks;
     std::unordered_set<uintptr_t> seen;
     if (root) {
         const int reportedHighest = Read<int>(root + Offsets::HighestEntityIndex);
@@ -777,7 +803,7 @@ void RefreshFarmTargets() {
                     : Offsets::HandleChunkMask;
                 for (uint32_t slot = 0; slot <= highestSlot; ++slot) {
                     const uintptr_t identity = chunk + Offsets::EntityStride * slot;
-                    const uint32_t storedHandle = Read<uint32_t>(identity + 0x10);
+                    const uint32_t storedHandle = Read<uint32_t>(identity + Offsets::EntityHandleOffset);
                     const uint32_t expectedIndex = (chunkIndex << Offsets::HandleChunkShift) | slot;
                     // Several auxiliary arrays sit near the entity table. A
                     // pointer from one of those arrays can still look like a

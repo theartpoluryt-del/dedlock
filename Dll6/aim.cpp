@@ -1,10 +1,13 @@
 #include "shared.h"
+#include <cstring>
 #include <fstream>
 #include <random>
 #include <sstream>
 
 // Temporary measurement mode: suppress verbose aim/parry diagnostics.
 #define printf(...) do { } while (0)
+
+static Vector3 cachedFarmAimPoint{};
 
 bool WorldToScreen(const Vector3& pos, Vector2& screen, const Matrix4x4& matrix) {
     float w = matrix.m[3][0] * pos.x + matrix.m[3][1] * pos.y + matrix.m[3][2] * pos.z + matrix.m[3][3];
@@ -43,6 +46,7 @@ uintptr_t FindBonePattern(uintptr_t base, std::size_t size, const char* pattern)
         bytes.push_back(token == "?" || token == "??" ? -1 : std::stoi(token, nullptr, 16));
     }
     if (bytes.empty() || bytes.size() > size) return 0;
+    uintptr_t found = 0;
     for (std::size_t i = 0; i <= size - bytes.size(); ++i) {
         bool match = true;
         for (std::size_t j = 0; j < bytes.size(); ++j) {
@@ -51,9 +55,11 @@ uintptr_t FindBonePattern(uintptr_t base, std::size_t size, const char* pattern)
                 break;
             }
         }
-        if (match) return base + i;
+        if (!match) continue;
+        if (found) return 0;
+        found = base + i;
     }
-    return 0;
+    return found;
 }
 
 void ResolveBoneFunctions() {
@@ -121,24 +127,277 @@ void ApplySilentFlick(LONG moveX, LONG moveY) {
     silentFlickActive = true;
 }
 
+float normalMouseRemainderX = 0.0f;
+float normalMouseRemainderY = 0.0f;
+
+void ResetNormalMouseAim() {
+    normalMouseRemainderX = 0.0f;
+    normalMouseRemainderY = 0.0f;
+}
+
+void ApplyNormalMouseAim(float deltaX, float deltaY) {
+    if (!gameWindow || !IsWindow(gameWindow)) return;
+    const HWND foreground = GetForegroundWindow();
+    if (!foreground || (foreground != gameWindow &&
+        GetAncestor(foreground, GA_ROOT) != GetAncestor(gameWindow, GA_ROOT))) {
+        ResetNormalMouseAim();
+        return;
+    }
+
+    const float yawSmooth = (std::max)(1.0f, aimYawSmooth);
+    const float pitchSmooth = (std::max)(1.0f, aimPitchSmooth);
+    float stepX = std::fabs(deltaX) < 0.25f ? 0.0f : deltaX / yawSmooth;
+    float stepY = std::fabs(deltaY) < 0.25f ? 0.0f : deltaY / pitchSmooth;
+
+    // Limit the complete movement vector instead of clamping each axis to
+    // eight counts. Independent axis clamps turn diagonal tracking into a
+    // staircase, while the old tiny limit also made smooth=1 unnecessarily
+    // slow. Keep low smoothing fast and progressively lower the safety cap.
+    const float averageSmooth = (yawSmooth + pitchSmooth) * 0.5f;
+    const float maxMagnitude = 96.0f / std::sqrt(averageSmooth);
+    const float magnitude = std::hypot(stepX, stepY);
+    if (magnitude > maxMagnitude && magnitude > 0.0f) {
+        const float scale = maxMagnitude / magnitude;
+        stepX *= scale;
+        stepY *= scale;
+    }
+    normalMouseRemainderX += stepX;
+    normalMouseRemainderY += stepY;
+    const LONG moveX = static_cast<LONG>(std::lround(normalMouseRemainderX));
+    const LONG moveY = static_cast<LONG>(std::lround(normalMouseRemainderY));
+    normalMouseRemainderX -= static_cast<float>(moveX);
+    normalMouseRemainderY -= static_cast<float>(moveY);
+    if (!moveX && !moveY) return;
+
+    INPUT input{};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_MOVE;
+    input.mi.dx = moveX;
+    input.mi.dy = moveY;
+    SendInput(1, &input, sizeof(input));
+}
+
 }
 
 static ID3D11Texture2D* cachedGameDepth = nullptr;
 static std::vector<uint8_t> depthSnapshotData;
 static UINT depthSnapshotRowPitch = 0;
+static std::mutex trackedDepthMutex;
+static std::atomic<bool> trackedDepthArmed{true};
 
-// Source 2 client physics trace entry points identified in client.dll.i64.
-// These are relative to the client module base and are kept together so the
-// game-trace path can be disabled cleanly if the client build changes.
-constexpr uintptr_t PhysicsTraceWrapperRva = 0x14A0120;
-constexpr uintptr_t PhysicsTraceContextRva = 0x2E8CCE0;
-constexpr uintptr_t PhysicsRayShapeInitRva = 0x026FA80;
-constexpr uintptr_t TraceResultInitRva = 0x1E91D30;
-constexpr uintptr_t RayShapeGlobalRva = 0x021D1F08;
-constexpr uintptr_t TraceFilterConstructorRva = 0x1047720;
-constexpr uintptr_t TraceFilterGroupRva = 0x1461B10;
-constexpr uintptr_t TraceFilterLayerRva = 0x146EBB0;
-constexpr uintptr_t TraceFilterVtableRva = 0x021D2748;
+void ArmGameDepthCapture() {
+    trackedDepthArmed.store(true, std::memory_order_release);
+}
+
+void TrackGameDepthStencil(ID3D11DepthStencilView* depthView) {
+    if (!depthView ||
+        !trackedDepthArmed.load(std::memory_order_acquire)) return;
+
+    ID3D11Resource* resource = nullptr;
+    depthView->GetResource(&resource);
+    if (!resource) return;
+    ID3D11Texture2D* texture = nullptr;
+    const HRESULT queryResult = resource->QueryInterface(
+        __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&texture));
+    resource->Release();
+    if (FAILED(queryResult) || !texture) return;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    RECT client{};
+    const bool haveClient = gameWindow && GetClientRect(gameWindow, &client);
+    const UINT clientWidth = haveClient ? static_cast<UINT>(client.right - client.left) : 0;
+    const UINT clientHeight = haveClient ? static_cast<UINT>(client.bottom - client.top) : 0;
+    const bool supportedFormat =
+        desc.Format == DXGI_FORMAT_D32_FLOAT ||
+        desc.Format == DXGI_FORMAT_R32_TYPELESS ||
+        desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT ||
+        desc.Format == DXGI_FORMAT_R24G8_TYPELESS ||
+        desc.Format == DXGI_FORMAT_D16_UNORM;
+    const bool displaySized = clientWidth && clientHeight &&
+        desc.Width == clientWidth && desc.Height == clientHeight;
+    if (!supportedFormat || desc.SampleDesc.Count != 1 || !displaySized) {
+        texture->Release();
+        return;
+    }
+
+    bool expected = true;
+    if (!trackedDepthArmed.compare_exchange_strong(
+            expected, false, std::memory_order_acq_rel)) {
+        texture->Release();
+        return;
+    }
+    std::lock_guard<std::mutex> lock(trackedDepthMutex);
+    if (cachedGameDepth) cachedGameDepth->Release();
+    cachedGameDepth = texture;
+}
+
+// Native visibility is resolved from the live client image. TraceShape, the
+// manager global and the complete CTraceFilter constructor all move between
+// game patches, so none of them is kept as a hardcoded RVA.
+constexpr bool EnableNativeAimTrace = true;
+constexpr char TraceShapePattern[] =
+    "48 89 5C 24 20 48 89 4C 24 08 55 56 41 54 41 55 41 56 "
+    "48 8D AC 24 10 E0 FF FF B8 F0 20 00 00 E8 ? ? ? ? "
+    "48 2B E0 44 8B 15 ? ? ? ? 48 8B F1";
+constexpr char TraceFilterConstructorPattern[] =
+    "48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC ? "
+    "0F B6 41 ? 33 FF";
+
+struct NativeVisibilityRuntime {
+    uintptr_t traceShape{};
+    uintptr_t filterConstructor{};
+    uintptr_t managerGlobal{};
+    std::size_t imageSize{};
+    ULONGLONG lastAttemptAt{};
+    bool attempted{};
+    bool ready{};
+};
+
+static NativeVisibilityRuntime nativeVisibility{};
+static std::mutex nativeVisibilityMutex;
+
+uintptr_t FindVisibilityPattern(const char* pattern) {
+    std::vector<int> bytes;
+    std::istringstream stream(pattern ? pattern : "");
+    std::string token;
+    while (stream >> token) {
+        bytes.push_back(token == "?" || token == "??"
+            ? -1 : std::stoi(token, nullptr, 16));
+    }
+    if (bytes.empty() || bytes.size() > nativeVisibility.imageSize)
+        return 0;
+
+    const auto* image = reinterpret_cast<const uint8_t*>(clientBase);
+    const std::size_t last = nativeVisibility.imageSize - bytes.size();
+    uintptr_t found = 0;
+    for (std::size_t offset = 0; offset <= last; ++offset) {
+        bool matches = true;
+        for (std::size_t i = 0; i < bytes.size(); ++i) {
+            if (bytes[i] >= 0 &&
+                image[offset + i] != static_cast<uint8_t>(bytes[i])) {
+                matches = false;
+                break;
+            }
+        }
+        if (!matches) continue;
+        if (found) return 0;
+        found = clientBase + offset;
+    }
+    return found;
+}
+
+bool IsInClientImage(uintptr_t address, std::size_t size = 1) {
+    if (!clientBase || !nativeVisibility.imageSize || address < clientBase)
+        return false;
+    const uintptr_t offset = address - clientBase;
+    return offset <= nativeVisibility.imageSize &&
+        size <= nativeVisibility.imageSize - offset;
+}
+
+uintptr_t FindTraceManagerGlobal(uintptr_t traceShape) {
+    if (!traceShape || nativeVisibility.imageSize < 64) return 0;
+
+    std::unordered_map<uintptr_t, unsigned int> candidates;
+    const auto* image = reinterpret_cast<const uint8_t*>(clientBase);
+    const uintptr_t end = clientBase + nativeVisibility.imageSize - 5;
+    for (uintptr_t call = clientBase; call < end; ++call) {
+        if (image[call - clientBase] != 0xE8) continue;
+        const int32_t relative = Read<int32_t>(call + 1);
+        if (call + 5 + static_cast<intptr_t>(relative) != traceShape) continue;
+
+        const uintptr_t first =
+            call > clientBase + 64 ? call - 64 : clientBase;
+        for (uintptr_t probe = call; probe-- > first;) {
+            const auto offset = probe - clientBase;
+            if (image[offset] != 0x48 ||
+                image[offset + 1] != 0x8B ||
+                image[offset + 2] != 0x0D) {
+                continue;
+            }
+            const int32_t displacement = Read<int32_t>(probe + 3);
+            const uintptr_t global =
+                probe + 7 + static_cast<intptr_t>(displacement);
+            if (!IsInClientImage(global, sizeof(uintptr_t))) continue;
+            const uintptr_t object = Read<uintptr_t>(global);
+            if (object <= 0x10000) continue;
+            ++candidates[global];
+            break;
+        }
+    }
+
+    uintptr_t best{};
+    unsigned int bestCount{};
+    for (const auto& [candidate, count] : candidates) {
+        if (count > bestCount) {
+            best = candidate;
+            bestCount = count;
+        }
+    }
+    return best;
+}
+
+bool ResolveNativeVisibility() {
+    std::lock_guard<std::mutex> lock(nativeVisibilityMutex);
+    if (nativeVisibility.ready) return true;
+    const ULONGLONG now = GetTickCount64();
+    if (nativeVisibility.attempted &&
+        now - nativeVisibility.lastAttemptAt < 1000) {
+        return false;
+    }
+    nativeVisibility.attempted = true;
+    nativeVisibility.lastAttemptAt = now;
+    if (!clientBase) return false;
+
+    MODULEINFO moduleInfo{};
+    if (!GetModuleInformation(
+            GetCurrentProcess(), reinterpret_cast<HMODULE>(clientBase),
+            &moduleInfo, sizeof(moduleInfo))) {
+        return false;
+    }
+    nativeVisibility.imageSize =
+        static_cast<std::size_t>(moduleInfo.SizeOfImage);
+    nativeVisibility.traceShape =
+        FindVisibilityPattern(TraceShapePattern);
+    nativeVisibility.filterConstructor =
+        FindVisibilityPattern(TraceFilterConstructorPattern);
+    nativeVisibility.managerGlobal =
+        FindTraceManagerGlobal(nativeVisibility.traceShape);
+    nativeVisibility.ready =
+        nativeVisibility.traceShape &&
+        nativeVisibility.filterConstructor &&
+        nativeVisibility.managerGlobal;
+
+    std::ofstream log(
+        "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\visibility_runtime.log",
+        std::ios::app);
+    if (log) {
+        log << "trace=0x" << std::hex
+            << (nativeVisibility.traceShape - clientBase)
+            << " filterConstructor=0x"
+            << (nativeVisibility.filterConstructor - clientBase)
+            << " manager=0x"
+            << (nativeVisibility.managerGlobal - clientBase)
+            << std::dec << " ready=" << nativeVisibility.ready << '\n';
+    }
+    return nativeVisibility.ready;
+}
+
+struct VisibilityTraceRequest {
+    Vector3 point{};
+    uintptr_t targetEntity{};
+    ULONGLONG requestedAt{};
+};
+
+struct VisibilityTraceCacheEntry {
+    Vector3 point{};
+    bool visible = true;
+    ULONGLONG completedAt{};
+};
+
+static std::mutex visibilityTraceMutex;
+static std::unordered_map<uintptr_t, VisibilityTraceRequest> pendingVisibilityTraces;
+static std::unordered_map<uintptr_t, VisibilityTraceCacheEntry> visibilityTraceCache;
 
 bool InvertMatrix(const Matrix4x4& matrix, Matrix4x4& inverse) {
     const float* m = &matrix.m[0][0];
@@ -315,76 +574,148 @@ bool GetCameraTraceStart(Vector3& start) {
 bool PhysicsTraceVisible(const Vector3& start, const Vector3& end,
                          uintptr_t targetEntity) {
     if (!clientBase || !currentLocalPositionReady) return false;
+    if (!ResolveNativeVisibility()) return true;
 
-    using ShapeInitFn = uintptr_t(__fastcall*)(void*, const void*);
-    using ResultInitFn = uintptr_t(__fastcall*)(void*);
     using TraceFn = bool(__fastcall*)(void*, void*, const Vector3*, const Vector3*, void*, void*);
-    using TraceFilterConstructorFn = void(__fastcall*)(void*, uintptr_t, int);
-
-    const uintptr_t physics = Read<uintptr_t>(clientBase + PhysicsTraceContextRva);
+    // Native ABI verified in the current client: (this, skip entity, mask,
+    // layer, unknown). The public Andromeda wrapper deliberately reorders the
+    // user-facing mask/entity parameters before making this call.
+    using FilterConstructorFn = void(__fastcall*)(
+        void*, uintptr_t, uint64_t, int, uint16_t);
+    const uintptr_t physics =
+        Read<uintptr_t>(nativeVisibility.managerGlobal);
     if (!physics) return false;
 
-    alignas(16) uint8_t shape[64]{};
-    alignas(16) uint8_t filter[96]{};
-    alignas(16) uint8_t result[192]{};
-
-    // Native callers install the current CTraceFilter vtable before invoking
-    // TraceShape. A zero vtable makes the wrapper return a clear ray even
-    // though the remaining filter fields look valid.
-    *reinterpret_cast<uintptr_t*>(filter) = clientBase + TraceFilterVtableRva;
-    *reinterpret_cast<uint64_t*>(filter + 8) = 0xC1001;
-    *reinterpret_cast<uint64_t*>(filter + 0x10) = 0;
-    *reinterpret_cast<uint64_t*>(filter + 0x18) = 0;
-    *reinterpret_cast<int64_t*>(filter + 0x20) = -1;
-    *reinterpret_cast<int64_t*>(filter + 0x28) = -1;
-    *reinterpret_cast<uint32_t*>(filter + 0x30) = 0;
-    *reinterpret_cast<uint32_t*>(filter + 0x34) = 0x0100FFFFu;
-    filter[0x38] = 3;
-    filter[0x39] = 0x49;
-    filter[0x40] = 0;
+    // The guide's current line-trace ABI uses a zero-initialized 0x40 Ray_t.
+    alignas(16) uint8_t ray[0x40]{};
+    alignas(16) uint8_t filter[0x110]{};
+    alignas(16) uint8_t result[256]{};
 
     __try {
-        auto initShape = reinterpret_cast<ShapeInitFn>(clientBase + PhysicsRayShapeInitRva);
-        auto initResult = reinterpret_cast<ResultInitFn>(clientBase + TraceResultInitRva);
-        auto trace = reinterpret_cast<TraceFn>(clientBase + PhysicsTraceWrapperRva);
-        auto filterCtor = reinterpret_cast<TraceFilterConstructorFn>(
-            clientBase + TraceFilterConstructorRva);
+        if (!currentLocalPawn) return true;
+        auto constructFilter = reinterpret_cast<FilterConstructorFn>(
+            nativeVisibility.filterConstructor);
+        // Current TraceToEntityEndPos mask from the visibility implementation.
+        constructFilter(filter, currentLocalPawn, 0x1C3003, 3, 15);
 
-        filterCtor(filter, currentLocalPawn, 0);
+        auto trace =
+            reinterpret_cast<TraceFn>(nativeVisibility.traceShape);
+        const bool traced = trace(reinterpret_cast<void*>(physics), ray,
+                                  &start, &end, filter, result);
 
-        initShape(shape, reinterpret_cast<const void*>(clientBase + RayShapeGlobalRva));
-        initResult(result);
-        // TraceShape returns whether it hit something. A clear line returns
-        // false, so the visibility decision must use the populated result
-        // rather than this return value.
-        trace(reinterpret_cast<void*>(physics), shape, &start, &end, filter, result);
-
-        const float fraction = *reinterpret_cast<const float*>(result + 172);
-        const bool startSolid = *reinterpret_cast<const bool*>(result + 183);
+        const float fraction =
+            *reinterpret_cast<const float*>(result + 0xAC);
+        const bool startSolid = result[0xB7] != 0;
         const uintptr_t hitEntity =
-            *reinterpret_cast<const uintptr_t*>(result + 8);
+            *reinterpret_cast<const uintptr_t*>(result + 0x08);
         // A stale/partially initialized trace result must not remove every
         // target from the aim list. Only a valid native result may veto aim.
         if (!std::isfinite(fraction) || fraction < 0.0f || fraction > 1.0f)
             return true;
-        if (startSolid) return true;
-        return fraction >= 0.995f ||
-            (targetEntity && hitEntity == targetEntity);
+        // TraceToEntityEndPos in Andromeda treats the target as visible when
+        // the native trace's first hit entity is the requested pawn.  A trace
+        // that reaches almost the entire segment is also unobstructed: moving
+        // bones can finish just outside the target's current collision shape,
+        // leaving hitEntity null with fraction == 1.
+        // TraceShape returns false when the full segment is unobstructed; in
+        // that case fraction is 1 and hitEntity is null. The return value only
+        // says whether a shape was hit, not whether the line is usable.
+        (void)traced;
+        return !startSolid &&
+            ((targetEntity && hitEntity == targetEntity) || fraction > 0.93f);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         return true;
     }
 }
 
+bool QueueAimVisibilityTrace(const Vector3& point, uintptr_t targetEntity) {
+    const uintptr_t key = targetEntity ? targetEntity : 1;
+    const ULONGLONG now = GetTickCount64();
+    std::lock_guard<std::mutex> lock(visibilityTraceMutex);
+    pendingVisibilityTraces[key] = {point, targetEntity, now};
+
+    const auto cached = visibilityTraceCache.find(key);
+    // Unknown visibility must never be treated as visible. That optimistic
+    // fallback let a newly acquired/previously visible target pull through a
+    // wall until CreateMove published the delayed trace result.
+    if (cached == visibilityTraceCache.end() ||
+        now - cached->second.completedAt > 50)
+        return false;
+    const float dx = cached->second.point.x - point.x;
+    const float dy = cached->second.point.y - point.y;
+    const float dz = cached->second.point.z - point.z;
+    // Keep a recent result across ordinary per-frame animation/movement, but
+    // require a fresh trace after a teleport or a materially different point.
+    if (dx * dx + dy * dy + dz * dz > 96.0f * 96.0f) return false;
+    return cached->second.visible;
+}
+
+void ProcessAimVisibilityTraces() {
+    if constexpr (!EnableNativeAimTrace) return;
+    if (!clientBase || !currentLocalPositionReady ||
+        !ResolveNativeVisibility() ||
+        !Read<uintptr_t>(nativeVisibility.managerGlobal)) return;
+
+    std::vector<VisibilityTraceRequest> requests;
+    {
+        std::lock_guard<std::mutex> lock(visibilityTraceMutex);
+        requests.reserve((std::min)(pendingVisibilityTraces.size(), size_t{16}));
+        for (auto it = pendingVisibilityTraces.begin();
+             it != pendingVisibilityTraces.end() && requests.size() < 16;) {
+            requests.push_back(it->second);
+            it = pendingVisibilityTraces.erase(it);
+        }
+    }
+
+    Vector3 traceStart = currentLocalPosition;
+    traceStart.z += 64.0f;
+    for (const auto& request : requests) {
+        const bool visible =
+            PhysicsTraceVisible(traceStart, request.point, request.targetEntity);
+        const uintptr_t key = request.targetEntity ? request.targetEntity : 1;
+        std::lock_guard<std::mutex> lock(visibilityTraceMutex);
+        visibilityTraceCache[key] =
+            {request.point, visible, GetTickCount64()};
+    }
+}
+
 bool CaptureDepthSnapshot() {
     depthSnapshotReady = false;
-    if (!pContext || !pDevice) return false;
-
-    ID3D11DepthStencilView* depthView = nullptr;
-    pContext->OMGetRenderTargets(0, nullptr, &depthView);
+    auto setDepthState = [](int state) {
+        if (depthDiagnosticState == state) return;
+        depthDiagnosticState = state;
+        FILE* file = nullptr;
+        if (fopen_s(&file, "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\visibility_runtime.log", "a") == 0 && file) {
+            fprintf(file, "depth_state=%d\\n", state);
+            fclose(file);
+        }
+    };
+    if (!pContext || !pDevice) {
+        setDepthState(0);
+        // An unavailable depth sample is not proof of occlusion. Do not
+        // suppress the complete aim target list while the DSV is changing.
+        return true;
+    }
 
     ID3D11Texture2D* depthTexture = nullptr;
-    if (depthView) {
+    {
+        std::lock_guard<std::mutex> lock(trackedDepthMutex);
+        if (cachedGameDepth) {
+            depthTexture = cachedGameDepth;
+            depthTexture->AddRef();
+        }
+    }
+
+    // Fallback for the first frame, before OMSetRenderTargets has supplied
+    // the scene DSV.
+    if (!depthTexture) {
+        ID3D11DepthStencilView* depthView = nullptr;
+        pContext->OMGetRenderTargets(0, nullptr, &depthView);
+        if (!depthView) {
+            setDepthState(1);
+            return false;
+        }
         ID3D11Resource* resource = nullptr;
         depthView->GetResource(&resource);
         depthView->Release();
@@ -393,17 +724,12 @@ bool CaptureDepthSnapshot() {
             resource->Release();
             if (FAILED(queryResult) || !depthTexture) depthTexture = nullptr;
         }
-        if (depthTexture) {
-            if (cachedGameDepth) cachedGameDepth->Release();
-            cachedGameDepth = depthTexture;
-            cachedGameDepth->AddRef();
-        }
-    } else if (cachedGameDepth) {
-        depthTexture = cachedGameDepth;
-        depthTexture->AddRef();
     }
 
-    if (!depthTexture) return false;
+    if (!depthTexture) {
+        setDepthState(1);
+        return false;
+    }
 
     D3D11_TEXTURE2D_DESC desc{};
     depthTexture->GetDesc(&desc);
@@ -412,6 +738,7 @@ bool CaptureDepthSnapshot() {
          desc.Format != DXGI_FORMAT_D24_UNORM_S8_UINT && desc.Format != DXGI_FORMAT_R24G8_TYPELESS &&
          desc.Format != DXGI_FORMAT_D16_UNORM)) {
         depthTexture->Release();
+        setDepthState(2);
         return false;
     }
 
@@ -427,6 +754,7 @@ bool CaptureDepthSnapshot() {
             depthWidth = depthHeight = 0;
             depthFormat = DXGI_FORMAT_UNKNOWN;
             depthTexture->Release();
+            setDepthState(3);
             return false;
         }
         depthWidth = desc.Width;
@@ -442,6 +770,7 @@ bool CaptureDepthSnapshot() {
     // aim assist never received a usable visibility snapshot.
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (FAILED(pContext->Map(depthStaging, 0, D3D11_MAP_READ, 0, &mapped))) {
+        setDepthState(4);
         return false;
     }
 
@@ -455,13 +784,40 @@ bool CaptureDepthSnapshot() {
     depthSnapshotRowPitch = mapped.RowPitch;
     pContext->Unmap(depthStaging, 0);
     depthSnapshotReady = true;
+    static uint32_t depthDiagnostics = 0;
+    if ((++depthDiagnostics % 120u) == 0u) {
+        float minDepth = 1.0f;
+        float maxDepth = 0.0f;
+        uint32_t populated = 0;
+        constexpr UINT grid = 16;
+        for (UINT gy = 0; gy < grid; ++gy) {
+            for (UINT gx = 0; gx < grid; ++gx) {
+                float sample = 0.0f;
+                if (!ReadDepthAt(depthWidth * (gx + 0.5f) / grid,
+                                 depthHeight * (gy + 0.5f) / grid, sample)) continue;
+                if (sample < minDepth) minDepth = sample;
+                if (sample > maxDepth) maxDepth = sample;
+                if (sample > 0.001f && sample < 0.9999f) ++populated;
+            }
+        }
+        FILE* file = nullptr;
+        if (fopen_s(&file, "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\visibility_runtime.log", "a") == 0 && file) {
+            fprintf(file, "depth_range format=%u min=%.6f max=%.6f populated=%u\\n",
+                    static_cast<unsigned>(depthFormat), minDepth, maxDepth, populated);
+            fclose(file);
+        }
+    }
+    setDepthState(5);
     return true;
 }
 
 void ReleaseAimResources() {
-    if (cachedGameDepth) {
-        cachedGameDepth->Release();
-        cachedGameDepth = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(trackedDepthMutex);
+        if (cachedGameDepth) {
+            cachedGameDepth->Release();
+            cachedGameDepth = nullptr;
+        }
     }
     depthSnapshotData.clear();
     depthSnapshotRowPitch = 0;
@@ -492,14 +848,16 @@ bool ReadDepthAt(float x, float y, float& depth) {
 bool IsDepthBufferPopulated() {
     if (!depthSnapshotReady || depthWidth == 0 || depthHeight == 0) return false;
 
-    constexpr float samplePoints[][2] = {
-        { 0.50f, 0.50f }, { 0.25f, 0.50f }, { 0.75f, 0.50f },
-        { 0.50f, 0.25f }, { 0.50f, 0.75f }
-    };
-    for (const auto& point : samplePoints) {
-        float depth = 0.0f;
-        if (ReadDepthAt(depthWidth * point[0], depthHeight * point[1], depth) && depth > 0.001f) {
-            return true;
+    // The crosshair can point at sky, so checking only the centre falsely
+    // reports an empty depth buffer. Search a sparse screen grid instead.
+    constexpr float samples[] = { 0.10f, 0.25f, 0.40f, 0.55f, 0.70f, 0.85f };
+    for (const float y : samples) {
+        for (const float x : samples) {
+            float depth = 0.0f;
+            // 1.0 is the cleared D3D depth value, not scene geometry.
+            if (ReadDepthAt(depthWidth * x, depthHeight * y, depth) &&
+                depth > 0.001f && depth < 0.9999f)
+                return true;
         }
     }
     return false;
@@ -525,27 +883,72 @@ bool IsDepthPointVisible(const Vector3& point) {
     if (!std::isfinite(clipX) || !std::isfinite(clipY) || !std::isfinite(clipZ) ||
         !std::isfinite(w) || w <= 0.01f) return false;
 
-    const float screenX = display.x * 0.5f + clipX / w * display.x * 0.5f;
-    const float screenY = display.y * 0.5f - clipY / w * display.y * 0.5f;
-    const float targetDepth = clipZ / w * 0.5f + 0.5f;
-    if (!std::isfinite(screenX) || !std::isfinite(screenY) ||
-        !std::isfinite(targetDepth) || targetDepth < 0.0f || targetDepth > 1.0f)
+    const float displayX = display.x * 0.5f + clipX / w * display.x * 0.5f;
+    const float displayY = display.y * 0.5f - clipY / w * display.y * 0.5f;
+    // Source 2 uses the DirectX depth convention: after the perspective
+    // divide, clipZ/w is already the [0, 1] depth written to the DSV.
+    const float projectedDepth = clipZ / w;
+    if (!std::isfinite(displayX) || !std::isfinite(displayY) ||
+        !std::isfinite(projectedDepth) || projectedDepth < 0.0f || projectedDepth > 1.0f)
         return false;
+
+    const float screenX = displayX * static_cast<float>(depthWidth) / display.x;
+    const float screenY = displayY * static_cast<float>(depthHeight) / display.y;
 
     // Use a small neighborhood: a single depth pixel can belong to a thin
     // model part or be unsettled while the render target is changing.
     constexpr float offsets[][2] = {{0, 0}, {-2, 0}, {2, 0}, {0, -2}, {0, 2}};
+    static uint32_t visibilityDiagnostics = 0;
+    const bool logVisibility = (++visibilityDiagnostics % 60u) == 0u;
     bool sampled = false;
-    float nearestSceneDepth = 1.0f;
+    bool matched = false;
+    float firstSceneDepth = -1.0f;
+    float comparisonTargetDepth = projectedDepth;
     for (const auto& offset : offsets) {
         float sceneDepth = 0.0f;
         if (!ReadDepthAt(screenX + offset[0], screenY + offset[1], sceneDepth)) continue;
-        if (sceneDepth <= 0.001f) continue;
+        if (sceneDepth <= 0.001f || sceneDepth >= 0.9999f) continue;
         sampled = true;
-        nearestSceneDepth = (std::min)(nearestSceneDepth, sceneDepth);
+        if (firstSceneDepth < 0.0f) firstSceneDepth = sceneDepth;
+        // The current client renders its main scene with reversed-Z. Detect it
+        // from the sampled range so the same code remains valid for normal-Z
+        // render targets. A closer wall moves depth in the opposite direction
+        // from the target and therefore fails this directional comparison.
+        const bool reversedZ = sceneDepth < 0.5f && projectedDepth > 0.5f;
+        comparisonTargetDepth = reversedZ ? 1.0f - projectedDepth : projectedDepth;
+        constexpr float surfaceTolerance = 0.015f;
+        if (reversedZ) {
+            if (sceneDepth <= comparisonTargetDepth + surfaceTolerance)
+                matched = true;
+        } else if (sceneDepth >= comparisonTargetDepth - surfaceTolerance) {
+            matched = true;
+        }
     }
-    if (!sampled) return false;
-    return targetDepth <= nearestSceneDepth + 0.025f;
+    if (!sampled) {
+        if (logVisibility) {
+            FILE* file = nullptr;
+            if (fopen_s(&file, "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\visibility_runtime.log", "a") == 0 && file) {
+                fprintf(file, "vis sampled=0 target=%.6f screen=%.1f,%.1f depth=%ux%u\\n",
+                        comparisonTargetDepth, screenX, screenY,
+                        depthWidth, depthHeight);
+                fclose(file);
+            }
+        }
+        // No usable depth sample means the render target is unavailable, not
+        // that the target is behind a wall.
+        return true;
+    }
+    const bool visible = matched;
+    if (logVisibility) {
+        FILE* file = nullptr;
+        if (fopen_s(&file, "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\visibility_runtime.log", "a") == 0 && file) {
+            fprintf(file, "vis sampled=1 target=%.6f scene=%.6f matched=%d result=%d screen=%.1f,%.1f depth=%ux%u\\n",
+                    comparisonTargetDepth, firstSceneDepth, matched ? 1 : 0,
+                    visible ? 1 : 0, screenX, screenY, depthWidth, depthHeight);
+            fclose(file);
+        }
+    }
+    return visible;
 }
 
 bool GetAimPointScreen(const PlayerData& player, float height, Vector2& screen) {
@@ -555,6 +958,7 @@ bool GetAimPointScreen(const PlayerData& player, float height, Vector2& screen) 
 }
 
 void FarmAimAssist(const std::vector<PlayerData>& players) {
+    farmNormalActive = false;
     const bool configuredFarmKeyDown = (GetAsyncKeyState(farmAssistKey) & 0x8000) != 0;
     const bool configuredFarmKeyPressed = configuredFarmKeyDown && !farmToggleLastDown;
     if (farmAssist && farmToggleMode && configuredFarmKeyPressed) {
@@ -567,7 +971,7 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
         return;
     }
     const bool farmAiming = farmToggleMode ? farmToggleActive : configuredFarmKeyDown;
-    if (!farmSilentMode) ClearPendingCreepAngles();
+    if (!farmSilentMode && !farmMixedMode) ClearPendingCreepAngles();
     if (menuOpen || !currentViewMatrixReady || !farmAiming) {
         ClearPendingCreepAngles();
         return;
@@ -587,6 +991,7 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
 
     FarmTarget best{};
     Vector2 bestScreen{};
+    Vector3 bestPoint{};
     float bestDistance = farmFov * farmFov;
     const uint8_t localTeam = currentLocalPawn
         ? Read<uint8_t>(currentLocalPawn + Offsets::Team)
@@ -620,14 +1025,14 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
             return left.screenDistance < right.screenDistance;
         });
 
-    const bool traceAvailable = clientBase &&
-        Read<uintptr_t>(clientBase + PhysicsTraceContextRva) != 0;
+    const bool depthAvailable =
+        EnableNativeAimTrace ? clientBase != 0 : depthSnapshotReady;
     for (const auto& candidate : candidates) {
         Vector3 point{ candidate.target.pos.x, candidate.target.pos.y,
                        candidate.target.pos.z + 24.0f };
         // Only nearby screen candidates reach this expensive engine call.
         GetEntityBonePosition(candidate.target.entity, "head", point);
-        if (aimVisibilityCheck && traceAvailable &&
+        if (aimVisibilityCheck && depthAvailable &&
             !IsWorldAimPointVisible(point, candidate.target.entity)) continue;
         Vector2 screen{};
         if (!WorldToScreen(point, screen, currentViewMatrix)) continue;
@@ -637,6 +1042,7 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
         if (distance >= bestDistance) continue;
         best = candidate.target;
         bestScreen = screen;
+        bestPoint = point;
         bestDistance = distance;
         // Candidates are ordered by their inexpensive screen estimate. The
         // first visible result is the same practical target without tracing
@@ -648,26 +1054,23 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
         return;
     }
 
-    if (farmSilentMode) {
+    if (farmSilentMode || farmMixedMode) {
         Vector3 commandAngles{};
         if (GetAimAnglesFromScreen(bestScreen.x, bestScreen.y, commandAngles)) {
             std::lock_guard<std::mutex> lock(creepSilentMutex);
             pendingCreepAngles = commandAngles;
             pendingCreepReady = true;
         }
-        return;
+        if (farmSilentMode)
+            return;
     }
 
-    const float smooth = farmAimSmooth < 1.0f ? 1.0f : farmAimSmooth;
-    const LONG moveX = static_cast<LONG>((bestScreen.x - cx) / smooth);
-    const LONG moveY = static_cast<LONG>((bestScreen.y - cy) / smooth);
-    if (!moveX && !moveY) return;
-    INPUT input{};
-    input.type = INPUT_MOUSE;
-    input.mi.dwFlags = MOUSEEVENTF_MOVE;
-    input.mi.dx = moveX;
-    input.mi.dy = moveY;
-    SendInput(1, &input, sizeof(input));
+    // Normal creep aim uses the same per-frame gameplay-camera path as the
+    // current human Normal/Mixed aim. It never moves the OS cursor and uses
+    // the same time-based pitch/yaw smoothing in FlushCurrentCameraAim.
+    ClearPendingCreepAngles();
+    cachedFarmAimPoint = bestPoint;
+    farmNormalActive = true;
 }
 
 void AutoLastHitOrbs() {
@@ -720,9 +1123,8 @@ void AutoLastHitOrbs() {
                 point = orb.pos;
             }
             if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) continue;
-            const bool traceAvailable = clientBase &&
-                Read<uintptr_t>(clientBase + PhysicsTraceContextRva) != 0;
-            if (orbAimVisibilityCheck && traceAvailable &&
+            if (orbAimVisibilityCheck && (EnableNativeAimTrace
+                ? clientBase != 0 : depthSnapshotReady) &&
                 !IsWorldAimPointVisible(point, orb.entity)) continue;
             Vector2 screen{};
             if (!WorldToScreen(point, screen, currentViewMatrix)) continue;
@@ -809,37 +1211,126 @@ float ResolveAimHeightFromBox(const PlayerData& player, float verticalFraction, 
 
 bool IsAimPointVisible(const PlayerData& player, float height, float screenX, float screenY) {
     const Vector3 aimPoint{ player.pos.x, player.pos.y, player.pos.z + height };
-    if (!clientBase || !currentLocalPositionReady) return false;
-    if (!Read<uintptr_t>(clientBase + PhysicsTraceContextRva)) return false;
-    Vector3 traceStart = currentLocalPosition;
-    traceStart.z += 64.0f;
-    return PhysicsTraceVisible(traceStart, aimPoint, player.entity);
+    (void)screenX;
+    (void)screenY;
+    if constexpr (EnableNativeAimTrace) {
+        return QueueAimVisibilityTrace(aimPoint, player.entity);
+    }
+    return IsDepthPointVisible(aimPoint);
 }
 
 bool IsWorldAimPointVisible(const Vector3& point, uintptr_t targetEntity) {
-    if (!clientBase || !currentLocalPositionReady) return false;
-    if (!Read<uintptr_t>(clientBase + PhysicsTraceContextRva)) return false;
-    Vector3 traceStart = currentLocalPosition;
-    traceStart.z += 64.0f;
-    return PhysicsTraceVisible(traceStart, point, targetEntity);
+    if constexpr (EnableNativeAimTrace) {
+        return QueueAimVisibilityTrace(point, targetEntity);
+    }
+    return IsDepthPointVisible(point);
+}
+
+namespace {
+
+struct BacktrackSample {
+    ULONGLONG time{};
+    Vector3 head{};
+    Vector3 body{};
+    bool hasHead{};
+    bool hasBody{};
+};
+
+std::unordered_map<uintptr_t, std::vector<BacktrackSample>> backtrackHistory;
+uintptr_t lockedAimTarget = 0;
+Vector3 cachedVisibleAimPoint{};
+Vector3 cachedVisibleAimVelocity{};
+ULONGLONG cachedVisibleAimAt = 0;
+bool cachedVisibleAimReady = false;
+
+bool RollHitchance() {
+    if (aimHitchance >= 99.99f) return true;
+    if (aimHitchance <= 0.01f) return false;
+    thread_local std::mt19937 generator(std::random_device{}());
+    std::uniform_real_distribution<float> distribution(0.0f, 100.0f);
+    return distribution(generator) <= std::clamp(aimHitchance, 0.0f, 100.0f);
+}
+
+void UpdateBacktrackHistory(const std::vector<PlayerData>& players, ULONGLONG now) {
+    if (!aimBacktrack) return;
+    const ULONGLONG keepMs = static_cast<ULONGLONG>(std::clamp(aimBacktrackMs, 1.0f, 1000.0f)) + 250;
+    for (const auto& player : players) {
+        if (!player.entity) continue;
+        auto& history = backtrackHistory[player.entity];
+        history.push_back({now, player.headPos, player.bodyPos,
+                           player.hasHeadBone, player.hasBodyBone});
+        while (!history.empty() && now - history.front().time > keepMs)
+            history.erase(history.begin());
+    }
+    for (auto it = backtrackHistory.begin(); it != backtrackHistory.end();) {
+        if (now - it->second.back().time > keepMs)
+            it = backtrackHistory.erase(it);
+        else
+            ++it;
+    }
+}
+
+bool GetBacktrackedPoint(uintptr_t entity, AimTargetMode mode, ULONGLONG now,
+                         Vector3& point) {
+    if (!aimBacktrack) return false;
+    const auto it = backtrackHistory.find(entity);
+    if (it == backtrackHistory.end() || it->second.empty()) return false;
+    const ULONGLONG targetTime = now - static_cast<ULONGLONG>(
+        std::clamp(aimBacktrackMs, 1.0f, 1000.0f));
+    const BacktrackSample* selected = &it->second.front();
+    for (const auto& sample : it->second) {
+        if (sample.time <= targetTime) selected = &sample;
+        else break;
+    }
+    if (mode == AimTargetMode::Head && selected->hasHead) {
+        point = selected->head;
+        return true;
+    }
+    if (mode == AimTargetMode::Body && selected->hasBody) {
+        point = selected->body;
+        return true;
+    }
+    if (mode == AimTargetMode::Closest) {
+        if (selected->hasHead) { point = selected->head; return true; }
+        if (selected->hasBody) { point = selected->body; return true; }
+    }
+    return false;
+}
+
 }
 
 void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     humanAimTargetFound = false;
     const bool leftButtonDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     const bool rightButtonDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
-    if (!aimSilentMode || !leftButtonDown) ClearPendingSilentAngles();
+    const bool silentPass = aimSilentMode || (aimMixedMode && leftButtonDown);
+    aimSilentActive = silentPass;
+    if ((!aimMixedMode && !leftButtonDown) || (!aimSilentMode && !aimMixedMode))
+        ClearPendingSilentAngles();
     const bool configuredAimKeyDown = (GetAsyncKeyState(aimAssistKey) & 0x8000) != 0;
     const bool configuredAimKeyPressed = configuredAimKeyDown && !aimToggleLastDown;
     if (aimToggleMode && configuredAimKeyPressed) aimToggleActive = !aimToggleActive;
     aimToggleLastDown = configuredAimKeyDown;
     const bool keyActive = aimToggleMode ? aimToggleActive : configuredAimKeyDown;
+    aimNormalActive = !aimSilentMode && !aimMixedMode && keyActive;
     const bool aiming = aimSilentMode ? (keyActive && leftButtonDown) : keyActive;
-    if (!aimAssist || menuOpen || !aiming || !currentViewMatrixReady) return;
+    if (!aimAssist || menuOpen || !aiming || !currentViewMatrixReady) {
+        cachedVisibleAimReady = false;
+        ResetNormalMouseAim();
+        aimSilentActive = false;
+        aimNormalActive = false;
+        ClearPendingSilentAngles();
+        if (!aimLockTarget) lockedAimTarget = 0;
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    UpdateBacktrackHistory(players, now);
 
-    const bool traceAvailable = clientBase &&
-        Read<uintptr_t>(clientBase + PhysicsTraceContextRva) != 0;
-    const bool useDepthWallCheck = aimVisibilityCheck && traceAvailable;
+    // Do not bypass the visibility predicate when the GPU snapshot is not
+    // usable. With the option enabled, an unknown depth result is blocked;
+    // otherwise the assist silently falls back to aiming through walls.
+    const bool useDepthWallCheck = aimVisibilityCheck &&
+        (EnableNativeAimTrace ? clientBase != 0 : depthSnapshotReady);
     const ImVec2 size = ImGui::GetIO().DisplaySize;
     const float cx = size.x * 0.5f;
     const float cy = size.y * 0.5f;
@@ -847,7 +1338,9 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
     const PlayerData* best = nullptr;
     Vector2 bestAimScreen{};
-    float bestDistance = aimFov * aimFov;
+    Vector3 bestAimPoint{};
+    const float fovDistance = aimFov * aimFov;
+    float bestSelectionScore = FLT_MAX;
     size_t visibleTargets = 0;
     size_t testedTargets = 0;
 
@@ -877,15 +1370,19 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         }
         bool targetVisible = false;
         Vector2 visibleAimScreen{};
+        Vector3 visibleAimPoint{};
         float visibleDistance = FLT_MAX;
         for (int candidateIndex = 0; candidateIndex < candidateCount; ++candidateIndex) {
-            const Vector3 point = candidates[candidateIndex].point;
+            Vector3 point = candidates[candidateIndex].point;
+            Vector3 historicalPoint{};
+            if (GetBacktrackedPoint(player.entity, aimTargetMode, now, historicalPoint))
+                point = historicalPoint;
             Vector2 aimScreen{};
             if (!GetWorldAimPointScreen(point, aimScreen)) continue;
             const float dx = aimScreen.x - cx;
             const float dy = aimScreen.y - cy;
             const float distance = dx * dx + dy * dy;
-            if (distance >= bestDistance) continue;
+            if (distance >= fovDistance) continue;
             ++testedTargets;
             if (useDepthWallCheck && (candidates[candidateIndex].bone
                 ? !IsWorldAimPointVisible(point, player.entity)
@@ -894,47 +1391,113 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
             if (distance < visibleDistance) {
                 visibleDistance = distance;
                 visibleAimScreen = aimScreen;
+                visibleAimPoint = point;
             }
         }
         if (targetVisible) {
             ++visibleTargets;
-            if (visibleDistance < bestDistance) {
-                bestDistance = visibleDistance;
+            float selectionScore = visibleDistance;
+            if (aimSelectionMode == AimSelectionMode::Distance)
+                selectionScore = player.distance;
+            else if (aimSelectionMode == AimSelectionMode::Health)
+                selectionScore = static_cast<float>(player.health);
+            const bool locked = aimLockTarget && lockedAimTarget &&
+                                player.entity == lockedAimTarget;
+            if (locked) selectionScore = -FLT_MAX;
+            const bool better = locked || selectionScore < bestSelectionScore;
+            if (better && (aimSelectionMode != AimSelectionMode::Crosshair ||
+                           visibleDistance < aimFov * aimFov)) {
+                bestSelectionScore = selectionScore;
                 best = &player;
                 // Store the point that passed the depth test for the final move.
                 bestAimScreen = visibleAimScreen;
+                bestAimPoint = visibleAimPoint;
             }
         }
     }
 
     if (!best) {
-        if (aimSilentMode) ClearPendingSilentAngles();
+        cachedVisibleAimReady = false;
+        ResetNormalMouseAim();
+        ClearPendingSilentAngles();
+        aimNormalActive = false;
+        if (!aimLockTarget) lockedAimTarget = 0;
+        std::lock_guard<std::mutex> lock(movementDebugTargetMutex);
+        movementDebugTargetReady = false;
+        return;
+    }
+    if (aimLockTarget) lockedAimTarget = best->entity;
+    if (!RollHitchance()) {
+        ResetNormalMouseAim();
+        ClearPendingSilentAngles();
         return;
     }
     humanAimTargetFound = true;
+    {
+        std::lock_guard<std::mutex> lock(movementDebugTargetMutex);
+        movementDebugTarget = bestAimPoint;
+        movementDebugTargetReady = true;
+    }
 
     const float targetX = bestAimScreen.x;
     const float targetY = bestAimScreen.y;
-    const float smooth = aimSilentMode ? 1.0f : (aimSmooth < 1.0f ? 1.0f : aimSmooth);
-    const LONG moveX = static_cast<LONG>((targetX - cx) / smooth);
-    const LONG moveY = static_cast<LONG>((targetY - cy) / smooth);
-    if (aimSilentMode) {
+    // Mixed always keeps the current visible Normal camera path. While the
+    // attack button is held, pSilent is applied in addition to it.
+    const bool visibleMouseAim = aimNormalActive || aimMixedMode;
+    cachedVisibleAimPoint = bestAimPoint;
+    cachedVisibleAimVelocity = Read<Vector3>(
+        best->entity + Offsets::Velocity);
+    if (!std::isfinite(cachedVisibleAimVelocity.x) ||
+        !std::isfinite(cachedVisibleAimVelocity.y) ||
+        !std::isfinite(cachedVisibleAimVelocity.z)) {
+        cachedVisibleAimVelocity = {};
+    }
+    cachedVisibleAimAt = now;
+    cachedVisibleAimReady = visibleMouseAim;
+    if (visibleMouseAim || silentPass) {
         Vector3 commandAngles{};
-        if (GetAimAnglesFromScreen(targetX, targetY, commandAngles)) {
+        const bool haveCommandAngles =
+            GetAimAnglesFromScreen(targetX, targetY, commandAngles);
+        if (haveCommandAngles) {
             std::lock_guard<std::mutex> lock(humanSilentMutex);
             pendingHumanAngles = commandAngles;
             pendingHumanReady = true;
         }
+        // Pure pSilent intentionally stops here so the visible camera stays still.
+        if (silentPass && !aimMixedMode)
+            return;
+    }
+    // Normal/Mixed keeps the selected world target alive for the gameplay
+    // camera hook. UpdateVisibleAimCamera publishes it every render frame and
+    // the hook applies smoothing on every native camera update; using OS mouse
+    // packets here limited the cadence and produced visible stair-stepping.
+    if (visibleMouseAim) {
+        ResetNormalMouseAim();
+    }
+}
+
+void UpdateVisibleAimCamera() {
+    const bool humanVisibleAim = cachedVisibleAimReady && aimAssist &&
+        (aimNormalActive || aimMixedMode);
+    const bool creepVisibleAim = farmNormalActive && farmAssist;
+    if ((!humanVisibleAim && !creepVisibleAim) || menuOpen ||
+        !currentViewMatrixReady)
+        return;
+    if (creepVisibleAim && !humanVisibleAim) {
+        ApplyCurrentCameraAim(cachedFarmAimPoint);
         return;
     }
-    if (moveX || moveY) {
-        INPUT input{};
-        input.type = INPUT_MOUSE;
-        input.mi.dwFlags = MOUSEEVENTF_MOVE;
-        input.mi.dx = moveX;
-        input.mi.dy = moveY;
-        SendInput(1, &input, sizeof(INPUT));
+    Vector3 predictedPoint = cachedVisibleAimPoint;
+    if (cachedVisibleAimAt != 0) {
+        const ULONGLONG ageMs = (std::min)(
+            GetTickCount64() - cachedVisibleAimAt,
+            static_cast<ULONGLONG>(32));
+        const float ageSeconds = static_cast<float>(ageMs) * 0.001f;
+        predictedPoint.x += cachedVisibleAimVelocity.x * ageSeconds;
+        predictedPoint.y += cachedVisibleAimVelocity.y * ageSeconds;
+        predictedPoint.z += cachedVisibleAimVelocity.z * ageSeconds;
     }
+    ApplyCurrentCameraAim(predictedPoint);
 }
 
 namespace {

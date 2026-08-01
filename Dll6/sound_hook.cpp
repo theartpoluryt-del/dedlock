@@ -92,6 +92,7 @@ uintptr_t FindPattern(HMODULE module, const char* pattern) {
 
     const auto bytes = ParsePattern(pattern);
     const auto* base = static_cast<const uint8_t*>(info.lpBaseOfDll);
+    uintptr_t found = 0;
     for (size_t i = 0; i + bytes.size() <= info.SizeOfImage; ++i) {
         bool match = true;
         for (size_t j = 0; j < bytes.size(); ++j) {
@@ -100,9 +101,11 @@ uintptr_t FindPattern(HMODULE module, const char* pattern) {
                 break;
             }
         }
-        if (match) return reinterpret_cast<uintptr_t>(base + i);
+        if (!match) continue;
+        if (found) return 0;
+        found = reinterpret_cast<uintptr_t>(base + i);
     }
-    return 0;
+    return found;
 }
 
 class CSoundEventManager {

@@ -87,15 +87,101 @@ uintptr_t ResolveRipRelativeAddress(uintptr_t instruction) {
     return instruction + 7 + displacement;
 }
 
+bool IsReadableMemory(uintptr_t address, size_t size = sizeof(uintptr_t)) {
+    if (address <= 0x10000 || !size) return false;
+    MEMORY_BASIC_INFORMATION information{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(address), &information,
+                      sizeof(information)))
+        return false;
+    if (information.State != MEM_COMMIT ||
+        (information.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+        return false;
+    const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(
+        information.BaseAddress) + information.RegionSize;
+    return address <= regionEnd && size <= regionEnd - address;
+}
+
+bool ResolveEntitySystemLayout(uintptr_t system) {
+    if (!IsReadableMemory(system, 0x100)) return false;
+    constexpr uintptr_t tableCandidates[] = {0x10, 0x0, 0x20, 0x100, 0x110};
+    constexpr uintptr_t strideCandidates[] = {0x70, 0x78, 0x68, 0x80, 0x60};
+    constexpr uintptr_t handleCandidates[] = {0x10, 0x08, 0x18, 0x20};
+    int bestScore = 0;
+    uintptr_t bestTable = 0, bestStride = 0, bestHandle = 0;
+
+    for (const uintptr_t table : tableCandidates) {
+        const uintptr_t chunk = Read<uintptr_t>(system + table);
+        if (!IsReadableMemory(chunk, 0x100)) continue;
+        for (const uintptr_t stride : strideCandidates) {
+            for (const uintptr_t handleOffset : handleCandidates) {
+                int score = 0;
+                for (uint32_t slot = 0; slot < 64; ++slot) {
+                    const uintptr_t identity = chunk + stride * slot;
+                    const uintptr_t entity = Read<uintptr_t>(identity);
+                    const uint32_t handle = Read<uint32_t>(
+                        identity + handleOffset);
+                    if (entity > 0x10000 &&
+                        (handle & Offsets::HandleIndexMask) == slot)
+                        ++score;
+                }
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestTable = table;
+                    bestStride = stride;
+                    bestHandle = handleOffset;
+                }
+            }
+        }
+    }
+    if (bestScore < 4) return false;
+    Offsets::EntityChunks = bestTable;
+    Offsets::EntityStride = bestStride;
+    Offsets::EntityHandleOffset = bestHandle;
+
+    uint32_t highestObserved = 0;
+    for (uint32_t chunkIndex = 0; chunkIndex < 64; ++chunkIndex) {
+        const uintptr_t chunk = Read<uintptr_t>(
+            system + bestTable + sizeof(uintptr_t) * chunkIndex);
+        if (!IsReadableMemory(chunk, bestStride)) continue;
+        for (uint32_t slot = 0; slot <= Offsets::HandleChunkMask; ++slot) {
+            const uintptr_t identity = chunk + bestStride * slot;
+            const uintptr_t entity = Read<uintptr_t>(identity);
+            const uint32_t handle = Read<uint32_t>(identity + bestHandle);
+            if (entity <= 0x10000) continue;
+            const uint32_t index = handle & Offsets::HandleIndexMask;
+            const uint32_t expected =
+                (chunkIndex << Offsets::HandleChunkShift) | slot;
+            if (index == expected) highestObserved = (std::max)(highestObserved, index);
+        }
+    }
+    if (highestObserved) {
+        uintptr_t bestHighestOffset = 0;
+        uintptr_t bestDistance = UINTPTR_MAX;
+        for (uintptr_t offset = 0x1F00; offset <= 0x2200; offset += 4) {
+            const int value = Read<int>(system + offset);
+            if (value < static_cast<int>(highestObserved) ||
+                value > static_cast<int>(Offsets::HandleIndexMask))
+                continue;
+            const uintptr_t distance = offset > Offsets::HighestEntityIndex
+                ? offset - Offsets::HighestEntityIndex
+                : Offsets::HighestEntityIndex - offset;
+            if (static_cast<uint32_t>(value) - highestObserved <= 4 &&
+                distance < bestDistance) {
+                bestDistance = distance;
+                bestHighestOffset = offset;
+            }
+        }
+        if (bestHighestOffset)
+            Offsets::HighestEntityIndex = bestHighestOffset;
+    }
+    return true;
+}
+
 bool IsPlausibleEntitySystem(uintptr_t system) {
-    if (!system) return false;
-    const int highest = Read<int>(system + Offsets::HighestEntityIndex);
-    if (highest <= 0 || highest > static_cast<int>(Offsets::HandleIndexMask)) return false;
-    const uintptr_t firstChunk = Read<uintptr_t>(system + Offsets::EntityChunks);
-    if (!firstChunk) return false;
-    const uintptr_t identity = Read<uintptr_t>(firstChunk);
-    const uint32_t handle = Read<uint32_t>(firstChunk + 0x10);
-    return identity != 0 && (handle & Offsets::HandleIndexMask) == 0;
+    // The chunk/identity/handle relationship is the primary validation. A
+    // moved highest-index member only affects scan bounds and callers already
+    // clamp/fallback when its value is implausible.
+    return ResolveEntitySystemLayout(system);
 }
 
 bool IsPlausibleCameraMatrices(uintptr_t matrixBase,
@@ -197,6 +283,8 @@ bool InitializeLiveSchemaOffsets(size_t& loaded, size_t required) {
     loaded += SetRuntimeField("CBasePlayerController", "m_bIsLocalPlayerController", Offsets::IsLocalPlayerController);
     loaded += SetRuntimeField("C_BasePlayerPawn", "m_hController", Offsets::PawnController);
     loaded += SetRuntimeField("C_BaseEntity", "m_pGameSceneNode", Offsets::GameSceneNode);
+    loaded += SetRuntimeField("C_BaseEntity", "m_pCollision", Offsets::CollisionProperty);
+    loaded += SetRuntimeField("C_BaseEntity", "m_vecVelocity", Offsets::Velocity);
     loaded += SetRuntimeField("CGameSceneNode", "m_vecAbsOrigin", Offsets::SceneNodeAbsOrigin);
     loaded += SetRuntimeField("CGameSceneNode", "m_vRenderOrigin", Offsets::SceneNodeRenderOrigin);
     loaded += SetRuntimeField("CGameSceneNode", "m_flScale", Offsets::SceneNodeAbsScale);
@@ -220,9 +308,29 @@ bool InitializeLiveSchemaOffsets(size_t& loaded, size_t required) {
     loaded += SetRuntimeField("C_BaseEntity", "m_iHealth", Offsets::Health);
     loaded += SetRuntimeField("C_BaseEntity", "m_lifeState", Offsets::LifeState);
     loaded += SetRuntimeField("C_BaseEntity", "m_iTeamNum", Offsets::Team);
+    loaded += SetRuntimeField("C_BasePlayerPawn", "m_vOldOrigin", Offsets::Pos);
+    loaded += SetRuntimeField("C_BasePlayerPawn", "m_pObserverServices", Offsets::ObserverServices);
+    loaded += SetRuntimeField("CPlayer_ObserverServices", "m_iObserverMode", Offsets::ObserverMode);
+    loaded += SetRuntimeField("CPlayer_ObserverServices", "m_hObserverTarget", Offsets::ObserverTarget);
+    loaded += SetRuntimeField("CBasePlayerController", "m_iszPlayerName", Offsets::PlayerName);
+    loaded += SetRuntimeField("CCitadelPlayerController", "m_PlayerDataGlobal", Offsets::ControllerPlayerData);
+    loaded += SetRuntimeField("PlayerDataGlobal_t", "m_iHealthMax", Offsets::PlayerDataHealthMax);
+    loaded += SetRuntimeField("CBaseAnimGraph", "m_graphControllerManager", Offsets::GraphControllerManager);
+    loaded += SetRuntimeField("CBaseAnimGraph", "m_pMainGraphController", Offsets::MainGraphController);
+    loaded += SetRuntimeField("CBaseAnimGraphController", "m_hSequence", Offsets::AnimSequence);
+    loaded += SetRuntimeField("CBaseAnimGraphController", "m_flSeqStartTime", Offsets::AnimSequenceStartTime);
+    loaded += SetRuntimeField("CCitadel_Ability_HoldMelee", "m_eCurrentAttackState", Offsets::MeleeAttackState);
     loaded += SetRuntimeField("C_CitadelPlayerPawn", "m_CCitadelAbilityComponent", Offsets::AbilityComponent);
     loaded += SetRuntimeField("CCitadelAbilityComponent", "m_vecAbilities", Offsets::AbilityVector);
     loaded += SetRuntimeField("C_CitadelPlayerPawn", "m_CCitadelHeroComponent", Offsets::HeroComponent);
+    const uintptr_t spawnedHero = FindSchemaOffset(
+        "CCitadelHeroComponent", "m_spawnedHero");
+    const uintptr_t spawnedHeroId = FindSchemaOffset(
+        "CitadelHeroSpawnData_t", "m_nHeroID");
+    if (spawnedHero && spawnedHeroId) {
+        Offsets::HeroSpawnedId = spawnedHero + spawnedHeroId;
+        ++loaded;
+    }
     return loaded >= required;
 }
 
@@ -241,8 +349,8 @@ bool InitializePatternOffsets() {
     // rest of DLL6 reads it as clientBase + Offsets::GameEntitySystem.
     constexpr char kGameEntitySystemPattern[] =
         "48 8B ? ? ? ? ? 8B D0 E8 ? ? ? ? 44 8B 83 ? ? ? ? 33 FF";
-    const uintptr_t instruction = FindModulePattern(
-        reinterpret_cast<HMODULE>(clientBase), kGameEntitySystemPattern);
+    const uintptr_t instruction = FindUniqueClientPattern(
+        kGameEntitySystemPattern);
     if (!instruction) {
         printf("[!] GameEntitySystem pattern not found\n");
         return false;
@@ -276,10 +384,13 @@ bool InitializePatternOffsets() {
     // makes GetPlayers() return an empty snapshot for every visual feature.
     constexpr char kCameraOriginWriterPattern[] =
         "F2 0F 11 05 ? ? ? ? 41 8B 46 08 89 05 ? ? ? ? F2 0F 10 45 00";
-    const uintptr_t cameraInstruction = FindModulePattern(
-        reinterpret_cast<HMODULE>(clientBase), kCameraOriginWriterPattern);
+    uintptr_t cameraInstruction = 0;
     uintptr_t cameraOrigin = 0;
-    if (cameraInstruction) {
+    uintptr_t cameraSearchFrom = 0;
+    while (!cameraOrigin && (cameraInstruction = FindModulePattern(
+        reinterpret_cast<HMODULE>(clientBase),
+        kCameraOriginWriterPattern, cameraSearchFrom))) {
+        cameraSearchFrom = cameraInstruction + 1;
         const int32_t xyDisplacement = Read<int32_t>(cameraInstruction + 4);
         const uintptr_t zInstruction = cameraInstruction + 12;
         const int32_t zDisplacement = Read<int32_t>(zInstruction + 2);
@@ -317,6 +428,9 @@ bool InitializePatternOffsets() {
             << "globalAddress=0x" << globalAddress << '\n'
             << "GameEntitySystem=0x" << Offsets::GameEntitySystem << '\n'
             << "system=0x" << system << '\n'
+            << "EntityChunks=0x" << Offsets::EntityChunks << '\n'
+            << "EntityStride=0x" << Offsets::EntityStride << '\n'
+            << "EntityHandleOffset=0x" << Offsets::EntityHandleOffset << '\n'
             << "HighestEntityIndex=0x" << Offsets::HighestEntityIndex << '\n'
             << "cameraInstruction=0x" << cameraInstruction << '\n'
             << "cameraOrigin=0x" << cameraOrigin << '\n'
@@ -332,6 +446,102 @@ bool InitializePatternOffsets() {
     printf("[+] ViewMatrix: %s offset=0x%llX\n",
            cameraOrigin ? "pattern" : "fallback",
            static_cast<unsigned long long>(Offsets::ViewMatrix));
+    return cameraOrigin != 0;
+}
+
+uintptr_t FindUniqueClientPattern(const char* pattern) {
+    if (!clientBase || !pattern || !*pattern) return 0;
+    const HMODULE client = reinterpret_cast<HMODULE>(clientBase);
+    const uintptr_t first = FindModulePattern(client, pattern);
+    if (!first) return 0;
+    // Ambiguous signatures are more dangerous than an unavailable feature:
+    // never hook an arbitrary match after a patch.
+    const uintptr_t second = FindModulePattern(client, pattern, first + 1);
+    return second ? 0 : first;
+}
+
+bool WriteResolvedOffsetSnapshot() {
+    char modulePath[MAX_PATH]{};
+    if (!moduleHandle || !GetModuleFileNameA(
+            moduleHandle, modulePath, static_cast<DWORD>(sizeof(modulePath))))
+        return false;
+    std::filesystem::path directory =
+        std::filesystem::path(modulePath).parent_path() / "offset_snapshots";
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+    if (error) return false;
+
+    std::string filename = runtimeBuildKey.empty()
+        ? "unknown" : runtimeBuildKey;
+    for (char& character : filename) {
+        if (!std::isalnum(static_cast<unsigned char>(character)) &&
+            character != '-' && character != '_')
+            character = '_';
+    }
+    std::ofstream out(directory / (filename + ".txt"), std::ios::trunc);
+    if (!out) return false;
+    out << "# Automatically resolved by DLL6 from the running client\n"
+        << "fingerprint=" << runtimeBuildKey << '\n'
+        << "runtimeOffsetsReady=" << runtimeOffsetsReady << '\n'
+        << std::hex;
+#define DLL6_SNAPSHOT_OFFSET(name) out << #name "=0x" << Offsets::name << '\n'
+    DLL6_SNAPSHOT_OFFSET(GameEntitySystem);
+    DLL6_SNAPSHOT_OFFSET(ViewMatrix);
+    DLL6_SNAPSHOT_OFFSET(ViewMatrixView);
+    DLL6_SNAPSHOT_OFFSET(ViewMatrixProjection);
+    DLL6_SNAPSHOT_OFFSET(CameraOrigin);
+    DLL6_SNAPSHOT_OFFSET(ControllerPawn);
+    DLL6_SNAPSHOT_OFFSET(IsLocalPlayerController);
+    DLL6_SNAPSHOT_OFFSET(PawnController);
+    DLL6_SNAPSHOT_OFFSET(HeroComponent);
+    DLL6_SNAPSHOT_OFFSET(HeroSpawnedId);
+    DLL6_SNAPSHOT_OFFSET(GameSceneNode);
+    DLL6_SNAPSHOT_OFFSET(GraphControllerManager);
+    DLL6_SNAPSHOT_OFFSET(MainGraphController);
+    DLL6_SNAPSHOT_OFFSET(AnimSequence);
+    DLL6_SNAPSHOT_OFFSET(AnimSequenceStartTime);
+    DLL6_SNAPSHOT_OFFSET(CollisionProperty);
+    DLL6_SNAPSHOT_OFFSET(SceneNodeAbsOrigin);
+    DLL6_SNAPSHOT_OFFSET(SceneNodeAbsScale);
+    DLL6_SNAPSHOT_OFFSET(SceneNodeDormant);
+    DLL6_SNAPSHOT_OFFSET(SceneNodeRenderOrigin);
+    DLL6_SNAPSHOT_OFFSET(CollisionMins);
+    DLL6_SNAPSHOT_OFFSET(CollisionMaxs);
+    DLL6_SNAPSHOT_OFFSET(OrbCollisionProperty);
+    DLL6_SNAPSHOT_OFFSET(Glow);
+    DLL6_SNAPSHOT_OFFSET(GlowColor);
+    DLL6_SNAPSHOT_OFFSET(GlowType);
+    DLL6_SNAPSHOT_OFFSET(GlowTeam);
+    DLL6_SNAPSHOT_OFFSET(GlowRange);
+    DLL6_SNAPSHOT_OFFSET(GlowRangeMin);
+    DLL6_SNAPSHOT_OFFSET(GlowColorOverride);
+    DLL6_SNAPSHOT_OFFSET(GlowFlashing);
+    DLL6_SNAPSHOT_OFFSET(GlowTime);
+    DLL6_SNAPSHOT_OFFSET(GlowStartTime);
+    DLL6_SNAPSHOT_OFFSET(GlowEligible);
+    DLL6_SNAPSHOT_OFFSET(IsGlowing);
+    DLL6_SNAPSHOT_OFFSET(GlowBackfaceMult);
+    DLL6_SNAPSHOT_OFFSET(MaxHealth);
+    DLL6_SNAPSHOT_OFFSET(Health);
+    DLL6_SNAPSHOT_OFFSET(LifeState);
+    DLL6_SNAPSHOT_OFFSET(Team);
+    DLL6_SNAPSHOT_OFFSET(Pos);
+    DLL6_SNAPSHOT_OFFSET(Velocity);
+    DLL6_SNAPSHOT_OFFSET(AbilityComponent);
+    DLL6_SNAPSHOT_OFFSET(AbilityVector);
+    DLL6_SNAPSHOT_OFFSET(MeleeAttackState);
+    DLL6_SNAPSHOT_OFFSET(ControllerPlayerData);
+    DLL6_SNAPSHOT_OFFSET(PlayerDataHealthMax);
+    DLL6_SNAPSHOT_OFFSET(ObserverServices);
+    DLL6_SNAPSHOT_OFFSET(ObserverMode);
+    DLL6_SNAPSHOT_OFFSET(ObserverTarget);
+    DLL6_SNAPSHOT_OFFSET(PlayerName);
+    DLL6_SNAPSHOT_OFFSET(EntityChunks);
+    DLL6_SNAPSHOT_OFFSET(HighestEntityIndex);
+    DLL6_SNAPSHOT_OFFSET(EntityChunkStride);
+    DLL6_SNAPSHOT_OFFSET(EntityStride);
+    DLL6_SNAPSHOT_OFFSET(EntityHandleOffset);
+#undef DLL6_SNAPSHOT_OFFSET
     return true;
 }
 
@@ -442,20 +652,26 @@ bool InitializeRuntimeOffsets() {
         ReadDump(schemaDir / "_globals.txt", globals);
     }
 
-    const size_t required = 25;
+    const size_t required = 46; // 45 schema fields plus GameEntitySystem.
     size_t loaded = 0;
     // GameEntitySystem is resolved and validated by InitializePatternOffsets.
     // Never replace it with a possibly stale value from an on-disk dump.
 
     // Prefer the live SchemaSystem. It is generated by the running client and
     // therefore follows class layout changes without a new dump file.
-    const bool liveSchemaReady = InitializeLiveSchemaOffsets(loaded, required - 1);
+    // Some fields are optional feature paths and may disappear entirely from
+    // a build. Keep a validated partial live-schema result instead of
+    // discarding every resolved critical field because one optional name was
+    // removed.
+    const bool liveSchemaReady = InitializeLiveSchemaOffsets(loaded, 38);
     if (!liveSchemaReady) {
         loaded = 0;
         loaded += SetField(fields, "CBasePlayerController.m_hPawn", Offsets::ControllerPawn);
         loaded += SetField(fields, "CBasePlayerController.m_bIsLocalPlayerController", Offsets::IsLocalPlayerController);
         loaded += SetField(fields, "C_BasePlayerPawn.m_hController", Offsets::PawnController);
         loaded += SetField(fields, "C_BaseEntity.m_pGameSceneNode", Offsets::GameSceneNode);
+        loaded += SetField(fields, "C_BaseEntity.m_pCollision", Offsets::CollisionProperty);
+        loaded += SetField(fields, "C_BaseEntity.m_vecVelocity", Offsets::Velocity);
         loaded += SetField(fields, "CGameSceneNode.m_vecAbsOrigin", Offsets::SceneNodeAbsOrigin);
         loaded += SetField(fields, "CGameSceneNode.m_flScale", Offsets::SceneNodeAbsScale);
         loaded += SetField(fields, "CGameSceneNode.m_bDormant", Offsets::SceneNodeDormant);
@@ -477,10 +693,30 @@ bool InitializeRuntimeOffsets() {
         loaded += SetField(fields, "C_BaseEntity.m_iMaxHealth", Offsets::MaxHealth);
         loaded += SetField(fields, "C_BaseEntity.m_iHealth", Offsets::Health);
         loaded += SetField(fields, "C_BaseEntity.m_lifeState", Offsets::LifeState);
+        loaded += SetField(fields, "C_BaseEntity.m_iTeamNum", Offsets::Team);
+        loaded += SetField(fields, "C_BasePlayerPawn.m_vOldOrigin", Offsets::Pos);
+        loaded += SetField(fields, "C_BasePlayerPawn.m_pObserverServices", Offsets::ObserverServices);
+        loaded += SetField(fields, "CPlayer_ObserverServices.m_iObserverMode", Offsets::ObserverMode);
+        loaded += SetField(fields, "CPlayer_ObserverServices.m_hObserverTarget", Offsets::ObserverTarget);
+        loaded += SetField(fields, "CBasePlayerController.m_iszPlayerName", Offsets::PlayerName);
+        loaded += SetField(fields, "CCitadelPlayerController.m_PlayerDataGlobal", Offsets::ControllerPlayerData);
+        loaded += SetField(fields, "PlayerDataGlobal_t.m_iHealthMax", Offsets::PlayerDataHealthMax);
+        loaded += SetField(fields, "CBaseAnimGraph.m_graphControllerManager", Offsets::GraphControllerManager);
+        loaded += SetField(fields, "CBaseAnimGraph.m_pMainGraphController", Offsets::MainGraphController);
+        loaded += SetField(fields, "CBaseAnimGraphController.m_hSequence", Offsets::AnimSequence);
+        loaded += SetField(fields, "CBaseAnimGraphController.m_flSeqStartTime", Offsets::AnimSequenceStartTime);
+        loaded += SetField(fields, "CCitadel_Ability_HoldMelee.m_eCurrentAttackState", Offsets::MeleeAttackState);
+        const auto spawnedHero = fields.find("CCitadelHeroComponent.m_spawnedHero");
+        const auto spawnedHeroId = fields.find("CitadelHeroSpawnData_t.m_nHeroID");
+        if (spawnedHero != fields.end() && spawnedHeroId != fields.end()) {
+            Offsets::HeroSpawnedId = spawnedHero->second + spawnedHeroId->second;
+            ++loaded;
+        }
     }
 
-    runtimeOffsetsReady = liveSchemaReady || loaded >= 20;
+    runtimeOffsetsReady = liveSchemaReady || loaded >= 38;
     WriteRuntimeLog(schemaDir, loaded, required);
+    WriteResolvedOffsetSnapshot();
     printf("[+] Runtime offsets: %s (%zu/%zu, %s)\n", liveSchemaReady ? "live schema" : (runtimeOffsetsReady ? "dump fallback" : "static fallback"), loaded, required, runtimeBuildKey.c_str());
     return runtimeOffsetsReady;
 }

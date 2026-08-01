@@ -12,6 +12,8 @@ using DrawModelFn = void**(__fastcall*)(
     __int64, __int64, __int64*, int, __int64, __int64, __int64);
 using PlayerOutlineFn = __int64(__fastcall*)(
     __int64, uint32_t*, float*);
+using PlayerHealthGlowRenderFn = void(__fastcall*)(
+    void*, void*, void*, void*);
 using DrawIndexedFn = void(STDMETHODCALLTYPE*)(
     ID3D11DeviceContext*, UINT, UINT, INT);
 using DrawFn = void(STDMETHODCALLTYPE*)(
@@ -27,6 +29,7 @@ using DrawInstancedIndirectFn = void(STDMETHODCALLTYPE*)(
 
 DrawModelFn originalDrawModel = nullptr;
 PlayerOutlineFn originalPlayerOutline = nullptr;
+PlayerHealthGlowRenderFn originalPlayerHealthGlowRender = nullptr;
 DrawIndexedFn originalDrawIndexed = nullptr;
 DrawFn originalDraw = nullptr;
 DrawIndexedInstancedFn originalDrawIndexedInstanced = nullptr;
@@ -36,6 +39,7 @@ DrawInstancedIndirectFn originalDrawInstancedIndirect = nullptr;
 
 void* drawModelTarget = nullptr;
 void* playerOutlineTarget = nullptr;
+void* playerHealthGlowRenderTarget = nullptr;
 void* drawIndexedTarget = nullptr;
 void* drawTarget = nullptr;
 void* drawIndexedInstancedTarget = nullptr;
@@ -44,6 +48,7 @@ void* drawIndexedInstancedIndirectTarget = nullptr;
 void* drawInstancedIndirectTarget = nullptr;
 
 ID3D11PixelShader* glowPixelShader = nullptr;
+ID3D11Buffer* glowColorBuffer = nullptr;
 ID3D11DepthStencilState* glowDepthState = nullptr;
 ID3D11BlendState* glowBlendState = nullptr;
 ID3D11RasterizerState* glowRasterizerState = nullptr;
@@ -65,6 +70,9 @@ constexpr char DrawModelPattern[] =
 constexpr char PlayerOutlinePattern[] =
     "4C 89 44 24 ? 48 89 54 24 ? 55 53 56 57 41 56 41 57 "
     "48 8D AC 24";
+constexpr char PlayerHealthGlowRenderPattern[] =
+    "48 8B C4 4C 89 48 20 48 89 48 08 55 48 8D A8 ? ? ? ? "
+    "48 81 EC 20 06 00 00";
 constexpr size_t MeshEntryStride = 0x68;
 constexpr size_t MeshSceneObject = 0x18;
 constexpr size_t SceneObjectOwner = 0xC0;
@@ -72,6 +80,9 @@ constexpr size_t MeshMaterialDescriptor = 0x08;
 constexpr size_t MaterialDescriptorSize = 0x108;
 constexpr size_t MaterialTintOffset = 0x04;
 constexpr size_t MaterialAlphaOffset = 0x10;
+// The engine's CPlayerHealthGlowRenderer now handles both selectable modes.
+// Keep the old experimental DrawModel duplicate pass out of the render path.
+constexpr bool EnableExperimentalModelGlowPass = false;
 
 void LogGlowHook(const char* message) {
     std::ofstream log(
@@ -109,6 +120,7 @@ uintptr_t FindPattern(HMODULE module, const char* pattern) {
     if (bytes.empty() || bytes.size() > info.SizeOfImage) return 0;
 
     const auto* image = static_cast<const uint8_t*>(info.lpBaseOfDll);
+    uintptr_t found = 0;
     for (size_t i = 0; i + bytes.size() <= info.SizeOfImage; ++i) {
         bool matches = true;
         for (size_t j = 0; j < bytes.size(); ++j) {
@@ -118,20 +130,22 @@ uintptr_t FindPattern(HMODULE module, const char* pattern) {
                 break;
             }
         }
-        if (matches) return reinterpret_cast<uintptr_t>(image + i);
+        if (!matches) continue;
+        if (found) return 0;
+        found = reinterpret_cast<uintptr_t>(image + i);
     }
-    return 0;
+    return found;
 }
 
-bool IsEnemyHeroMesh(uintptr_t entry) {
+uintptr_t GetEnemyHeroMeshPawn(uintptr_t entry) {
     const uintptr_t sceneObject =
         Read<uintptr_t>(entry + MeshSceneObject);
-    if (!sceneObject || !currentLocalPawn) return false;
+    if (!sceneObject || !currentLocalPawn) return 0;
 
     const uint32_t ownerHandle =
         Read<uint32_t>(sceneObject + SceneObjectOwner);
     const uintptr_t pawn = ResolveEntity(ownerHandle);
-    if (!pawn || pawn == currentLocalPawn) return false;
+    if (!pawn || pawn == currentLocalPawn) return 0;
 
     bool isHero = false;
     {
@@ -139,7 +153,7 @@ bool IsEnemyHeroMesh(uintptr_t entry) {
         isHero = std::find(heroPawns.begin(), heroPawns.end(), pawn) !=
                  heroPawns.end();
     }
-    if (!isHero) return false;
+    if (!isHero) return 0;
 
     const uint8_t localTeam =
         Read<uint8_t>(currentLocalPawn + Offsets::Team);
@@ -147,7 +161,11 @@ bool IsEnemyHeroMesh(uintptr_t entry) {
     return localTeam >= 2 && localTeam <= 3 &&
            team >= 2 && team <= 3 && team != localTeam &&
            Read<int>(pawn + Offsets::Health) > 0 &&
-           Read<uint8_t>(pawn + Offsets::LifeState) == 0;
+           Read<uint8_t>(pawn + Offsets::LifeState) == 0 ? pawn : 0;
+}
+
+bool IsEnemyHeroMesh(uintptr_t entry) {
+    return GetEnemyHeroMeshPawn(entry) != 0;
 }
 
 bool IsEnemyOutlinePawn(uintptr_t pawn) {
@@ -157,24 +175,53 @@ bool IsEnemyOutlinePawn(uintptr_t pawn) {
     return pawn != 0 && pawn != currentLocalPawn;
 }
 
+static uint32_t GlowPackedColor(const float color[4]) {
+    const uint32_t r = static_cast<uint32_t>(std::clamp(color[0], 0.0f, 1.0f) * 255.0f);
+    const uint32_t g = static_cast<uint32_t>(std::clamp(color[1], 0.0f, 1.0f) * 255.0f);
+    const uint32_t b = static_cast<uint32_t>(std::clamp(color[2], 0.0f, 1.0f) * 255.0f);
+    const uint32_t a = static_cast<uint32_t>(std::clamp(color[3], 0.0f, 1.0f) * 255.0f);
+    return (a << 24) | (b << 16) | (g << 8) | r;
+}
+
 __int64 __fastcall HookPlayerOutline(
     __int64 pawn, uint32_t* color, float* width) {
-    // Do not call the original query for enemy pawns. In this build the
-    // original routine can clear the outline state during the same update,
-    // which makes a forced outline alternate on and off between frames.
+    const __int64 originalResult = originalPlayerOutline
+        ? originalPlayerOutline(pawn, color, width) : 0;
+
     if (glowEnabled && IsEnemyOutlinePawn(static_cast<uintptr_t>(pawn))) {
-        // Mode 2 is the native through-wall player outline in this build.
-        if (color) *color = 0xFF2EFF1Au;
-        if (width) *width = 2.0f;
-        return 2;
+        const uint8_t localTeam = currentLocalPawn
+            ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
+        const uint8_t pawnTeam = Read<uint8_t>(static_cast<uintptr_t>(pawn) + Offsets::Team);
+        const bool ally = localTeam >= 2 && localTeam <= 3 && pawnTeam == localTeam;
+        const float* glowColor = ally ? teammateGlowColor : enemyGlowColor;
+        float adjusted[4] = {
+            glowColor[0], glowColor[1], glowColor[2], glowColor[3]};
+        if (color) *color = GlowPackedColor(adjusted);
+        if (width) *width = 4.0f;
+
+        // Mode 2 is the native HP-based fill. Mode 3 is the non-HP-clipped
+        // outline/fill mode. Mode 1 produces no fill in this client build.
+        return glowMode == 1 ? 3 : 2;
     }
 
-    return originalPlayerOutline
-        ? originalPlayerOutline(pawn, color, width) : 0;
+    return originalResult;
+}
+
+// PlayerHealthGlowRenderer is the game pass that converts current HP into
+// the vertical fill height.  In Normal fill we suppress only this HP pass;
+// the regular CGlow full-model pass remains enabled and entity health is never
+// written or spoofed.
+void __fastcall HookPlayerHealthGlowRender(
+    void* renderer, void* arg1, void* arg2, void* arg3) {
+    // Normal fill must not use the renderer that derives the fill amount from
+    // current HP. Keep the original pass for the explicitly HP-based mode.
+    if (glowMode != 1 && originalPlayerHealthGlowRender)
+        originalPlayerHealthGlowRender(renderer, arg1, arg2, arg3);
 }
 
 struct SavedPipelineState {
     ID3D11PixelShader* pixelShader{};
+    ID3D11Buffer* pixelConstantBuffer{};
     ID3D11DepthStencilState* depthState{};
     ID3D11BlendState* blendState{};
     ID3D11RasterizerState* rasterizerState{};
@@ -194,12 +241,22 @@ bool BeginGlowPipeline(
         LogGlowCounters();
 
     context->PSGetShader(&saved.pixelShader, nullptr, nullptr);
+    context->PSGetConstantBuffers(0, 1, &saved.pixelConstantBuffer);
     context->OMGetDepthStencilState(&saved.depthState, &saved.stencilRef);
     context->OMGetBlendState(
         &saved.blendState, saved.blendFactor, &saved.sampleMask);
     context->RSGetState(&saved.rasterizerState);
 
     context->PSSetShader(glowPixelShader, nullptr, 0);
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (SUCCEEDED(context->Map(glowColorBuffer, 0, D3D11_MAP_WRITE_DISCARD,
+                               0, &mapped))) {
+        const float color[4] = {
+            enemyGlowColor[0], enemyGlowColor[1], enemyGlowColor[2], 1.0f};
+        std::memcpy(mapped.pData, color, sizeof(color));
+        context->Unmap(glowColorBuffer, 0);
+    }
+    context->PSSetConstantBuffers(0, 1, &glowColorBuffer);
     context->OMSetDepthStencilState(glowDepthState, 0);
     const FLOAT factor[4] = {0.f, 0.f, 0.f, 0.f};
     context->OMSetBlendState(glowBlendState, factor, 0xFFFFFFFFu);
@@ -244,8 +301,8 @@ bool CopyReadableBytes(void* destination, const void* source, size_t size) {
 }
 
 void SetGlowDescriptorTint(std::array<uint8_t, MaterialDescriptorSize>& descriptor) {
-    const Vector3 tint{0.08f, 1.0f, 0.18f};
-    const float alpha = 1.0f;
+    const Vector3 tint{enemyGlowColor[0], enemyGlowColor[1], enemyGlowColor[2]};
+    const float alpha = enemyGlowColor[3];
     std::memcpy(descriptor.data() + MaterialTintOffset, &tint, sizeof(tint));
     std::memcpy(descriptor.data() + MaterialAlphaOffset, &alpha, sizeof(alpha));
 }
@@ -253,12 +310,14 @@ void SetGlowDescriptorTint(std::array<uint8_t, MaterialDescriptorSize>& descript
 void EndGlowPipeline(
     ID3D11DeviceContext* context, SavedPipelineState& saved) {
     context->PSSetShader(saved.pixelShader, nullptr, 0);
+    context->PSSetConstantBuffers(0, 1, &saved.pixelConstantBuffer);
     context->OMSetDepthStencilState(saved.depthState, saved.stencilRef);
     context->OMSetBlendState(
         saved.blendState, saved.blendFactor, saved.sampleMask);
     context->RSSetState(saved.rasterizerState);
 
     if (saved.pixelShader) saved.pixelShader->Release();
+    if (saved.pixelConstantBuffer) saved.pixelConstantBuffer->Release();
     if (saved.depthState) saved.depthState->Release();
     if (saved.blendState) saved.blendState->Release();
     if (saved.rasterizerState) saved.rasterizerState->Release();
@@ -357,7 +416,8 @@ void** __fastcall HookDrawModel(
         sceneObjectDesc, dx11, meshDraws, meshCount,
         sceneView, sceneLayer, a7);
 
-    if (!glowEnabled || !meshDraws || meshCount <= 0 ||
+    if (!EnableExperimentalModelGlowPass ||
+        !glowEnabled || glowMode != 1 || !meshDraws || meshCount <= 0 ||
         !resourcesReady.load(std::memory_order_acquire)) {
         return result;
     }
@@ -479,8 +539,9 @@ bool CreateGlowResources() {
     if (!pDevice) return false;
 
     constexpr char shaderSource[] =
+        "cbuffer GlowColor : register(b0) { float4 color; };"
         "float4 main() : SV_Target {"
-        " return float4(0.10, 1.00, 0.18, 0.62);"
+        " return color;"
         "}";
     ID3DBlob* shaderBlob = nullptr;
     ID3DBlob* errors = nullptr;
@@ -500,6 +561,17 @@ bool CreateGlowResources() {
     shaderBlob->Release();
     if (FAILED(result) || !glowPixelShader) {
         LogGlowHook("glow pixel shader creation failed");
+        return false;
+    }
+
+    D3D11_BUFFER_DESC colorBufferDesc{};
+    colorBufferDesc.ByteWidth = 16;
+    colorBufferDesc.Usage = D3D11_USAGE_DYNAMIC;
+    colorBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    colorBufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    result = pDevice->CreateBuffer(&colorBufferDesc, nullptr, &glowColorBuffer);
+    if (FAILED(result) || !glowColorBuffer) {
+        LogGlowHook("glow color constant buffer creation failed");
         return false;
     }
 
@@ -629,6 +701,20 @@ bool InstallModelGlowHook() {
             LogGlowHook("client PlayerOutline pattern not found or hook failed");
         }
     }
+    if (!playerHealthGlowRenderTarget) {
+        HMODULE client = GetModuleHandleA("client.dll");
+        const uintptr_t renderCandidate = client
+            ? FindPattern(client, PlayerHealthGlowRenderPattern) : 0;
+        if (renderCandidate && InstallContextHook(
+                playerHealthGlowRenderTarget,
+                reinterpret_cast<void*>(renderCandidate),
+                reinterpret_cast<void*>(&HookPlayerHealthGlowRender),
+                originalPlayerHealthGlowRender)) {
+            LogGlowHook("PlayerHealthGlowRenderer render hook installed");
+        } else {
+            LogGlowHook("PlayerHealthGlowRenderer render hook failed");
+        }
+    }
     return playerOutlineTarget != nullptr;
 }
 
@@ -642,6 +728,7 @@ void RemoveModelGlowHook() {
     RemoveHookTarget(drawIndexedTarget);
     RemoveHookTarget(drawModelTarget);
     RemoveHookTarget(playerOutlineTarget);
+    RemoveHookTarget(playerHealthGlowRenderTarget);
 
     originalDrawInstanced = nullptr;
     originalDrawInstancedIndirect = nullptr;
@@ -651,13 +738,16 @@ void RemoveModelGlowHook() {
     originalDrawIndexed = nullptr;
     originalDrawModel = nullptr;
     originalPlayerOutline = nullptr;
+    originalPlayerHealthGlowRender = nullptr;
 
     if (glowRasterizerState) glowRasterizerState->Release();
     if (glowBlendState) glowBlendState->Release();
     if (glowDepthState) glowDepthState->Release();
     if (glowPixelShader) glowPixelShader->Release();
+    if (glowColorBuffer) glowColorBuffer->Release();
     glowRasterizerState = nullptr;
     glowBlendState = nullptr;
     glowDepthState = nullptr;
     glowPixelShader = nullptr;
+    glowColorBuffer = nullptr;
 }
