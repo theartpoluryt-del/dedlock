@@ -551,19 +551,24 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
     const D2D1_RECT_F stage = Rect(x + 15, y + 74, x + width - 15, y + height - 16);
     FillRounded(stage, 7, Color(0.008f, 0.010f, 0.014f, 1.0f));
     StrokeRounded(stage, 7, Color(0.16f, 0.18f, 0.23f, 0.85f));
-    const D2D1_RECT_F modelRect = Rect(x + 49, y + 112, x + width - 31, y + height - 45);
+    // Keep the character aspect ratio from the source sheet. The previous
+    // crop used coordinates for a 2048px image, while the embedded reference
+    // is 2515px wide; that selected half of two poses and pushed the hero out
+    // of the preview window.
+    const D2D1_RECT_F modelRect = Rect(x + 55, y + 110,
+                                       x + width - 55, y + height - 40);
     if (g.previewHeroBitmap) {
         // Front view from the in-game Infernus model reference sheet.
         g.target->DrawBitmap(g.previewHeroBitmap.Get(), modelRect, 1.0f,
             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-            Rect(485.0f, 115.0f, 925.0f, 1125.0f));
+            Rect(620.0f, 170.0f, 1135.0f, 1310.0f));
     }
     if (!enabled) return;
 
-    const float left = modelRect.left + 26.0f;
-    const float right = modelRect.right - 26.0f;
-    const float top = modelRect.top + 34.0f;
-    const float bottom = modelRect.bottom - 8.0f;
+    const float left = modelRect.left + 10.0f;
+    const float right = modelRect.right - 10.0f;
+    const float top = modelRect.top + 11.0f;
+    const float bottom = modelRect.bottom - 11.0f;
     const float cx = (left + right) * 0.5f;
     const D2D1_COLOR_F box = Color(boxColor[0], boxColor[1], boxColor[2]);
     const D2D1_COLOR_F bones = Color(skeletonColor[0], skeletonColor[1], skeletonColor[2]);
@@ -589,14 +594,22 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
         FillRounded(Rect(left - 10, top + 54, left - 5, bottom), 2, hp);
     }
     if (skeleton) {
-        const float head = top + 54.0f;
-        const float shoulders = top + 115.0f;
-        const float hips = top + 250.0f;
-        Line(D2D1::Point2F(cx, head), D2D1::Point2F(cx, hips), bones, 1.4f);
-        Line(D2D1::Point2F(cx, shoulders), D2D1::Point2F(left + 20, top + 205), bones, 1.4f);
-        Line(D2D1::Point2F(cx, shoulders), D2D1::Point2F(right - 20, top + 205), bones, 1.4f);
-        Line(D2D1::Point2F(cx, hips), D2D1::Point2F(cx - 34, bottom), bones, 1.4f);
-        Line(D2D1::Point2F(cx, hips), D2D1::Point2F(cx + 34, bottom), bones, 1.4f);
+        const float head = top + 34.0f;
+        const float neck = top + 67.0f;
+        const float shoulders = top + 105.0f;
+        const float hips = top + 285.0f;
+        const float knees = top + 405.0f;
+        SetBrush(bones);
+        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, head), 10, 13),
+                              g.brush.Get(), 1.3f);
+        Line(D2D1::Point2F(cx, head + 13), D2D1::Point2F(cx, neck), bones, 1.4f);
+        Line(D2D1::Point2F(cx, neck), D2D1::Point2F(cx, hips), bones, 1.4f);
+        Line(D2D1::Point2F(cx, shoulders), D2D1::Point2F(left + 27, top + 205), bones, 1.4f);
+        Line(D2D1::Point2F(cx, shoulders), D2D1::Point2F(right - 27, top + 205), bones, 1.4f);
+        Line(D2D1::Point2F(cx, hips), D2D1::Point2F(cx - 32, knees), bones, 1.4f);
+        Line(D2D1::Point2F(cx - 32, knees), D2D1::Point2F(cx - 35, bottom), bones, 1.4f);
+        Line(D2D1::Point2F(cx, hips), D2D1::Point2F(cx + 32, knees), bones, 1.4f);
+        Line(D2D1::Point2F(cx + 32, knees), D2D1::Point2F(cx + 35, bottom), bones, 1.4f);
     }
     float labelY = top - 46.0f;
     if (heroName) {
