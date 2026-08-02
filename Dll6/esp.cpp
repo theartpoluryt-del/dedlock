@@ -2039,7 +2039,11 @@ void RenderESP(const std::vector<PlayerData>& players) {
         const uint8_t localTeam = currentLocalPawn
             ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
         const bool ally = localTeam != 0 && player.team == localTeam;
+        const bool teamEsp = ally ? allyEspEnabled : enemyEspEnabled;
         const bool teamSnaplines = ally ? allySnaplinesEnabled : enemySnaplinesEnabled;
+        // Snaplines belong to the same team ESP channel. Do this gate before
+        // both the off-screen and on-screen snapline paths below.
+        if (!teamEsp) continue;
         // worldPos and box bounds use the fenced AbsOrigin sample. Bones are
         // rebuilt from the same completed frame before they are projected.
         const Vector3 visualOrigin = player.worldPos;
@@ -2105,8 +2109,6 @@ void RenderESP(const std::vector<PlayerData>& players) {
             drawList->AddLine(lineStart, ImVec2(screenX, screenY),
                               ImColor(255, 255, 255, alpha), 1.0f);
         }
-        const bool teamEsp = ally ? allyEspEnabled : enemyEspEnabled;
-        if (!teamEsp) continue;
         const bool teamBoxes = ally ? allyBoxesEnabled : enemyBoxesEnabled;
         const bool teamCornerBoxes = ally ? allyCornerBoxesEnabled : enemyCornerBoxesEnabled;
         const bool teamHealth = ally ? allyHealthEnabled : enemyHealthEnabled;
