@@ -1316,12 +1316,17 @@ void RenderD2DMenu(std::size_t playerCount) {
             farmToggleMode = farmBind == 1;
             DrawKeyBind(l, leftX + 290, firstY + 132, 159,
                         farmKeyCapture, farmAssistKey, &farmKeyCapture);
-            if (!farmSilentMode || farmMixedMode) {
-                DrawSlider(l, leftX, firstY + 194, columnWidth, L"Farm FOV",
-                           &farmFov, 40.0f, 600.0f, L"%.0f px");
-                DrawSlider(l, leftX, firstY + 256, columnWidth, L"Smoothing",
-                           &farmAimSmooth, 1.0f, 20.0f, L"%.1f");
-            }
+             if (!farmSilentMode || farmMixedMode) {
+                 DrawSlider(l, leftX, firstY + 194, columnWidth, L"Farm FOV",
+                            &farmFov, 40.0f, 600.0f, L"%.0f px");
+                 DrawSlider(l, leftX, firstY + 256, columnWidth, L"Smoothing",
+                            &farmAimSmooth, 1.0f, 20.0f, L"%.1f");
+             }
+             DrawToggle(l, rightX, firstY, columnWidth, L"Farm FOV circle",
+                        L"Show the creep aim radius", &drawFarmFovCircle);
+             if (drawFarmFovCircle)
+                 DrawSlider(l, rightX, firstY + 72, columnWidth, L"FOV opacity",
+                            &farmFovAlpha, 0.0f, 255.0f, L"%.0f");
             }
         } else {
             DrawToggle(l, leftX, firstY, columnWidth, L"Creep aim",
@@ -1338,13 +1343,18 @@ void RenderD2DMenu(std::size_t playerCount) {
                 farmToggleMode = farmBind == 1;
                 DrawKeyBind(l, leftX + 290, firstY + 132, 159,
                             farmKeyCapture, farmAssistKey, &farmKeyCapture);
-                if (!farmSilentMode || farmMixedMode) {
-                    DrawSlider(l, leftX, firstY + 194, columnWidth, L"Farm FOV",
-                               &farmFov, 40.0f, 600.0f, L"%.0f px");
-                    DrawSlider(l, leftX, firstY + 256, columnWidth, L"Smoothing",
-                               &farmAimSmooth, 1.0f, 20.0f, L"%.1f");
-                }
-            }
+                 if (!farmSilentMode || farmMixedMode) {
+                     DrawSlider(l, leftX, firstY + 194, columnWidth, L"Farm FOV",
+                                &farmFov, 40.0f, 600.0f, L"%.0f px");
+                     DrawSlider(l, leftX, firstY + 256, columnWidth, L"Smoothing",
+                                &farmAimSmooth, 1.0f, 20.0f, L"%.1f");
+                 }
+                 DrawToggle(l, rightX, firstY, columnWidth, L"Farm FOV circle",
+                            L"Show the creep aim radius", &drawFarmFovCircle);
+                 if (drawFarmFovCircle)
+                     DrawSlider(l, rightX, firstY + 72, columnWidth, L"FOV opacity",
+                                &farmFovAlpha, 0.0f, 255.0f, L"%.0f");
+             }
 
             DrawToggle(l, rightX, firstY, columnWidth, L"Orb aim",
                        L"Aim at valid soul orbs", &autoLastHitOrbs);
