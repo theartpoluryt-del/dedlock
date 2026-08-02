@@ -1259,6 +1259,7 @@ void RenderD2DMenu(std::size_t playerCount) {
 
     const bool visualEditor = g.tab == 0;
     const float visualPanelBottom = 790.0f;
+    const float visualPanelHeight = visualPanelBottom - cardTop;
     const D2D1_RECT_F cardRect = Rect(334, cardTop,
                                       visualEditor ? 990.0f : 1414.0f,
                                       visualEditor ? visualPanelBottom : 818.0f);
@@ -1338,7 +1339,7 @@ void RenderD2DMenu(std::size_t playerCount) {
         float* teamHealthValueColor = g.visualTeam == 0 ? enemyHealthValueColor : teammateHealthValueColor;
         float* teamGlowColor = g.visualTeam == 0 ? enemyGlowColor : teammateGlowColor;
         bool* teamGlowEnabled = g.visualTeam == 0 ? &enemyGlowEnabled : &allyGlowEnabled;
-        DrawHeroEspPreview(1008.0f, cardTop, 406.0f, 660.0f,
+        DrawHeroEspPreview(1008.0f, cardTop, 406.0f, visualPanelHeight,
                            g.visualTeam == 0 ? L"Enemy preset" :
                            g.visualTeam == 1 ? L"Ally preset" : L"Creep preset",
                            *teamEsp,
