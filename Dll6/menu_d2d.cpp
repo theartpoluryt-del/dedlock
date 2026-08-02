@@ -1258,11 +1258,14 @@ void RenderD2DMenu(std::size_t playerCount) {
     }
 
     const bool visualEditor = g.tab == 0;
-    const float visualPanelBottom = 790.0f;
+    // All tabs share one bottom edge. Their top can differ (Aim has subtabs),
+    // but the content cards must terminate at the same design-space Y.
+    constexpr float contentPanelBottom = 818.0f;
+    const float visualPanelBottom = contentPanelBottom;
     const float visualPanelHeight = visualPanelBottom - cardTop;
     const D2D1_RECT_F cardRect = Rect(334, cardTop,
                                       visualEditor ? 990.0f : 1414.0f,
-                                      visualEditor ? visualPanelBottom : 818.0f);
+                                      contentPanelBottom);
     GlowRounded(cardRect, 10, Color(0, 0, 0, 0.64f), 5, 2.0f);
     GradientRounded(cardRect, 10, Color(0.098f, 0.112f, 0.148f, 0.68f),
                     Color(0.105f, 0.116f, 0.154f, 0.71f), true);
