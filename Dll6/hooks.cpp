@@ -1451,12 +1451,17 @@ void FlushCurrentCameraAimInternal(uintptr_t camera) {
     float pitchDelta = NormalizeCameraAngle(targetPitch - pitch);
     float yawDelta = NormalizeCameraAngle(targetYaw - yaw);
 
+    const bool instantPitch = aimPitchSmooth <= 1.001f;
+    const bool instantYaw = aimYawSmooth <= 1.001f;
+
     // Stop writing once the crosshair has converged. Reapplying tiny deltas
     // from consecutive camera states creates a feedback oscillation that also
     // makes every ESP projection shake.
     constexpr float angularDeadzone = 0.01f;
-    if (std::fabs(pitchDelta) < angularDeadzone) pitchDelta = 0.0f;
-    if (std::fabs(yawDelta) < angularDeadzone) yawDelta = 0.0f;
+    if (!instantPitch && std::fabs(pitchDelta) < angularDeadzone)
+        pitchDelta = 0.0f;
+    if (!instantYaw && std::fabs(yawDelta) < angularDeadzone)
+        yawDelta = 0.0f;
     if ((aimOnlyYaw || pitchDelta == 0.0f) && yawDelta == 0.0f)
         return;
 
@@ -1492,9 +1497,14 @@ void FlushCurrentCameraAimInternal(uintptr_t camera) {
     const float maxStepAt60Hz = 45.0f -
         (averageSmooth - 1.0f) * (33.0f / 19.0f);
     const float maxStep = maxStepAt60Hz * deltaSeconds * 60.0f;
-    if (!aimOnlyYaw)
-        pitch += (std::clamp)(pitchDelta * pitchAlpha, -maxStep, maxStep);
-    yaw += (std::clamp)(yawDelta * yawAlpha, -maxStep, maxStep);
+    if (!aimOnlyYaw) {
+        pitch = instantPitch
+            ? targetPitch
+            : pitch + (std::clamp)(pitchDelta * pitchAlpha, -maxStep, maxStep);
+    }
+    yaw = instantYaw
+        ? targetYaw
+        : yaw + (std::clamp)(yawDelta * yawAlpha, -maxStep, maxStep);
     pitch = (std::clamp)(pitch, -89.0f, 89.0f);
     yaw = NormalizeCameraAngle(yaw);
 

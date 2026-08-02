@@ -1432,7 +1432,6 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     const uint8_t localTeam = currentLocalPawn
         ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
     const PlayerData* best = nullptr;
-    Vector2 bestAimScreen{};
     Vector3 bestAimPoint{};
     const float fovDistance = aimFov * aimFov;
     float bestSelectionScore = FLT_MAX;
@@ -1529,7 +1528,6 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
                 bestSelectionScore = selectionScore;
                 best = &player;
                 // Store the point that passed the depth test for the final move.
-                bestAimScreen = visibleAimScreen;
                 bestAimPoint = visibleAimPoint;
             }
         }
@@ -1558,12 +1556,9 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         movementDebugTargetReady = true;
     }
 
-    const float targetX = bestAimScreen.x;
-    const float targetY = bestAimScreen.y;
     // Mixed always keeps the current visible Normal camera path. While the
     // attack button is held, pSilent is applied in addition to it.
     const bool visibleMouseAim = aimNormalActive || aimMixedMode;
-    cachedVisibleAimPoint = bestAimPoint;
     // Use the live engine velocity when available. The position-delta
     // estimator is intentionally retained as a fallback for entities whose
     // velocity field is unavailable, but it lags badly when a target starts
@@ -1585,6 +1580,20 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         !std::isfinite(cachedVisibleAimVelocity.z)) {
         cachedVisibleAimVelocity = {};
     }
+    cachedVisibleAimPoint = bestAimPoint;
+    if (!aimBacktrack) {
+        // Both camera aim and pSilent consume this render-side target on the
+        // next gameplay/input update. Advance by one measured render interval
+        // so neither path fires at the position from the preceding frame.
+        const float pipelineSeconds = (std::clamp)(
+            ImGui::GetIO().DeltaTime, 0.001f, 1.0f / 60.0f);
+        cachedVisibleAimPoint.x +=
+            cachedVisibleAimVelocity.x * pipelineSeconds;
+        cachedVisibleAimPoint.y +=
+            cachedVisibleAimVelocity.y * pipelineSeconds;
+        cachedVisibleAimPoint.z +=
+            cachedVisibleAimVelocity.z * pipelineSeconds;
+    }
     cachedVisibleAimAt = now;
     cachedVisibleAimReady = visibleMouseAim;
 
@@ -1599,9 +1608,12 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     // fights over the view angles and makes the camera and ESP oscillate.
     // Mixed keeps the input-angle path only for its silent attack pass.
     if (silentPass) {
+        Vector2 commandScreen{};
         Vector3 commandAngles{};
-        const bool haveCommandAngles =
-            GetAimAnglesFromScreen(targetX, targetY, commandAngles);
+        const bool haveCommandAngles = GetWorldAimPointScreen(
+                cachedVisibleAimPoint, commandScreen) &&
+            GetAimAnglesFromScreen(
+                commandScreen.x, commandScreen.y, commandAngles);
         if (haveCommandAngles) {
             std::lock_guard<std::mutex> lock(humanSilentMutex);
             pendingHumanAngles = commandAngles;
@@ -1631,6 +1643,8 @@ void UpdateVisibleAimCamera() {
         ApplyCurrentCameraAim(cachedFarmAimPoint);
         return;
     }
+    const bool instantVisibleAim =
+        aimPitchSmooth <= 1.001f && aimYawSmooth <= 1.001f;
     Vector3 predictedPoint = cachedVisibleAimPoint;
     if (cachedVisibleAimAt != 0 && !aimBacktrack) {
         const ULONGLONG ageMs = (std::min)(
@@ -1648,10 +1662,12 @@ void UpdateVisibleAimCamera() {
             return rate > 0.001f
                 ? (std::min)(1.0f / rate, 0.250f) : 0.0f;
         };
-        const float horizontalLead =
-            ageSeconds + smoothingDelay(aimYawSmooth);
-        const float verticalLead =
-            ageSeconds + smoothingDelay(aimPitchSmooth);
+        // Smooth=1 has no camera-response delay. Only compensate the real age
+        // of the render-side target before the next gameplay-camera callback.
+        const float horizontalLead = ageSeconds +
+            (instantVisibleAim ? 0.0f : smoothingDelay(aimYawSmooth));
+        const float verticalLead = ageSeconds +
+            (instantVisibleAim ? 0.0f : smoothingDelay(aimPitchSmooth));
         predictedPoint.x += cachedVisibleAimVelocity.x * horizontalLead;
         predictedPoint.y += cachedVisibleAimVelocity.y * horizontalLead;
         predictedPoint.z += cachedVisibleAimVelocity.z * verticalLead;
@@ -1665,6 +1681,16 @@ void UpdateVisibleAimCamera() {
     static Vector3 filteredPoint{};
     static bool filteredPointReady = false;
     static std::chrono::steady_clock::time_point filteredAt{};
+    if (instantVisibleAim) {
+        // At the minimum slider value Normal must use the same current point
+        // as pSilent. The 18 ms measurement filter was the remaining visible
+        // trail behind a running head even though camera smoothing was 1.
+        filteredPoint = predictedPoint;
+        filteredPointReady = true;
+        filteredAt = std::chrono::steady_clock::now();
+        ApplyCurrentCameraAim(predictedPoint);
+        return;
+    }
     const auto filterNow = std::chrono::steady_clock::now();
     float filterDelta = filteredAt.time_since_epoch().count() == 0
         ? (1.0f / 60.0f)
