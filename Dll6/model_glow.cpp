@@ -57,6 +57,7 @@ ID3D11RasterizerState* glowRasterizerState = nullptr;
 // executes it on another. A thread_local marker therefore made the second
 // pass lose its state before the actual Draw* call.
 std::atomic_bool renderGlowPass = false;
+std::atomic_int renderGlowTeam = -1;
 std::atomic_bool resourcesReady = false;
 std::atomic_bool firstEnemyPassLogged = false;
 std::atomic_bool drawModelLayoutLogged = false;
@@ -82,7 +83,9 @@ constexpr size_t MaterialTintOffset = 0x04;
 constexpr size_t MaterialAlphaOffset = 0x10;
 // The engine's CPlayerHealthGlowRenderer now handles both selectable modes.
 // Keep the old experimental DrawModel duplicate pass out of the render path.
-constexpr bool EnableExperimentalModelGlowPass = false;
+// Normal fill is implemented by a second model submission.  The native
+// health renderer remains the source for HP-based fill.
+constexpr bool EnableExperimentalModelGlowPass = true;
 
 void LogGlowHook(const char* message) {
     std::ofstream log(
@@ -164,8 +167,40 @@ uintptr_t GetEnemyHeroMeshPawn(uintptr_t entry) {
            Read<uint8_t>(pawn + Offsets::LifeState) == 0 ? pawn : 0;
 }
 
+uintptr_t GetGlowHeroMeshPawn(uintptr_t entry) {
+    const uintptr_t sceneObject = Read<uintptr_t>(entry + MeshSceneObject);
+    if (!sceneObject || !currentLocalPawn) return 0;
+
+    const uint32_t ownerHandle = Read<uint32_t>(sceneObject + SceneObjectOwner);
+    const uintptr_t pawn = ResolveEntity(ownerHandle);
+    if (!pawn || pawn == currentLocalPawn) return 0;
+
+    bool isHero = false;
+    {
+        std::lock_guard<std::mutex> lock(heroPawnsMutex);
+        isHero = std::find(heroPawns.begin(), heroPawns.end(), pawn) != heroPawns.end();
+    }
+    if (!isHero) return 0;
+
+    const uint8_t team = Read<uint8_t>(pawn + Offsets::Team);
+    const int health = Read<int>(pawn + Offsets::Health);
+    const uint8_t lifeState = Read<uint8_t>(pawn + Offsets::LifeState);
+    return (team == 2 || team == 3) && health > 0 && lifeState == 0 ? pawn : 0;
+}
+
+bool IsGlowEnabledForPawn(uintptr_t pawn) {
+    if (!pawn) return false;
+    const uint8_t localTeam = currentLocalPawn
+        ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
+    const uint8_t pawnTeam = Read<uint8_t>(pawn + Offsets::Team);
+    if (pawnTeam != 2 && pawnTeam != 3) return false;
+    const bool ally = localTeam >= 2 && localTeam <= 3 && pawnTeam == localTeam;
+    return ally ? allyGlowEnabled : enemyGlowEnabled;
+}
+
 bool IsEnemyHeroMesh(uintptr_t entry) {
-    return GetEnemyHeroMeshPawn(entry) != 0;
+    const uintptr_t pawn = GetGlowHeroMeshPawn(entry);
+    return pawn != 0 && IsGlowEnabledForPawn(pawn);
 }
 
 bool IsEnemyOutlinePawn(uintptr_t pawn) {
@@ -256,8 +291,10 @@ bool BeginGlowPipeline(
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (SUCCEEDED(context->Map(glowColorBuffer, 0, D3D11_MAP_WRITE_DISCARD,
                                0, &mapped))) {
+        const float* glowColor = renderGlowTeam.load(std::memory_order_acquire) == 1
+            ? teammateGlowColor : enemyGlowColor;
         const float color[4] = {
-            enemyGlowColor[0], enemyGlowColor[1], enemyGlowColor[2], 1.0f};
+            glowColor[0], glowColor[1], glowColor[2], glowColor[3]};
         std::memcpy(mapped.pData, color, sizeof(color));
         context->Unmap(glowColorBuffer, 0);
     }
@@ -305,9 +342,11 @@ bool CopyReadableBytes(void* destination, const void* source, size_t size) {
     }
 }
 
-void SetGlowDescriptorTint(std::array<uint8_t, MaterialDescriptorSize>& descriptor) {
-    const Vector3 tint{enemyGlowColor[0], enemyGlowColor[1], enemyGlowColor[2]};
-    const float alpha = enemyGlowColor[3];
+void SetGlowDescriptorTint(
+    std::array<uint8_t, MaterialDescriptorSize>& descriptor,
+    const float glowColor[4]) {
+    const Vector3 tint{glowColor[0], glowColor[1], glowColor[2]};
+    const float alpha = glowColor[3];
     std::memcpy(descriptor.data() + MaterialTintOffset, &tint, sizeof(tint));
     std::memcpy(descriptor.data() + MaterialAlphaOffset, &alpha, sizeof(alpha));
 }
@@ -422,7 +461,7 @@ void** __fastcall HookDrawModel(
         sceneView, sceneLayer, a7);
 
     if (!EnableExperimentalModelGlowPass ||
-        !glowEnabled || glowMode != 1 || !meshDraws || meshCount <= 0 ||
+        glowMode != 1 || !meshDraws || meshCount <= 0 ||
         !resourcesReady.load(std::memory_order_acquire)) {
         return result;
     }
@@ -436,6 +475,7 @@ void** __fastcall HookDrawModel(
     };
     std::vector<MeshEntry> enemyMeshes;
     std::vector<MaterialDescriptor> glowDescriptors;
+    int batchTeam = -1;
     enemyMeshes.reserve(static_cast<size_t>(safeCount));
     glowDescriptors.reserve(static_cast<size_t>(safeCount));
 
@@ -443,7 +483,13 @@ void** __fastcall HookDrawModel(
     for (int i = 0; i < safeCount; ++i) {
         const uintptr_t entry =
             source + static_cast<uintptr_t>(i) * MeshEntryStride;
-        if (!IsEnemyHeroMesh(entry)) continue;
+        const uintptr_t pawn = GetGlowHeroMeshPawn(entry);
+        if (!pawn || !IsGlowEnabledForPawn(pawn)) continue;
+        const uint8_t localTeam = currentLocalPawn
+            ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
+        const uint8_t pawnTeam = Read<uint8_t>(pawn + Offsets::Team);
+        const bool ally = localTeam >= 2 && localTeam <= 3 && pawnTeam == localTeam;
+        if (batchTeam < 0) batchTeam = ally ? 1 : 0;
         MeshEntry copy{};
         if (!CopyReadableBytes(copy.bytes.data(),
                                reinterpret_cast<const void*>(entry), MeshEntryStride))
@@ -455,7 +501,9 @@ void** __fastcall HookDrawModel(
             if (!glowDescriptors.empty()) glowDescriptors.pop_back();
             continue;
         }
-        SetGlowDescriptorTint(glowDescriptors.back().bytes);
+        SetGlowDescriptorTint(
+            glowDescriptors.back().bytes,
+            ally ? teammateGlowColor : enemyGlowColor);
         const uintptr_t descriptorCopy = reinterpret_cast<uintptr_t>(
             glowDescriptors.back().bytes.data());
         std::memcpy(copy.bytes.data() + MeshMaterialDescriptor,
@@ -526,6 +574,7 @@ void** __fastcall HookDrawModel(
         const bool overridden = submittedContext &&
             BeginGlowPipeline(submittedContext, saved);
 
+        renderGlowTeam.store(batchTeam, std::memory_order_release);
         renderGlowPass.store(!submittedContext, std::memory_order_release);
         originalDrawModel(
             sceneObjectDesc, dx11,
@@ -533,6 +582,7 @@ void** __fastcall HookDrawModel(
             static_cast<int>(enemyMeshes.size()),
             sceneView, sceneLayer, a7);
         renderGlowPass.store(false, std::memory_order_release);
+        renderGlowTeam.store(-1, std::memory_order_release);
 
         if (overridden) EndGlowPipeline(submittedContext, saved);
     }
