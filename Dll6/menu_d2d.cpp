@@ -486,6 +486,92 @@ void DrawCombo(const Layout& l, int id, float x, float y, float width,
     }
 }
 
+void DrawEspPreview(float x, float y, float width, float height, bool enabled,
+                    bool boxes, bool skeleton, bool health, bool names,
+                    bool snaplines, const float* boxColor,
+                    const float* skeletonColor, const float* healthColor,
+                    const float* nameColor) {
+    FillRounded(Rect(x, y, x + width, y + height), 9,
+                Color(0.030f, 0.035f, 0.045f, 0.94f));
+    StrokeRounded(Rect(x, y, x + width, y + height), 9, Border(), 1.0f);
+    Text(L"ESP preview", Rect(x + 16, y + 12, x + width - 16, y + 36),
+         g.semibold.Get(), White());
+    Text(enabled ? L"Live example" : L"ESP disabled",
+         Rect(x + 16, y + 36, x + width - 16, y + 58), g.regular.Get(),
+         enabled ? Muted() : Red(0.9f));
+
+    const float canvasLeft = x + 16.0f;
+    const float canvasTop = y + 68.0f;
+    const float canvasRight = x + 208.0f;
+    const float canvasBottom = y + height - 14.0f;
+    FillRounded(Rect(canvasLeft, canvasTop, canvasRight, canvasBottom), 6,
+                Color(0.055f, 0.065f, 0.085f, 0.90f));
+    StrokeRounded(Rect(canvasLeft, canvasTop, canvasRight, canvasBottom), 6,
+                  Color(0.20f, 0.24f, 0.32f, 0.75f));
+
+    const float cx = (canvasLeft + canvasRight) * 0.5f;
+    const float top = canvasTop + 23.0f;
+    const float shoulder = top + 55.0f;
+    const float hip = top + 118.0f;
+    const float foot = top + 181.0f;
+    const D2D1_COLOR_F box = Color(boxColor[0], boxColor[1], boxColor[2]);
+    const D2D1_COLOR_F bones = Color(skeletonColor[0], skeletonColor[1], skeletonColor[2]);
+    const D2D1_COLOR_F hp = Color(healthColor[0], healthColor[1], healthColor[2]);
+    const D2D1_COLOR_F name = Color(nameColor[0], nameColor[1], nameColor[2]);
+    const float left = cx - 38.0f;
+    const float right = cx + 38.0f;
+    if (boxes) {
+        Line(D2D1::Point2F(left, shoulder), D2D1::Point2F(left + 18, shoulder), box);
+        Line(D2D1::Point2F(left, shoulder), D2D1::Point2F(left, shoulder + 18), box);
+        Line(D2D1::Point2F(right - 18, shoulder), D2D1::Point2F(right, shoulder), box);
+        Line(D2D1::Point2F(right, shoulder), D2D1::Point2F(right, shoulder + 18), box);
+        Line(D2D1::Point2F(left, foot), D2D1::Point2F(left + 18, foot), box);
+        Line(D2D1::Point2F(left, foot - 18), D2D1::Point2F(left, foot), box);
+        Line(D2D1::Point2F(right - 18, foot), D2D1::Point2F(right, foot), box);
+        Line(D2D1::Point2F(right, foot - 18), D2D1::Point2F(right, foot), box);
+    }
+    if (health) {
+        FillRounded(Rect(left - 10, shoulder, left - 5, foot), 2,
+                    Color(0.12f, 0.14f, 0.17f));
+        FillRounded(Rect(left - 10, shoulder + 20, left - 5, foot), 2,
+                    hp);
+    }
+    if (skeleton) {
+        Line(D2D1::Point2F(cx, top + 12), D2D1::Point2F(cx, shoulder), bones, 1.4f);
+        Line(D2D1::Point2F(cx, shoulder), D2D1::Point2F(cx, hip), bones, 1.4f);
+        Line(D2D1::Point2F(cx, hip), D2D1::Point2F(cx - 20, foot), bones, 1.4f);
+        Line(D2D1::Point2F(cx, hip), D2D1::Point2F(cx + 20, foot), bones, 1.4f);
+        Line(D2D1::Point2F(cx, shoulder), D2D1::Point2F(cx - 28, shoulder + 39), bones, 1.4f);
+        Line(D2D1::Point2F(cx, shoulder), D2D1::Point2F(cx + 28, shoulder + 39), bones, 1.4f);
+    }
+    SetBrush(box);
+    g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, top), 12, 12), g.brush.Get());
+    if (names)
+        Text(L"Enemy", Rect(left - 4, top - 22, right + 36, top - 2),
+             g.regular.Get(), name);
+    if (snaplines)
+        Line(D2D1::Point2F(cx, canvasBottom), D2D1::Point2F(canvasRight - 14, canvasBottom - 16),
+             Color(1.0f, 1.0f, 1.0f, 0.62f), 1.0f);
+
+    const float infoX = x + 230.0f;
+    Text(L"Preview follows the selected team", Rect(infoX, y + 76, x + width - 14, y + 116),
+         g.regular.Get(), Muted());
+    const auto chip = [&](float cy, const wchar_t* label, bool value,
+                          const D2D1_COLOR_F& accent) {
+        FillRounded(Rect(infoX, cy, x + width - 16, cy + 28), 5,
+                    Color(0.075f, 0.085f, 0.11f, 0.92f));
+        StrokeRounded(Rect(infoX, cy, x + width - 16, cy + 28), 5,
+                      value ? accent : Border(), 0.8f);
+        Text(label, Rect(infoX + 10, cy, x + width - 55, cy + 28),
+             g.regular.Get(), value ? White() : Muted());
+        Text(value ? L"ON" : L"OFF", Rect(x + width - 50, cy, x + width - 22, cy + 28),
+             g.centered.Get(), value ? accent : Muted());
+    };
+    chip(y + 128, L"Box", boxes, box);
+    chip(y + 162, L"Skeleton", skeleton, bones);
+    chip(y + 196, L"Health bar", health, hp);
+}
+
 void DrawKeyBind(const Layout& l, float x, float y, float width,
                  bool capture, int key, bool* captureState) {
     const float baseY = y;
@@ -1166,25 +1252,30 @@ void RenderD2DMenu(std::size_t playerCount) {
         float* teamHealthValueColor = g.visualTeam == 0 ? enemyHealthValueColor : teammateHealthValueColor;
         float* teamGlowColor = g.visualTeam == 0 ? enemyGlowColor : teammateGlowColor;
         bool* teamGlowEnabled = g.visualTeam == 0 ? &enemyGlowEnabled : &allyGlowEnabled;
+        const float leftFirstY = firstY + 276.0f;
+        DrawEspPreview(leftX, firstY, leftColumnWidth, 258.0f, *teamEsp,
+                       *teamBoxes, *teamBones, *teamHealth, *teamNames,
+                       *teamSnaplines, teamBoxColor, teamSkeletonColor,
+                       teamHealthColor, teamNameColor);
 
         if (g.visualTeam == 2) {
-            DrawToggle(l, leftX, firstY, leftColorWidth, L"Creep ESP",
+            DrawToggle(l, leftX, leftFirstY, leftColorWidth, L"Creep ESP",
                        L"Highlight valid creeps", teamEsp);
-            float orbY = firstY + 72;
+            float orbY = leftFirstY + 72;
             if (*teamEsp) {
-                DrawToggle(l, leftX, firstY + 72, leftColorWidth, L"Bounding boxes",
+                DrawToggle(l, leftX, leftFirstY + 72, leftColorWidth, L"Bounding boxes",
                            L"Draw boxes around creeps", teamBoxes, teamBoxColor);
                 if (*teamBoxes) {
-                    DrawToggle(l, leftX, firstY + 144, leftColorWidth, L"Corner boxes",
+                    DrawToggle(l, leftX, leftFirstY + 144, leftColorWidth, L"Corner boxes",
                                L"Use corner-only box style", teamCornerBoxes, nullptr);
                 }
-                DrawToggle(l, leftX, firstY + 216, leftColorWidth, L"Health bar",
+                DrawToggle(l, leftX, leftFirstY + 216, leftColorWidth, L"Health bar",
                            L"Show creep health", teamHealth, teamHealthColor);
-                DrawToggle(l, leftX, firstY + 282, leftColorWidth, L"Health value",
+                DrawToggle(l, leftX, leftFirstY + 282, leftColorWidth, L"Health value",
                             L"Show creep health value", teamHealthValues, creepHealthValueColor);
-                DrawToggle(l, leftX, firstY + 348, leftColorWidth, L"Distance",
+                DrawToggle(l, leftX, leftFirstY + 348, leftColorWidth, L"Distance",
                            L"Show distance to creep", teamDistance, nullptr);
-                orbY = firstY + 414;
+                orbY = leftFirstY + 414;
             }
             DrawToggle(l, leftX, orbY, leftColorWidth, L"Orb ESP",
                        L"Highlight active soul orbs", &drawOrbEsp);
@@ -1204,20 +1295,20 @@ void RenderD2DMenu(std::size_t playerCount) {
                            L"Show distance to allied creep", &allyCreepDistanceEnabled);
             }
         } else {
-        DrawToggle(l, leftX, firstY, leftColumnWidth, L"Enable ESP",
+        DrawToggle(l, leftX, leftFirstY, leftColumnWidth, L"Enable ESP",
                    L"Master overlay switch", teamEsp);
         if (*teamEsp) {
-        DrawToggle(l, leftX, firstY + 72, leftColorWidth, L"Bounding boxes",
+        DrawToggle(l, leftX, leftFirstY + 72, leftColorWidth, L"Bounding boxes",
                    L"Draw boxes around enemies", teamBoxes, teamBoxColor);
         if (*teamBoxes) {
-            DrawSlider(l, leftX, firstY + 138, leftColumnWidth, L"Box thickness",
+            DrawSlider(l, leftX, leftFirstY + 138, leftColumnWidth, L"Box thickness",
                        &boxThickness, 0.5f, 4.0f, L"%.2f px");
-            DrawToggle(l, leftX, firstY + 198, leftColorWidth, L"Corner boxes",
+            DrawToggle(l, leftX, leftFirstY + 198, leftColorWidth, L"Corner boxes",
                        L"Use corner-only box style", teamCornerBoxes, nullptr);
-            DrawSlider(l, leftX, firstY + 264, leftColumnWidth, L"Corner length",
+            DrawSlider(l, leftX, leftFirstY + 264, leftColumnWidth, L"Corner length",
                        &cornerBoxLength, 0.10f, 0.50f, L"%.2f");
         }
-        const float featureY = *teamBoxes ? firstY + 324 : firstY + 138;
+        const float featureY = *teamBoxes ? leftFirstY + 324 : leftFirstY + 138;
         DrawToggle(l, leftX, featureY, leftColorWidth, L"Health bar",
                    L"Show health bar", teamHealth, teamHealthColor);
         DrawToggle(l, leftX, featureY + 66, leftColorWidth, L"Health value",
