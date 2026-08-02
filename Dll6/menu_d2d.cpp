@@ -13,6 +13,7 @@
 #include <cwchar>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
@@ -35,6 +36,8 @@ struct Renderer {
     ComPtr<ID2D1Bitmap> preview3dBitmap;
     ComPtr<ID3D11Texture2D> preview3dTexture;
     Preview3DFrame preview3dFrame{};
+    std::vector<uint8_t> preview3dPixels;
+    bool preview3dShared = false;
     bool preview3dActive = false;
     ComPtr<ID2D1Bitmap> tabIcons[4];
     ComPtr<ID2D1Bitmap> sceneBitmap;
@@ -879,24 +882,44 @@ void LoadEmbeddedAssets() {
         LoadEmbeddedBitmap(iconIds[i], g.tabIcons[i]);
 }
 
-bool BindPreview3DFrame(const Preview3DFrame& frame) {
+bool BindPreview3DFrame(const Preview3DFrame& frame,
+                        ID3D11DeviceContext* context) {
     if (!frame.texture || !g.target || g.softwareTarget) return false;
     if (g.preview3dTexture.Get() != frame.texture || !g.preview3dBitmap) {
         g.preview3dBitmap.Reset();
         g.preview3dTexture.Reset();
+        g.preview3dShared = false;
         ComPtr<IDXGISurface> surface;
-        if (FAILED(frame.texture->QueryInterface(
-                IID_PPV_ARGS(surface.GetAddressOf())))) return false;
         const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
                               D2D1_ALPHA_MODE_PREMULTIPLIED),
             96.0f, 96.0f);
-        if (FAILED(g.target->CreateSharedBitmap(
+        if (SUCCEEDED(frame.texture->QueryInterface(
+                IID_PPV_ARGS(surface.GetAddressOf()))) &&
+            SUCCEEDED(g.target->CreateSharedBitmap(
                 __uuidof(IDXGISurface), surface.Get(), &properties,
                 g.preview3dBitmap.GetAddressOf()))) {
-            return false;
+            g.preview3dShared = true;
+        } else {
+            uint32_t width = 0, height = 0, stride = 0;
+            if (!ReadPreview3DPixels(context, g.preview3dPixels,
+                                     width, height, stride) ||
+                FAILED(g.target->CreateBitmap(
+                    D2D1::SizeU(width, height), g.preview3dPixels.data(),
+                    stride, properties, g.preview3dBitmap.GetAddressOf()))) {
+                g.preview3dBitmap.Reset();
+                return false;
+            }
         }
         g.preview3dTexture = frame.texture;
+    } else if (!g.preview3dShared) {
+        uint32_t width = 0, height = 0, stride = 0;
+        if (!ReadPreview3DPixels(context, g.preview3dPixels,
+                                 width, height, stride) ||
+            FAILED(g.preview3dBitmap->CopyFromMemory(
+                nullptr, g.preview3dPixels.data(), stride))) {
+            return false;
+        }
     }
     g.preview3dFrame = frame;
     return true;
@@ -953,6 +976,8 @@ void ResetTarget() {
     g.preview3dBitmap.Reset();
     g.preview3dTexture.Reset();
     g.preview3dFrame = {};
+    g.preview3dPixels.clear();
+    g.preview3dShared = false;
     g.preview3dActive = false;
     for (auto& icon : g.tabIcons) icon.Reset();
     g.blurBitmap.Reset();
@@ -1201,7 +1226,7 @@ void RenderD2DMenu(std::size_t playerCount) {
         if (RenderPreview3D(pDevice, pContext, previewTime,
                             previewGlowEnabled, previewGlowColor,
                             previewFrame))
-            g.preview3dActive = BindPreview3DFrame(previewFrame);
+            g.preview3dActive = BindPreview3DFrame(previewFrame, pContext);
     }
     g.target->BeginDraw();
     g.target->SetTransform(D2D1::Matrix3x2F::Identity());

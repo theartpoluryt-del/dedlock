@@ -70,9 +70,9 @@ static_assert(sizeof(AssetMaterial) == 48);
 static_assert(sizeof(AssetVertex) == 56);
 
 struct SceneConstants {
-    XMFLOAT4X4 world;
     XMFLOAT4X4 viewProjection;
     XMFLOAT4 lightDirection;
+    XMFLOAT4 modelParameters;
 };
 
 struct MaterialConstants {
@@ -98,6 +98,7 @@ struct Runtime {
     ComPtr<ID3D11DepthStencilState> outlineDepthState;
     ComPtr<ID3D11Texture2D> targetTexture;
     ComPtr<ID3D11RenderTargetView> targetView;
+    ComPtr<ID3D11Texture2D> stagingTexture;
     ComPtr<ID3D11Texture2D> depthTexture;
     ComPtr<ID3D11DepthStencilView> depthView;
     ComPtr<ID3D11ShaderResourceView> whiteTexture;
@@ -236,6 +237,14 @@ bool CreateRenderTarget(ID3D11Device* device) {
             runtime.targetView.GetAddressOf()))) {
         return false;
     }
+    D3D11_TEXTURE2D_DESC staging = color;
+    staging.Usage = D3D11_USAGE_STAGING;
+    staging.BindFlags = 0;
+    staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(device->CreateTexture2D(
+            &staging, nullptr, runtime.stagingTexture.GetAddressOf()))) {
+        return false;
+    }
 
     D3D11_TEXTURE2D_DESC depth = color;
     depth.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
@@ -253,11 +262,11 @@ bool CreateRenderTarget(ID3D11Device* device) {
 bool CreatePipeline(ID3D11Device* device) {
     static constexpr char shader[] = R"(
 cbuffer Scene : register(b0) {
-    float4x4 World;
     float4x4 ViewProjection;
     float4 LightDirection;
+    float4 ModelParameters;
 };
-cbuffer Skin : register(b1) { float4x4 Bones[160]; };
+cbuffer Skin : register(b1) { float4 BoneRows[480]; };
 cbuffer Material : register(b2) {
     float4 BaseFactor;
     float4 EmissiveFactor;
@@ -283,15 +292,35 @@ VSOutput VSMain(VSInput input) {
     float4 localPosition = 0;
     float3 localNormal = 0;
     [unroll] for (int i = 0; i < 4; ++i) {
-        localPosition += mul(Bones[input.joints[i]], float4(input.position, 1.0)) * input.weights[i];
-        localNormal += mul((float3x3)Bones[input.joints[i]], input.normal) * input.weights[i];
+        uint row = input.joints[i] * 3;
+        float4 position = float4(input.position, 1.0);
+        float3 skinnedPosition = float3(
+            dot(BoneRows[row + 0], position),
+            dot(BoneRows[row + 1], position),
+            dot(BoneRows[row + 2], position));
+        float3 skinnedNormal = float3(
+            dot(BoneRows[row + 0].xyz, input.normal),
+            dot(BoneRows[row + 1].xyz, input.normal),
+            dot(BoneRows[row + 2].xyz, input.normal));
+        localPosition += float4(skinnedPosition, 1.0) * input.weights[i];
+        localNormal += skinnedNormal * input.weights[i];
     }
     if (EmissiveFactor.w > 0.5)
-        localPosition.xyz += normalize(localNormal) * 0.72;
-    float4 worldPosition = mul(World, localPosition);
+        localPosition.xyz += normalize(localNormal) * 0.014;
+    localPosition.xy += ModelParameters.zw;
+    float cosine = ModelParameters.x;
+    float sine = ModelParameters.y;
+    float3 worldPosition = float3(
+        localPosition.x * cosine + localPosition.z * sine,
+        localPosition.y,
+        -localPosition.x * sine + localPosition.z * cosine);
+    float3 worldNormal = normalize(float3(
+        localNormal.x * cosine + localNormal.z * sine,
+        localNormal.y,
+        -localNormal.x * sine + localNormal.z * cosine));
     VSOutput output;
-    output.position = mul(ViewProjection, worldPosition);
-    output.normal = normalize(mul((float3x3)World, localNormal));
+    output.position = mul(ViewProjection, float4(worldPosition, 1.0));
+    output.normal = worldNormal;
     output.uv = input.uv;
     return output;
 }
@@ -349,7 +378,7 @@ float4 PSMain(VSOutput input) : SV_TARGET {
             &description, nullptr, output.GetAddressOf()));
     };
     if (!createConstantBuffer(sizeof(SceneConstants), runtime.sceneBuffer) ||
-        !createConstantBuffer(sizeof(XMFLOAT4X4) * kMaxJoints,
+        !createConstantBuffer(sizeof(XMFLOAT4) * kMaxJoints * 3,
                               runtime.boneBuffer) ||
         !createConstantBuffer(sizeof(MaterialConstants),
                               runtime.materialBuffer)) {
@@ -508,7 +537,18 @@ bool UpdateBones(ID3D11DeviceContext* context, uint32_t frameIndex) {
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (FAILED(context->Map(runtime.boneBuffer.Get(), 0,
                             D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return false;
-    std::memcpy(mapped.pData, source, matrixCount * sizeof(XMFLOAT4X4));
+    // Store explicit affine rows instead of HLSL matrix values. This avoids
+    // all row/column-major packing ambiguity between glTF and D3D constant
+    // buffers, including the translation column used by skinning.
+    auto* destination = static_cast<float*>(mapped.pData);
+    for (size_t matrix = 0; matrix < matrixCount; ++matrix) {
+        for (size_t row = 0; row < 3; ++row) {
+            for (size_t column = 0; column < 4; ++column) {
+                destination[matrix * 12 + row * 4 + column] =
+                    source[matrix * 16 + column * 4 + row];
+            }
+        }
+    }
     context->Unmap(runtime.boneBuffer.Get(), 0);
     return true;
 }
@@ -578,25 +618,26 @@ bool RenderPreview3D(ID3D11Device* device, ID3D11DeviceContext* context,
         runtime.header.frameCount - 1,
         static_cast<uint32_t>(animationTime * runtime.header.fps));
 
-    const float yaw = std::sin(elapsedSeconds * 0.42f) * XMConvertToRadians(7.0f);
-    const XMMATRIX sourceToWorld = XMMatrixSet(
-        1, 0, 0, 0,
-        0, 0, -1, 0,
-        0, 1, 0, 0,
-        7, -52, 0, 1);
-    const XMMATRIX world = sourceToWorld * XMMatrixRotationY(yaw);
+    const float yaw = XM_PI +
+        std::sin(elapsedSeconds * 0.42f) * XMConvertToRadians(7.0f);
+    // VRF has already converted Source coordinates to glTF metres/Y-up.
+    // Center the 2.64 m model around the preview camera before applying the
+    // subtle showroom rotation.
+    const XMMATRIX world = XMMatrixTranslation(0.08f, -1.32f, 0.0f) *
+                           XMMatrixRotationY(yaw);
     const XMMATRIX view = XMMatrixLookAtLH(
-        XMVectorSet(0, 0, -274, 1), XMVectorZero(),
+        XMVectorSet(0, 0, -10.6f, 1), XMVectorZero(),
         XMVectorSet(0, 1, 0, 0));
     const XMMATRIX projection = XMMatrixPerspectiveFovLH(
         XMConvertToRadians(25.0f),
         static_cast<float>(kTargetWidth) / kTargetHeight, 1.0f, 1000.0f);
 
     SceneConstants scene{};
-    XMStoreFloat4x4(&scene.world, XMMatrixTranspose(world));
     XMStoreFloat4x4(&scene.viewProjection,
                     XMMatrixTranspose(view * projection));
-    scene.lightDirection = XMFLOAT4(-0.30f, -0.45f, -0.84f, 0.0f);
+    scene.lightDirection = XMFLOAT4(-0.24f, -0.42f, 0.88f, 0.0f);
+    scene.modelParameters = XMFLOAT4(std::cos(yaw), std::sin(yaw),
+                                     0.08f, -1.32f);
     if (!UpdateBuffer(context, runtime.sceneBuffer.Get(), scene) ||
         !UpdateBones(context, frameIndex)) return false;
 
@@ -682,6 +723,31 @@ bool RenderPreview3D(ID3D11Device* device, ID3D11DeviceContext* context,
     context->OMSetRenderTargets(0, nullptr, nullptr);
     BuildFrameGeometry(frameIndex, world, view, projection, frame);
     frame.texture = runtime.targetTexture.Get();
+    return true;
+}
+
+bool ReadPreview3DPixels(ID3D11DeviceContext* context,
+                         std::vector<uint8_t>& pixels,
+                         uint32_t& width, uint32_t& height,
+                         uint32_t& stride) {
+    width = kTargetWidth;
+    height = kTargetHeight;
+    stride = kTargetWidth * 4;
+    if (!context || !runtime.initialized || !runtime.targetTexture ||
+        !runtime.stagingTexture) return false;
+    context->CopyResource(runtime.stagingTexture.Get(),
+                          runtime.targetTexture.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context->Map(runtime.stagingTexture.Get(), 0,
+                            D3D11_MAP_READ, 0, &mapped))) return false;
+    pixels.resize(static_cast<size_t>(stride) * height);
+    for (uint32_t row = 0; row < height; ++row) {
+        std::memcpy(pixels.data() + static_cast<size_t>(row) * stride,
+                    static_cast<const uint8_t*>(mapped.pData) +
+                        static_cast<size_t>(row) * mapped.RowPitch,
+                    stride);
+    }
+    context->Unmap(runtime.stagingTexture.Get(), 0);
     return true;
 }
 

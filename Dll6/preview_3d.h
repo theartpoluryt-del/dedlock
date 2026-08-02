@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <vector>
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
@@ -25,4 +26,8 @@ struct Preview3DFrame {
 bool RenderPreview3D(ID3D11Device* device, ID3D11DeviceContext* context,
                      float elapsedSeconds, bool glowEnabled,
                      const float* glowColor, Preview3DFrame& frame);
+bool ReadPreview3DPixels(ID3D11DeviceContext* context,
+                         std::vector<uint8_t>& pixels,
+                         uint32_t& width, uint32_t& height,
+                         uint32_t& stride);
 void ShutdownPreview3D();
