@@ -537,20 +537,21 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
                         const float* skeletonColor, const float* healthColor,
                         const float* nameColor, const float* playerColor,
                         const float* healthValueColor) {
-    GlowRounded(Rect(x, y, x + width, y + height), 10,
+    GlowRounded(Rect(x, y, x + width, y + height), 12,
                 Color(0, 0, 0, 0.65f), 5, 2.0f);
-    FillRounded(Rect(x, y, x + width, y + height), 10,
+    FillRounded(Rect(x, y, x + width, y + height), 12,
                 Color(0.026f, 0.030f, 0.039f, 0.97f));
-    StrokeRounded(Rect(x, y, x + width, y + height), 10, Border(), 1.0f);
+    StrokeRounded(Rect(x, y, x + width, y + height), 12,
+                  Color(0.24f, 0.27f, 0.34f, 0.92f), 1.1f);
     Text(L"ESP Preview", Rect(x + 16, y + 10, x + width - 16, y + 42),
          g.semibold.Get(), White());
     Text(enabled ? presetLabel : L"ESP disabled",
          Rect(x + 16, y + 40, x + width - 16, y + 65),
          g.regular.Get(), enabled ? Muted() : Red());
 
-    const D2D1_RECT_F stage = Rect(x + 15, y + 74, x + width - 15, y + height - 16);
-    FillRounded(stage, 7, Color(0.008f, 0.010f, 0.014f, 1.0f));
-    StrokeRounded(stage, 7, Color(0.16f, 0.18f, 0.23f, 0.85f));
+    const D2D1_RECT_F stage = Rect(x + 15, y + 74, x + width - 15, y + height - 20);
+    FillRounded(stage, 10, Color(0.008f, 0.010f, 0.014f, 1.0f));
+    StrokeRounded(stage, 10, Color(0.20f, 0.23f, 0.29f, 0.92f), 1.0f);
     // Keep the character aspect ratio from the source sheet. The previous
     // crop used coordinates for a 2048px image, while the embedded reference
     // is 2515px wide; that selected half of two poses and pushed the hero out
@@ -1320,7 +1321,7 @@ void RenderD2DMenu(std::size_t playerCount) {
         float* teamHealthValueColor = g.visualTeam == 0 ? enemyHealthValueColor : teammateHealthValueColor;
         float* teamGlowColor = g.visualTeam == 0 ? enemyGlowColor : teammateGlowColor;
         bool* teamGlowEnabled = g.visualTeam == 0 ? &enemyGlowEnabled : &allyGlowEnabled;
-        DrawHeroEspPreview(1066.0f, cardTop, 348.0f, 688.0f,
+        DrawHeroEspPreview(1066.0f, cardTop, 348.0f, 650.0f,
                            g.visualTeam == 0 ? L"Enemy preset" :
                            g.visualTeam == 1 ? L"Ally preset" : L"Creep preset",
                            *teamEsp,
