@@ -9,6 +9,7 @@ using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(
 
 static OMSetRenderTargetsFn originalOMSetRenderTargets = nullptr;
 static void* omSetRenderTargetsTarget = nullptr;
+static IDXGISwapChain* overlaySwapChain = nullptr;
 
 void STDMETHODCALLTYPE hkOMSetRenderTargets(
     ID3D11DeviceContext* context, UINT numViews,
@@ -134,6 +135,7 @@ void ShutdownOverlay() {
         pDevice->Release();
         pDevice = nullptr;
     }
+    overlaySwapChain = nullptr;
 
     if (consoleAttached) {
         FreeConsole();
@@ -153,6 +155,13 @@ void RequestUnload() {
 
 HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
     if (!pSwapChain || !oPresent) return E_FAIL;
+
+    // The DXGI Present implementation is shared by every swap chain created
+    // by the process. Process only the swap chain that initialized the game
+    // overlay; running one ImGui context/RTV through auxiliary Presents gives
+    // two different render phases per game frame and visibly shakes ESP.
+    if (overlaySwapChain && pSwapChain != overlaySwapChain)
+        return oPresent(pSwapChain, SyncInterval, Flags);
 
     static bool presentMarkerWritten = false;
     if (!presentMarkerWritten) {
@@ -194,6 +203,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             pContext = nullptr;
             return oPresent(pSwapChain, SyncInterval, Flags);
         }
+        overlaySwapChain = pSwapChain;
         gameWindow = desc.OutputWindow;
         InstallDepthCaptureHook();
 
@@ -271,7 +281,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     // one coherent snapshot and update it at a bounded cadence so high-refresh
     // Present calls do not starve the render path.
     static ULONGLONG lastAssistUpdate = 0;
-    static std::vector<PlayerData> visualSnapshot;
+    std::vector<PlayerData> visualSnapshot;
     const ULONGLONG now = GetTickCount64();
     static ULONGLONG lastDepthSnapshot = 0;
     if (lastDepthSnapshot == 0 || now - lastDepthSnapshot >= 16) {
@@ -281,14 +291,9 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     }
     // Rebuild the visual snapshot on every Present so ESP positions are
     // refreshed once per rendered frame, including 144 Hz displays.
-    const std::vector<PlayerData> nextSnapshot = GetPlayers();
-    static ULONGLONG lastNonEmptySnapshot = 0;
-    if (!nextSnapshot.empty()) {
-        visualSnapshot = nextSnapshot;
-        lastNonEmptySnapshot = now;
-    } else if (lastNonEmptySnapshot == 0 || now - lastNonEmptySnapshot > 150) {
-        visualSnapshot.clear();
-    }
+    // Never retain a previous visual frame. At 144 Hz, the old 150 ms grace
+    // period could redraw the same moving position for more than 20 Presents.
+    visualSnapshot = GetPlayers();
     if (lastAssistUpdate == 0 || now - lastAssistUpdate >= 16) {
         AutoParry(visualSnapshot);
         AimAtClosestEnemy(visualSnapshot);

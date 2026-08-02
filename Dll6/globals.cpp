@@ -101,11 +101,6 @@ bool allyCreepEspEnabled = false, allyCreepBoxesEnabled = true, allyCreepCornerB
 bool allyCreepHealthEnabled = true, allyCreepHealthValuesEnabled = true, allyCreepDistanceEnabled = true;
 float allyCreepBoxColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
 float allyCreepHealthColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
-bool localEspEnabled = false, localBoxesEnabled = true, localCornerBoxesEnabled = false;
-bool localHealthEnabled = true, localHealthValuesEnabled = true, localBonesEnabled = false;
-float localBoxColor[4] = {0.20f, 0.90f, 1.00f, 1.00f};
-float localHealthColor[4] = {0.20f, 1.00f, 0.25f, 1.00f};
-
 namespace {
 std::string ConfigPath() {
     char modulePath[MAX_PATH]{};
@@ -167,12 +162,6 @@ void LoadConfig() {
         else if (key == "allyCreepHealthEnabled") allyCreepHealthEnabled = value;
         else if (key == "allyCreepHealthValuesEnabled") allyCreepHealthValuesEnabled = value;
         else if (key == "allyCreepDistanceEnabled") allyCreepDistanceEnabled = value;
-        else if (key == "localEspEnabled") localEspEnabled = value;
-        else if (key == "localBoxesEnabled") localBoxesEnabled = value;
-        else if (key == "localCornerBoxesEnabled") localCornerBoxesEnabled = value;
-        else if (key == "localHealthEnabled") localHealthEnabled = value;
-        else if (key == "localHealthValuesEnabled") localHealthValuesEnabled = value;
-        else if (key == "localBonesEnabled") localBonesEnabled = value;
         else if (key == "drawTeammates") drawTeammates = value;
         else if (key == "drawPlayerNames") drawPlayerNames = value;
         else if (key == "cornerBoxes") cornerBoxes = value;
@@ -250,14 +239,6 @@ void LoadConfig() {
         else if (key == "allyCreepHealthG") allyCreepHealthColor[1] = static_cast<float>(number);
         else if (key == "allyCreepHealthB") allyCreepHealthColor[2] = static_cast<float>(number);
         else if (key == "allyCreepHealthA") allyCreepHealthColor[3] = static_cast<float>(number);
-        else if (key == "localBoxR") localBoxColor[0] = static_cast<float>(number);
-        else if (key == "localBoxG") localBoxColor[1] = static_cast<float>(number);
-        else if (key == "localBoxB") localBoxColor[2] = static_cast<float>(number);
-        else if (key == "localBoxA") localBoxColor[3] = static_cast<float>(number);
-        else if (key == "localHealthR") localHealthColor[0] = static_cast<float>(number);
-        else if (key == "localHealthG") localHealthColor[1] = static_cast<float>(number);
-        else if (key == "localHealthB") localHealthColor[2] = static_cast<float>(number);
-        else if (key == "localHealthA") localHealthColor[3] = static_cast<float>(number);
         else if (key == "glowMode") glowMode = static_cast<int>(number);
         if (key == "drawOrbEsp") drawOrbEsp = value;
         else if (key == "drawSpectatorList") drawSpectatorList = value;
@@ -347,12 +328,6 @@ void SaveConfig() {
            << "allyCreepHealthEnabled " << allyCreepHealthEnabled << '\n'
            << "allyCreepHealthValuesEnabled " << allyCreepHealthValuesEnabled << '\n'
            << "allyCreepDistanceEnabled " << allyCreepDistanceEnabled << '\n'
-           << "localEspEnabled " << localEspEnabled << '\n'
-           << "localBoxesEnabled " << localBoxesEnabled << '\n'
-           << "localCornerBoxesEnabled " << localCornerBoxesEnabled << '\n'
-           << "localHealthEnabled " << localHealthEnabled << '\n'
-           << "localHealthValuesEnabled " << localHealthValuesEnabled << '\n'
-           << "localBonesEnabled " << localBonesEnabled << '\n'
            << "drawTeammates " << drawTeammates << '\n'
            << "drawPlayerNames " << drawPlayerNames << '\n'
            << "cornerBoxes " << cornerBoxes << '\n'
@@ -430,14 +405,6 @@ void SaveConfig() {
            << "allyCreepHealthG " << allyCreepHealthColor[1] << '\n'
            << "allyCreepHealthB " << allyCreepHealthColor[2] << '\n'
            << "allyCreepHealthA " << allyCreepHealthColor[3] << '\n'
-           << "localBoxR " << localBoxColor[0] << '\n'
-           << "localBoxG " << localBoxColor[1] << '\n'
-           << "localBoxB " << localBoxColor[2] << '\n'
-           << "localBoxA " << localBoxColor[3] << '\n'
-           << "localHealthR " << localHealthColor[0] << '\n'
-           << "localHealthG " << localHealthColor[1] << '\n'
-           << "localHealthB " << localHealthColor[2] << '\n'
-           << "localHealthA " << localHealthColor[3] << '\n'
            << "glowMode " << glowMode << '\n'
            << "drawOrbEsp " << drawOrbEsp << '\n'
            << "drawSpectatorList " << drawSpectatorList << '\n'

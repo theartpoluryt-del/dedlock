@@ -1046,7 +1046,6 @@ void RenderD2DMenu(std::size_t playerCount) {
         const D2D1_RECT_F enemy = Rect(contentX, 124, contentX + 140, 164);
         const D2D1_RECT_F ally = Rect(contentX + 146, 124, contentX + 286, 164);
         const D2D1_RECT_F creep = Rect(contentX + 292, 124, contentX + 432, 164);
-        const D2D1_RECT_F player = Rect(contentX + 438, 124, contentX + 578, 164);
         auto segment = [&](const D2D1_RECT_F& r, int value, const wchar_t* label) {
             if (Clicked(l, r)) g.visualTeam = value;
             const bool selected = g.visualTeam == value;
@@ -1066,7 +1065,6 @@ void RenderD2DMenu(std::size_t playerCount) {
         segment(enemy, 0, L"Enemy");
         segment(ally, 1, L"Ally");
         segment(creep, 2, L"Creep");
-        segment(player, 3, L"Player");
         cardTop = 190.0f;
     }
     if (g.tab == 1) {
@@ -1167,27 +1165,7 @@ void RenderD2DMenu(std::size_t playerCount) {
         float* teamHealthValueColor = g.visualTeam == 0 ? enemyHealthValueColor : teammateHealthValueColor;
         float* teamGlowColor = g.visualTeam == 0 ? enemyGlowColor : teammateGlowColor;
 
-        if (g.visualTeam == 3) {
-            DrawToggle(l, leftX, firstY, leftColorWidth, L"Local ESP",
-                       L"Visuals for your own player", &localEspEnabled);
-            if (localEspEnabled) {
-                float localY = firstY + 72;
-                DrawToggle(l, leftX, localY, leftColorWidth, L"Bounding boxes",
-                           L"Draw a box around the local player", &localBoxesEnabled, localBoxColor);
-                localY += 72;
-                if (localBoxesEnabled) {
-                    DrawToggle(l, leftX, localY, leftColorWidth, L"Corner boxes",
-                               L"Use corner-only box style", &localCornerBoxesEnabled);
-                    localY += 72;
-                }
-                DrawToggle(l, leftX, localY, leftColorWidth, L"Health bar",
-                           L"Show local health", &localHealthEnabled, localHealthColor);
-                DrawToggle(l, leftX, localY + 66, leftColorWidth, L"Health value",
-                           L"Show local health value", &localHealthValuesEnabled);
-                DrawToggle(l, leftX, localY + 132, leftColorWidth, L"Skeleton",
-                           L"Render local skeleton", &localBonesEnabled);
-            }
-        } else if (g.visualTeam == 2) {
+        if (g.visualTeam == 2) {
             DrawToggle(l, leftX, firstY, leftColorWidth, L"Creep ESP",
                        L"Highlight valid creeps", teamEsp);
             float orbY = firstY + 72;

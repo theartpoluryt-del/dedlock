@@ -175,6 +175,38 @@ bool GetEntityRenderPosition(uintptr_t entity, Vector3& position) {
     return GetEntityPosition(entity, position);
 }
 
+bool GetEntityRenderTransformPosition(uintptr_t entity, Vector3& position) {
+    position = {};
+    if (!entity) return false;
+    const uintptr_t sceneNode =
+        Read<uintptr_t>(entity + Offsets::GameSceneNode);
+    if (!sceneNode) return false;
+
+    // CGameSceneNode::m_nodeToWorld starts at +0x10 in the current layout;
+    // its CTransform position is the transform consumed by scene rendering.
+    // Unlike m_vRenderOrigin, this field is populated for hero pawns (the
+    // latter is FLT_MAX for Training Dummy in the current client).
+    constexpr uintptr_t NodeToWorldPosition = 0x10;
+    const uintptr_t address = sceneNode + NodeToWorldPosition;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const Vector3 first = Read<Vector3>(address);
+        const Vector3 second = Read<Vector3>(address);
+        if (std::memcmp(&first, &second, sizeof(first)) != 0) continue;
+        position = second;
+        return std::isfinite(position.x) &&
+               std::isfinite(position.y) &&
+               std::isfinite(position.z) &&
+               std::fabs(position.x) < 100000.0f &&
+               std::fabs(position.y) < 100000.0f &&
+               std::fabs(position.z) < 100000.0f &&
+               (std::fabs(position.x) > 0.01f ||
+                std::fabs(position.y) > 0.01f ||
+                std::fabs(position.z) > 0.01f);
+    }
+    position = {};
+    return false;
+}
+
 bool GetXpOrbPosition(uintptr_t entity, Vector3& position) {
     const uintptr_t sceneNode = Read<uintptr_t>(entity + Offsets::GameSceneNode);
     if (sceneNode) {

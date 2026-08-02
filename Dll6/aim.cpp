@@ -440,22 +440,35 @@ bool GetEntityBonePosition(uintptr_t entity, const char* boneName, Vector3& posi
     position = {};
     if (!entity || !boneName || !*boneName) return false;
     ResolveBoneFunctions();
-    if (!boneFunctions.calcWorldSpaceBones || !boneFunctions.getBoneIdByName) return false;
+    if (!boneFunctions.getBoneIdByName) return false;
 
     const uintptr_t sceneNode = Read<uintptr_t>(entity + Offsets::GameSceneNode);
     if (!sceneNode) return false;
 
     __try {
-        boneFunctions.calcWorldSpaceBones(sceneNode, 0xFFFFFu);
         const int boneIndex = boneFunctions.getBoneIdByName(entity, boneName);
         if (boneIndex < 0 || boneIndex > 512) return false;
 
         // CModelState starts at CSkeletonInstance + 0x150 and the runtime
-        // bone pointer is the first field after its 0x80-byte prefix.
+        // bone pointer is the first field after its 0x80-byte prefix. Do not
+        // call CalcWorldSpaceBones from Present: the existing array is the
+        // animation snapshot that rendered the current backbuffer, while a
+        // forced calculation rebuilds it from newer simulation state.
         const uintptr_t bones = Read<uintptr_t>(sceneNode + 0x150 + 0x80);
         if (!bones) return false;
-        position = Read<Vector3>(bones + static_cast<uintptr_t>(boneIndex) * 0x20);
-        return std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z);
+        const uintptr_t boneAddress =
+            bones + static_cast<uintptr_t>(boneIndex) * 0x20;
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            const Vector3 first = Read<Vector3>(boneAddress);
+            const Vector3 second = Read<Vector3>(boneAddress);
+            if (std::memcmp(&first, &second, sizeof(first)) != 0) continue;
+            position = second;
+            return std::isfinite(position.x) &&
+                   std::isfinite(position.y) &&
+                   std::isfinite(position.z);
+        }
+        position = {};
+        return false;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         position = {};
         return false;
@@ -466,7 +479,7 @@ bool GetEntityBoneSkeleton(uintptr_t entity, std::vector<BoneSegment>& segments)
     segments.clear();
     if (!entity) return false;
     ResolveBoneFunctions();
-    if (!boneFunctions.calcWorldSpaceBones || !boneFunctions.getBoneIdByName) return false;
+    if (!boneFunctions.getBoneIdByName) return false;
 
     const uintptr_t sceneNode = Read<uintptr_t>(entity + Offsets::GameSceneNode);
     if (!sceneNode) return false;
@@ -492,15 +505,26 @@ bool GetEntityBoneSkeleton(uintptr_t entity, std::vector<BoneSegment>& segments)
     };
 
     __try {
-        boneFunctions.calcWorldSpaceBones(sceneNode, 0xFFFFFu);
         const uintptr_t bones = Read<uintptr_t>(sceneNode + 0x150 + 0x80);
         if (!bones) return false;
 
         auto readBone = [&](const char* name, Vector3& position) {
             const int index = boneFunctions.getBoneIdByName(entity, name);
             if (index < 0 || index > 512) return false;
-            position = Read<Vector3>(bones + static_cast<uintptr_t>(index) * 0x20);
-            return std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z);
+            const uintptr_t boneAddress =
+                bones + static_cast<uintptr_t>(index) * 0x20;
+            for (int attempt = 0; attempt < 4; ++attempt) {
+                const Vector3 first = Read<Vector3>(boneAddress);
+                const Vector3 second = Read<Vector3>(boneAddress);
+                if (std::memcmp(&first, &second, sizeof(first)) != 0)
+                    continue;
+                position = second;
+                return std::isfinite(position.x) &&
+                       std::isfinite(position.y) &&
+                       std::isfinite(position.z);
+            }
+            position = {};
+            return false;
         };
 
         for (const auto& pair : pairs) {
@@ -1243,6 +1267,71 @@ Vector3 cachedVisibleAimVelocity{};
 ULONGLONG cachedVisibleAimAt = 0;
 bool cachedVisibleAimReady = false;
 
+struct AimMotionState {
+    Vector3 sample{};
+    Vector3 velocity{};
+    ULONGLONG sampleAt{};
+    ULONGLONG observedAt{};
+    bool initialized{};
+};
+
+std::unordered_map<uintptr_t, AimMotionState> aimMotionStates;
+
+Vector3 MeasureAimTargetVelocity(uintptr_t entity, const Vector3& position,
+                                 ULONGLONG now) {
+    if (!entity || !std::isfinite(position.x) ||
+        !std::isfinite(position.y) || !std::isfinite(position.z))
+        return {};
+
+    auto& state = aimMotionStates[entity];
+    state.observedAt = now;
+    if (!state.initialized) {
+        state.sample = position;
+        state.sampleAt = now;
+        state.initialized = true;
+        return {};
+    }
+
+    const Vector3 delta{position.x - state.sample.x,
+                        position.y - state.sample.y,
+                        position.z - state.sample.z};
+    const float distanceSquared = delta.x * delta.x +
+        delta.y * delta.y + delta.z * delta.z;
+    // AbsOrigin can stay unchanged for several Presents. Measure only on an
+    // actual simulation publication so zero duplicate samples do not pull the
+    // estimated velocity toward zero between ticks.
+    if (std::isfinite(distanceSquared) && distanceSquared > 0.0001f) {
+        const ULONGLONG elapsedMs = now - state.sampleAt;
+        if (elapsedMs >= 2 && elapsedMs <= 150 &&
+            distanceSquared <= 256.0f * 256.0f) {
+            const float inverseSeconds = 1000.0f /
+                static_cast<float>(elapsedMs);
+            const Vector3 measured{delta.x * inverseSeconds,
+                                   delta.y * inverseSeconds,
+                                   delta.z * inverseSeconds};
+            const float measuredSpeedSquared = measured.x * measured.x +
+                measured.y * measured.y + measured.z * measured.z;
+            if (std::isfinite(measuredSpeedSquared) &&
+                measuredSpeedSquared <= 2500.0f * 2500.0f) {
+                const float alpha = state.sampleAt == 0 ? 1.0f : 0.45f;
+                state.velocity.x +=
+                    (measured.x - state.velocity.x) * alpha;
+                state.velocity.y +=
+                    (measured.y - state.velocity.y) * alpha;
+                state.velocity.z +=
+                    (measured.z - state.velocity.z) * alpha;
+            }
+        } else {
+            state.velocity = {};
+        }
+        state.sample = position;
+        state.sampleAt = now;
+    } else if (now - state.sampleAt > 150) {
+        state.velocity = {};
+    }
+    return state.velocity;
+}
+
 bool RollHitchance() {
     if (aimHitchance >= 99.99f) return true;
     if (aimHitchance <= 0.01f) return false;
@@ -1375,8 +1464,32 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         for (int candidateIndex = 0; candidateIndex < candidateCount; ++candidateIndex) {
             Vector3 point = candidates[candidateIndex].point;
             Vector3 historicalPoint{};
-            if (GetBacktrackedPoint(player.entity, aimTargetMode, now, historicalPoint))
+            const bool usingBacktrack = GetBacktrackedPoint(
+                player.entity, aimTargetMode, now, historicalPoint);
+            if (usingBacktrack) {
                 point = historicalPoint;
+            } else if (candidates[candidateIndex].bone &&
+                       player.hasVisualAnchor) {
+                // Bones belong to the interpolated render snapshot, while
+                // player.pos is the latest simulation origin. Preserve the
+                // rendered pose but move it onto the current pawn origin so
+                // aim does not trail a running target by one interpolation
+                // interval. Backtrack points intentionally remain historical.
+                const Vector3 originDelta{
+                    player.pos.x - player.visualAnchor.x,
+                    player.pos.y - player.visualAnchor.y,
+                    player.pos.z - player.visualAnchor.z};
+                const float deltaSquared =
+                    originDelta.x * originDelta.x +
+                    originDelta.y * originDelta.y +
+                    originDelta.z * originDelta.z;
+                if (std::isfinite(deltaSquared) &&
+                    deltaSquared <= 128.0f * 128.0f) {
+                    point.x += originDelta.x;
+                    point.y += originDelta.y;
+                    point.z += originDelta.z;
+                }
+            }
             Vector2 aimScreen{};
             if (!GetWorldAimPointScreen(point, aimScreen)) continue;
             const float dx = aimScreen.x - cx;
@@ -1445,8 +1558,22 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     // attack button is held, pSilent is applied in addition to it.
     const bool visibleMouseAim = aimNormalActive || aimMixedMode;
     cachedVisibleAimPoint = bestAimPoint;
-    cachedVisibleAimVelocity = Read<Vector3>(
-        best->entity + Offsets::Velocity);
+    // Use the live engine velocity when available. The position-delta
+    // estimator is intentionally retained as a fallback for entities whose
+    // velocity field is unavailable, but it lags badly when a target starts
+    // sprinting and makes the camera trail behind the target.
+    const Vector3 measuredVelocity = MeasureAimTargetVelocity(
+        best->entity, best->pos, now);
+    const float engineVelocitySquared =
+        best->velocity.x * best->velocity.x +
+        best->velocity.y * best->velocity.y +
+        best->velocity.z * best->velocity.z;
+    const bool haveEngineVelocity =
+        std::isfinite(engineVelocitySquared) &&
+        engineVelocitySquared > 1.0f &&
+        engineVelocitySquared <= 2500.0f * 2500.0f;
+    cachedVisibleAimVelocity = haveEngineVelocity
+        ? best->velocity : measuredVelocity;
     if (!std::isfinite(cachedVisibleAimVelocity.x) ||
         !std::isfinite(cachedVisibleAimVelocity.y) ||
         !std::isfinite(cachedVisibleAimVelocity.z)) {
@@ -1454,7 +1581,18 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     }
     cachedVisibleAimAt = now;
     cachedVisibleAimReady = visibleMouseAim;
-    if (visibleMouseAim || silentPass) {
+
+    for (auto it = aimMotionStates.begin(); it != aimMotionStates.end();) {
+        if (now - it->second.observedAt > 2000)
+            it = aimMotionStates.erase(it);
+        else
+            ++it;
+    }
+    // Normal aim is applied by UpdateVisibleAimCamera/camera hook. Do not
+    // also publish the same target through CreateMove: applying both paths
+    // fights over the view angles and makes the camera and ESP oscillate.
+    // Mixed keeps the input-angle path only for its silent attack pass.
+    if (silentPass) {
         Vector3 commandAngles{};
         const bool haveCommandAngles =
             GetAimAnglesFromScreen(targetX, targetY, commandAngles);
@@ -1488,16 +1626,66 @@ void UpdateVisibleAimCamera() {
         return;
     }
     Vector3 predictedPoint = cachedVisibleAimPoint;
-    if (cachedVisibleAimAt != 0) {
+    if (cachedVisibleAimAt != 0 && !aimBacktrack) {
         const ULONGLONG ageMs = (std::min)(
             GetTickCount64() - cachedVisibleAimAt,
             static_cast<ULONGLONG>(32));
         const float ageSeconds = static_cast<float>(ageMs) * 0.001f;
-        predictedPoint.x += cachedVisibleAimVelocity.x * ageSeconds;
-        predictedPoint.y += cachedVisibleAimVelocity.y * ageSeconds;
-        predictedPoint.z += cachedVisibleAimVelocity.z * ageSeconds;
+        const auto smoothingDelay = [](float value) {
+            // FlushCurrentCameraAim uses this exact exponential response. A
+            // first-order tracker follows a constant-velocity target behind
+            // by velocity/rate, so feed that delay forward into the target.
+            const float divisor = (std::max)(1.0f, value);
+            const float retention =
+                (std::max)(0.001f, 1.0f - 1.0f / divisor);
+            const float rate = -std::log(retention) * 60.0f;
+            return rate > 0.001f
+                ? (std::min)(1.0f / rate, 0.250f) : 0.0f;
+        };
+        const float horizontalLead =
+            ageSeconds + smoothingDelay(aimYawSmooth);
+        const float verticalLead =
+            ageSeconds + smoothingDelay(aimPitchSmooth);
+        predictedPoint.x += cachedVisibleAimVelocity.x * horizontalLead;
+        predictedPoint.y += cachedVisibleAimVelocity.y * horizontalLead;
+        predictedPoint.z += cachedVisibleAimVelocity.z * verticalLead;
     }
-    ApplyCurrentCameraAim(predictedPoint);
+
+    // Bone/render snapshots are not published atomically with the camera
+    // snapshot. With low aim smoothing, feeding every tiny snapshot change
+    // straight into the camera creates visible micro-oscillation and makes
+    // ESP appear to shake on the target. Filter only this measurement noise;
+    // the user-selected angular smoothing below still controls responsiveness.
+    static Vector3 filteredPoint{};
+    static bool filteredPointReady = false;
+    static std::chrono::steady_clock::time_point filteredAt{};
+    const auto filterNow = std::chrono::steady_clock::now();
+    float filterDelta = filteredAt.time_since_epoch().count() == 0
+        ? (1.0f / 60.0f)
+        : std::chrono::duration<float>(filterNow - filteredAt).count();
+    filteredAt = filterNow;
+    if (!std::isfinite(filterDelta) || filterDelta <= 0.0f ||
+        filterDelta > 0.100f)
+        filterDelta = 1.0f / 60.0f;
+    const float filterDx = predictedPoint.x - filteredPoint.x;
+    const float filterDy = predictedPoint.y - filteredPoint.y;
+    const float filterDz = predictedPoint.z - filteredPoint.z;
+    const float filterDistanceSquared =
+        filterDx * filterDx + filterDy * filterDy + filterDz * filterDz;
+    // A target switch/teleport must not be dragged through the old target.
+    if (!filteredPointReady || !std::isfinite(filterDistanceSquared) ||
+        filterDistanceSquared > 256.0f * 256.0f) {
+        filteredPoint = predictedPoint;
+        filteredPointReady = true;
+    } else {
+        constexpr float filterTimeConstant = 0.018f;
+        const float alpha = 1.0f -
+            std::exp(-filterDelta / filterTimeConstant);
+        filteredPoint.x += filterDx * alpha;
+        filteredPoint.y += filterDy * alpha;
+        filteredPoint.z += filterDz * alpha;
+    }
+    ApplyCurrentCameraAim(filteredPoint);
 }
 
 namespace {
