@@ -1,5 +1,6 @@
 #include "shared.h"
 #include "menu_d2d.h"
+#include "preview_3d.h"
 #include "resource.h"
 
 #include <d2d1.h>
@@ -7,6 +8,7 @@
 #include <wincodec.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cwchar>
 #include <string>
@@ -30,6 +32,10 @@ struct Renderer {
     ComPtr<ID2D1RenderTarget> target;
     ComPtr<ID2D1Bitmap> logoBitmap;
     ComPtr<ID2D1Bitmap> previewHeroBitmap;
+    ComPtr<ID2D1Bitmap> preview3dBitmap;
+    ComPtr<ID3D11Texture2D> preview3dTexture;
+    Preview3DFrame preview3dFrame{};
+    bool preview3dActive = false;
     ComPtr<ID2D1Bitmap> tabIcons[4];
     ComPtr<ID2D1Bitmap> sceneBitmap;
     ComPtr<ID2D1BitmapRenderTarget> blurTarget;
@@ -560,17 +566,30 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
     // feet, and the box/health bar on both sides. The preview itself is scaled
     // down with the menu, so small design-space margins were disappearing at
     // common 1080p resolutions.
-    const float modelTop = y + 158.0f;
-    const float modelBottom = y + height - 72.0f;
-    const float modelHeight = modelBottom - modelTop;
-    constexpr float sourceAspect = 515.0f / 1140.0f;
-    const float modelHalfWidth = modelHeight * sourceAspect * 0.5f;
     const float previewCenterX = x + width * 0.5f;
-    const D2D1_RECT_F modelRect = Rect(previewCenterX - modelHalfWidth,
-                                       modelTop,
-                                       previewCenterX + modelHalfWidth,
-                                       modelBottom);
-    if (g.previewHeroBitmap) {
+    D2D1_RECT_F modelRect{};
+    const D2D1_RECT_F renderRect = Rect(stage.left + 2.0f, stage.top + 2.0f,
+                                        stage.right - 2.0f, stage.bottom - 2.0f);
+    if (g.preview3dActive && g.preview3dBitmap) {
+        g.target->DrawBitmap(g.preview3dBitmap.Get(), renderRect, 1.0f,
+                             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        const float renderWidth = renderRect.right - renderRect.left;
+        const float renderHeight = renderRect.bottom - renderRect.top;
+        modelRect = Rect(
+            renderRect.left + g.preview3dFrame.left * renderWidth,
+            renderRect.top + g.preview3dFrame.top * renderHeight,
+            renderRect.left + g.preview3dFrame.right * renderWidth,
+            renderRect.top + g.preview3dFrame.bottom * renderHeight);
+    } else {
+        const float modelTop = y + 158.0f;
+        const float modelBottom = y + height - 72.0f;
+        const float modelHeight = modelBottom - modelTop;
+        constexpr float sourceAspect = 515.0f / 1140.0f;
+        const float modelHalfWidth = modelHeight * sourceAspect * 0.5f;
+        modelRect = Rect(previewCenterX - modelHalfWidth, modelTop,
+                         previewCenterX + modelHalfWidth, modelBottom);
+    }
+    if (!g.preview3dActive && g.previewHeroBitmap) {
         // Front view from the in-game Infernus model reference sheet.
         g.target->DrawBitmap(g.previewHeroBitmap.Get(), modelRect, 1.0f,
             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
@@ -606,7 +625,32 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
         FillRounded(Rect(left - 10, top, left - 5, bottom), 2, Color(0.10f, 0.11f, 0.14f));
         FillRounded(Rect(left - 10, top + 54, left - 5, bottom), 2, hp);
     }
-    if (skeleton) {
+    if (skeleton && g.preview3dActive) {
+        const float renderWidth = renderRect.right - renderRect.left;
+        const float renderHeight = renderRect.bottom - renderRect.top;
+        std::array<D2D1_POINT_2F, 18> points{};
+        for (size_t i = 0; i < points.size(); ++i) {
+            points[i] = D2D1::Point2F(
+                renderRect.left + g.preview3dFrame.skeleton[i].x * renderWidth,
+                renderRect.top + g.preview3dFrame.skeleton[i].y * renderHeight);
+        }
+        static constexpr int segments[][2]{
+            {0, 1}, {1, 2}, {2, 11},
+            {2, 3}, {3, 4}, {4, 5}, {5, 6},
+            {2, 7}, {7, 8}, {8, 9}, {9, 10},
+            {11, 12}, {12, 13}, {13, 14},
+            {11, 15}, {15, 16}, {16, 17},
+        };
+        for (const auto& segment : segments) {
+            if (g.preview3dFrame.skeleton[segment[0]].visible &&
+                g.preview3dFrame.skeleton[segment[1]].visible) {
+                Line(points[segment[0]], points[segment[1]], bones, 1.4f);
+            }
+        }
+        SetBrush(bones);
+        g.target->DrawEllipse(D2D1::Ellipse(points[0], 8.0f, 10.0f),
+                              g.brush.Get(), 1.3f);
+    } else if (skeleton) {
         const float bodyHeight = bottom - top;
         const float head = top + bodyHeight * 0.055f;
         const float neck = top + bodyHeight * 0.12f;
@@ -835,6 +879,29 @@ void LoadEmbeddedAssets() {
         LoadEmbeddedBitmap(iconIds[i], g.tabIcons[i]);
 }
 
+bool BindPreview3DFrame(const Preview3DFrame& frame) {
+    if (!frame.texture || !g.target || g.softwareTarget) return false;
+    if (g.preview3dTexture.Get() != frame.texture || !g.preview3dBitmap) {
+        g.preview3dBitmap.Reset();
+        g.preview3dTexture.Reset();
+        ComPtr<IDXGISurface> surface;
+        if (FAILED(frame.texture->QueryInterface(
+                IID_PPV_ARGS(surface.GetAddressOf())))) return false;
+        const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                              D2D1_ALPHA_MODE_PREMULTIPLIED),
+            96.0f, 96.0f);
+        if (FAILED(g.target->CreateSharedBitmap(
+                __uuidof(IDXGISurface), surface.Get(), &properties,
+                g.preview3dBitmap.GetAddressOf()))) {
+            return false;
+        }
+        g.preview3dTexture = frame.texture;
+    }
+    g.preview3dFrame = frame;
+    return true;
+}
+
 bool PrepareBackgroundBlur(UINT width, UINT height) {
     if (!width || !height || !g.target) return false;
     if (!g.sceneBitmap || g.blurSourceSize.width != width ||
@@ -883,6 +950,10 @@ void ResetTarget() {
     g.menuLayer.Reset();
     g.logoBitmap.Reset();
     g.previewHeroBitmap.Reset();
+    g.preview3dBitmap.Reset();
+    g.preview3dTexture.Reset();
+    g.preview3dFrame = {};
+    g.preview3dActive = false;
     for (auto& icon : g.tabIcons) icon.Reset();
     g.blurBitmap.Reset();
     g.blurTarget.Reset();
@@ -1116,6 +1187,22 @@ void RenderD2DMenu(std::size_t playerCount) {
     const bool blurReady = !g.softwareTarget && PrepareBackgroundBlur(
         static_cast<UINT>(io.DisplaySize.x),
         static_cast<UINT>(io.DisplaySize.y));
+    g.preview3dActive = false;
+    if (!g.softwareTarget && g.tab == 0 && pDevice && pContext) {
+        static const ULONGLONG previewStart = GetTickCount64();
+        Preview3DFrame previewFrame{};
+        const float previewTime = static_cast<float>(
+            GetTickCount64() - previewStart) * 0.001f;
+        const bool previewGlowEnabled =
+            g.visualTeam == 0 ? enemyEspEnabled && enemyGlowEnabled :
+            g.visualTeam == 1 ? allyEspEnabled && allyGlowEnabled : false;
+        const float* previewGlowColor =
+            g.visualTeam == 0 ? enemyGlowColor : teammateGlowColor;
+        if (RenderPreview3D(pDevice, pContext, previewTime,
+                            previewGlowEnabled, previewGlowColor,
+                            previewFrame))
+            g.preview3dActive = BindPreview3DFrame(previewFrame);
+    }
     g.target->BeginDraw();
     g.target->SetTransform(D2D1::Matrix3x2F::Identity());
     if (g.softwareTarget)
@@ -1674,6 +1761,7 @@ void RenderD2DMenu(std::size_t playerCount) {
 }
 
 void ShutdownD2DMenu() {
+    ShutdownPreview3D();
     ResetTarget();
     g.regular.Reset();
     g.medium.Reset();
