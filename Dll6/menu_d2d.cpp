@@ -560,8 +560,16 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
     // feet, and the box/health bar on both sides. The preview itself is scaled
     // down with the menu, so small design-space margins were disappearing at
     // common 1080p resolutions.
-    const D2D1_RECT_F modelRect = Rect(x + 65, y + 130,
-                                       x + width - 65, y + height - 75);
+    const float modelTop = y + 165.0f;
+    const float modelBottom = y + height - 80.0f;
+    const float modelHeight = modelBottom - modelTop;
+    constexpr float sourceAspect = 515.0f / 1140.0f;
+    const float modelHalfWidth = modelHeight * sourceAspect * 0.5f;
+    const float previewCenterX = x + width * 0.5f;
+    const D2D1_RECT_F modelRect = Rect(previewCenterX - modelHalfWidth,
+                                       modelTop,
+                                       previewCenterX + modelHalfWidth,
+                                       modelBottom);
     if (g.previewHeroBitmap) {
         // Front view from the in-game Infernus model reference sheet.
         g.target->DrawBitmap(g.previewHeroBitmap.Get(), modelRect, 1.0f,
@@ -570,10 +578,10 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
     }
     if (!enabled) return;
 
-    const float left = modelRect.left + 10.0f;
-    const float right = modelRect.right - 10.0f;
-    const float top = modelRect.top + 11.0f;
-    const float bottom = modelRect.bottom - 11.0f;
+    const float left = modelRect.left + 7.0f;
+    const float right = modelRect.right - 7.0f;
+    const float top = modelRect.top + 8.0f;
+    const float bottom = modelRect.bottom - 8.0f;
     const float cx = (left + right) * 0.5f;
     const D2D1_COLOR_F box = Color(boxColor[0], boxColor[1], boxColor[2]);
     const D2D1_COLOR_F bones = Color(skeletonColor[0], skeletonColor[1], skeletonColor[2]);
@@ -599,34 +607,40 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
         FillRounded(Rect(left - 10, top + 54, left - 5, bottom), 2, hp);
     }
     if (skeleton) {
-        const float head = top + 34.0f;
-        const float neck = top + 67.0f;
-        const float shoulders = top + 105.0f;
-        const float hips = top + 285.0f;
-        const float knees = top + 405.0f;
+        const float bodyHeight = bottom - top;
+        const float head = top + bodyHeight * 0.055f;
+        const float neck = top + bodyHeight * 0.12f;
+        const float shoulders = top + bodyHeight * 0.21f;
+        const float hips = top + bodyHeight * 0.52f;
+        const float knees = top + bodyHeight * 0.76f;
         SetBrush(bones);
         g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, head), 10, 13),
                               g.brush.Get(), 1.3f);
         Line(D2D1::Point2F(cx, head + 13), D2D1::Point2F(cx, neck), bones, 1.4f);
         Line(D2D1::Point2F(cx, neck), D2D1::Point2F(cx, hips), bones, 1.4f);
-        Line(D2D1::Point2F(cx, shoulders), D2D1::Point2F(left + 27, top + 205), bones, 1.4f);
-        Line(D2D1::Point2F(cx, shoulders), D2D1::Point2F(right - 27, top + 205), bones, 1.4f);
-        Line(D2D1::Point2F(cx, hips), D2D1::Point2F(cx - 32, knees), bones, 1.4f);
-        Line(D2D1::Point2F(cx - 32, knees), D2D1::Point2F(cx - 35, bottom), bones, 1.4f);
-        Line(D2D1::Point2F(cx, hips), D2D1::Point2F(cx + 32, knees), bones, 1.4f);
-        Line(D2D1::Point2F(cx + 32, knees), D2D1::Point2F(cx + 35, bottom), bones, 1.4f);
+        Line(D2D1::Point2F(cx, shoulders),
+             D2D1::Point2F(left + 10, top + bodyHeight * 0.42f), bones, 1.4f);
+        Line(D2D1::Point2F(cx, shoulders),
+             D2D1::Point2F(right - 10, top + bodyHeight * 0.42f), bones, 1.4f);
+        const float legSpread = (right - left) * 0.23f;
+        Line(D2D1::Point2F(cx, hips), D2D1::Point2F(cx - legSpread, knees), bones, 1.4f);
+        Line(D2D1::Point2F(cx - legSpread, knees),
+             D2D1::Point2F(cx - legSpread, bottom), bones, 1.4f);
+        Line(D2D1::Point2F(cx, hips), D2D1::Point2F(cx + legSpread, knees), bones, 1.4f);
+        Line(D2D1::Point2F(cx + legSpread, knees),
+             D2D1::Point2F(cx + legSpread, bottom), bones, 1.4f);
     }
-    float labelY = top - 46.0f;
+    float labelY = y + 86.0f;
     if (heroName) {
         Text(L"Infernus", Rect(left - 20, labelY, right + 20, labelY + 24),
              g.centered.Get(), Color(nameColor[0], nameColor[1], nameColor[2]));
-        labelY += 22.0f;
+        labelY += 23.0f;
     }
     if (playerName)
         Text(L"Player", Rect(left - 20, labelY, right + 20, labelY + 24),
              g.centered.Get(), Color(playerColor[0], playerColor[1], playerColor[2]));
     if (healthValue)
-        Text(L"658 / 830", Rect(cx - 55, top + 6, cx + 55, top + 28),
+        Text(L"658 / 830", Rect(cx - 55, y + 134, cx + 55, y + 157),
              g.centered.Get(), Color(healthValueColor[0], healthValueColor[1], healthValueColor[2]));
     if (distance)
         Text(L"12m", Rect(cx - 35, bottom + 2, cx + 35, bottom + 26),
@@ -1245,7 +1259,7 @@ void RenderD2DMenu(std::size_t playerCount) {
 
     const bool visualEditor = g.tab == 0;
     const D2D1_RECT_F cardRect = Rect(334, cardTop,
-                                      visualEditor ? 1048.0f : 1414.0f, 818);
+                                      visualEditor ? 990.0f : 1414.0f, 818);
     GlowRounded(cardRect, 10, Color(0, 0, 0, 0.64f), 5, 2.0f);
     GradientRounded(cardRect, 10, Color(0.098f, 0.112f, 0.148f, 0.68f),
                     Color(0.105f, 0.116f, 0.154f, 0.71f), true);
@@ -1263,10 +1277,10 @@ void RenderD2DMenu(std::size_t playerCount) {
     if (!visualEditor)
         Line(D2D1::Point2F(875, cardTop + 58), D2D1::Point2F(875, 772), Border());
 
-    const float leftX = visualEditor ? 366.0f : 392.0f;
-    const float rightX = visualEditor ? 700.0f : 908.0f;
-    const float leftColumnWidth = visualEditor ? 312.0f : 449.0f;
-    const float rightColumnWidth = visualEditor ? 312.0f : 462.0f;
+    const float leftX = visualEditor ? 350.0f : 392.0f;
+    const float rightX = visualEditor ? 660.0f : 908.0f;
+    const float leftColumnWidth = visualEditor ? 288.0f : 449.0f;
+    const float rightColumnWidth = visualEditor ? 308.0f : 462.0f;
     const float leftColorWidth = leftColumnWidth;
     const float rightColorWidth = rightColumnWidth;
     const float columnWidth = leftColumnWidth;
@@ -1321,7 +1335,7 @@ void RenderD2DMenu(std::size_t playerCount) {
         float* teamHealthValueColor = g.visualTeam == 0 ? enemyHealthValueColor : teammateHealthValueColor;
         float* teamGlowColor = g.visualTeam == 0 ? enemyGlowColor : teammateGlowColor;
         bool* teamGlowEnabled = g.visualTeam == 0 ? &enemyGlowEnabled : &allyGlowEnabled;
-        DrawHeroEspPreview(1066.0f, cardTop, 348.0f, 650.0f,
+        DrawHeroEspPreview(1008.0f, cardTop, 406.0f, 650.0f,
                            g.visualTeam == 0 ? L"Enemy preset" :
                            g.visualTeam == 1 ? L"Ally preset" : L"Creep preset",
                            *teamEsp,
