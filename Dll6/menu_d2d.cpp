@@ -1201,10 +1201,9 @@ void RenderD2DMenu(std::size_t playerCount) {
                            L"Show distance to allied creep", &allyCreepDistanceEnabled);
             }
         } else {
-        if (*teamEsp) {
-
         DrawToggle(l, leftX, firstY, leftColumnWidth, L"Enable ESP",
                    L"Master overlay switch", teamEsp);
+        if (*teamEsp) {
         DrawToggle(l, leftX, firstY + 72, leftColorWidth, L"Bounding boxes",
                    L"Draw boxes around enemies", teamBoxes, teamBoxColor);
         if (*teamBoxes) {
