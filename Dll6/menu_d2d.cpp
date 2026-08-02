@@ -1305,7 +1305,8 @@ void RenderD2DMenu(std::size_t playerCount) {
     g.rightContentBottom = viewportTop;
 
     g.target->PushAxisAlignedClip(
-        Rect(334.0f, visualEditor ? cardTop : viewportTop, 1414.0f, 818.0f),
+        Rect(334.0f, visualEditor ? cardTop : viewportTop, 1414.0f,
+             visualEditor ? kDesignHeight : 818.0f),
         D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
     if (g.tab == 0) {
@@ -1335,7 +1336,7 @@ void RenderD2DMenu(std::size_t playerCount) {
         float* teamHealthValueColor = g.visualTeam == 0 ? enemyHealthValueColor : teammateHealthValueColor;
         float* teamGlowColor = g.visualTeam == 0 ? enemyGlowColor : teammateGlowColor;
         bool* teamGlowEnabled = g.visualTeam == 0 ? &enemyGlowEnabled : &allyGlowEnabled;
-        DrawHeroEspPreview(1008.0f, cardTop, 406.0f, 600.0f,
+        DrawHeroEspPreview(1008.0f, cardTop, 406.0f, 688.0f,
                            g.visualTeam == 0 ? L"Enemy preset" :
                            g.visualTeam == 1 ? L"Ally preset" : L"Creep preset",
                            *teamEsp,
