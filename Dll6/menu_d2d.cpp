@@ -555,8 +555,12 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
     // crop used coordinates for a 2048px image, while the embedded reference
     // is 2515px wide; that selected half of two poses and pushed the hero out
     // of the preview window.
-    const D2D1_RECT_F modelRect = Rect(x + 55, y + 110,
-                                       x + width - 55, y + height - 40);
+    // Reserve visible padding for labels above the head, distance below the
+    // feet, and the box/health bar on both sides. The preview itself is scaled
+    // down with the menu, so small design-space margins were disappearing at
+    // common 1080p resolutions.
+    const D2D1_RECT_F modelRect = Rect(x + 65, y + 130,
+                                       x + width - 65, y + height - 75);
     if (g.previewHeroBitmap) {
         // Front view from the in-game Infernus model reference sheet.
         g.target->DrawBitmap(g.previewHeroBitmap.Get(), modelRect, 1.0f,
