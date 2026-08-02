@@ -756,6 +756,27 @@ bool InstallModelGlowHook() {
             LogGlowHook("client PlayerOutline pattern not found or hook failed");
         }
     }
+
+    if (!drawModelTarget) {
+        HMODULE client = GetModuleHandleA("client.dll");
+        const uintptr_t drawCandidate = client
+            ? FindPattern(client, DrawModelPattern) : 0;
+        if (drawCandidate && InstallContextHook(
+                drawModelTarget,
+                reinterpret_cast<void*>(drawCandidate),
+                reinterpret_cast<void*>(&HookDrawModel),
+                originalDrawModel)) {
+            LogGlowHook("SceneSystem DrawModel hook installed");
+        } else {
+            LogGlowHook("SceneSystem DrawModel pattern not found or hook failed");
+        }
+    }
+
+    if (pContext && InstallDrawHooks())
+        LogGlowHook("D3D model glow draw hooks installed");
+    else
+        LogGlowHook("D3D model glow draw hooks unavailable");
+
     if (!playerHealthGlowRenderTarget) {
         HMODULE client = GetModuleHandleA("client.dll");
         const uintptr_t renderCandidate = client
