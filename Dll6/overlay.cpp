@@ -274,32 +274,29 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    // Keep a depth snapshot for visibility. The current physics filter can
-    // report a clear ray for world geometry, while the depth buffer still
-    // gives a reliable screen-space occlusion result.
-    // Entity discovery and assist logic are heavier than ImGui drawing. Keep
-    // one coherent snapshot and update it at a bounded cadence so high-refresh
-    // Present calls do not starve the render path.
-    static ULONGLONG lastAssistUpdate = 0;
+    // Copy and map the game depth buffer before sampling camera/entity state.
+    // Besides visibility data, the blocking D3D11_MAP_READ is the frame fence
+    // that made the c3d7f8ff build perfectly stable: it prevents ESP from
+    // combining a completed backbuffer with transforms from the next update.
+    // This must run on every primary-swap-chain Present, including 144 Hz.
+    static ULONGLONG lastAuxiliaryUpdate = 0;
     std::vector<PlayerData> visualSnapshot;
     const ULONGLONG now = GetTickCount64();
-    static ULONGLONG lastDepthSnapshot = 0;
-    if (lastDepthSnapshot == 0 || now - lastDepthSnapshot >= 16) {
-        CaptureDepthSnapshot();
-        ArmGameDepthCapture();
-        lastDepthSnapshot = now;
-    }
+    CaptureDepthSnapshot();
+    ArmGameDepthCapture();
     // Rebuild the visual snapshot on every Present so ESP positions are
     // refreshed once per rendered frame, including 144 Hz displays.
     // Never retain a previous visual frame. At 144 Hz, the old 150 ms grace
     // period could redraw the same moving position for more than 20 Presents.
     visualSnapshot = GetPlayers();
-    if (lastAssistUpdate == 0 || now - lastAssistUpdate >= 16) {
+    // Human aim follows the same coherent visual sample every render frame.
+    // A fixed 16 ms acquisition gate visibly stair-steps on 120/144/240 Hz.
+    AimAtClosestEnemy(visualSnapshot);
+    if (lastAuxiliaryUpdate == 0 || now - lastAuxiliaryUpdate >= 16) {
         AutoParry(visualSnapshot);
-        AimAtClosestEnemy(visualSnapshot);
         FarmAimAssist(visualSnapshot);
         AutoLastHitOrbs();
-        lastAssistUpdate = now;
+        lastAuxiliaryUpdate = now;
     }
     RenderESP(visualSnapshot);
     // Target acquisition and visibility tracing are bounded above. Camera

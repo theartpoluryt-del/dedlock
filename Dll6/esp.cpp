@@ -2066,12 +2066,14 @@ void RenderESP(const std::vector<PlayerData>& players) {
             continue;
         }
 
-        float frameLeft{}, frameTop{}, frameRight{}, frameBottom{};
-        if (!StabilizeEspScreenBox(
-                player.entity, rawFrameLeft, rawFrameTop,
-                rawFrameRight, rawFrameBottom,
-                frameLeft, frameTop, frameRight, frameBottom))
-            continue;
+        // The visual snapshot is now fenced to the completed game frame.
+        // Draw its exact projection. The previous screen-space correction was
+        // compensating for mixed-frame samples and made the box trail behind
+        // the rendered model even after the source data became coherent.
+        const float frameLeft = rawFrameLeft;
+        const float frameTop = rawFrameTop;
+        const float frameRight = rawFrameRight;
+        const float frameBottom = rawFrameBottom;
         const float rawCenterX =
             (rawFrameLeft + rawFrameRight) * 0.5f;
         const float screenX = (frameLeft + frameRight) * 0.5f;
