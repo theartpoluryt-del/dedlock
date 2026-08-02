@@ -233,6 +233,17 @@ __int64 __fastcall HookPlayerOutline(
         if (!validTeam || !teamGlowEnabled)
             return originalResult;
         const float* glowColor = ally ? teammateGlowColor : enemyGlowColor;
+
+        // The legacy glow worker is intentionally disabled. Keep the
+        // per-model CGlowProperty state synchronized at the point where the
+        // client asks for the outline; otherwise Normal fill inherits the
+        // previous HP-based state even though the UI mode changed.
+        const uintptr_t glow = static_cast<uintptr_t>(pawn) + Offsets::Glow;
+        Write<int>(glow + Offsets::GlowType, glowMode == 1 ? 2 : 1);
+        Write<float>(glow + Offsets::GlowTime, glowMode == 1 ? 0.0f : 1.0f);
+        Write<float>(glow + Offsets::GlowStartTime, 0.0f);
+        Write<bool>(glow + Offsets::GlowEligible, true);
+        Write<bool>(glow + Offsets::IsGlowing, true);
         float adjusted[4] = {
             glowColor[0], glowColor[1], glowColor[2], glowColor[3]};
         if (color) *color = GlowPackedColor(adjusted);
