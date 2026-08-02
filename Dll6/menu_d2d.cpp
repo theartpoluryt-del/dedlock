@@ -1322,10 +1322,12 @@ void RenderD2DMenu(std::size_t playerCount) {
                  DrawSlider(l, leftX, firstY + 256, columnWidth, L"Smoothing",
                             &farmAimSmooth, 1.0f, 20.0f, L"%.1f");
              }
-             DrawToggle(l, rightX, firstY, columnWidth, L"Farm FOV circle",
+             const float farmCircleY = (!farmSilentMode || farmMixedMode)
+                 ? firstY + 328.0f : firstY + 194.0f;
+             DrawToggle(l, leftX, farmCircleY, columnWidth, L"Farm FOV circle",
                         L"Show the creep aim radius", &drawFarmFovCircle);
              if (drawFarmFovCircle)
-                 DrawSlider(l, rightX, firstY + 72, columnWidth, L"FOV opacity",
+                 DrawSlider(l, leftX, farmCircleY + 72, columnWidth, L"FOV opacity",
                             &farmFovAlpha, 0.0f, 255.0f, L"%.0f");
             }
         } else {
@@ -1349,10 +1351,12 @@ void RenderD2DMenu(std::size_t playerCount) {
                      DrawSlider(l, leftX, firstY + 256, columnWidth, L"Smoothing",
                                 &farmAimSmooth, 1.0f, 20.0f, L"%.1f");
                  }
-                 DrawToggle(l, rightX, firstY, columnWidth, L"Farm FOV circle",
+                 const float farmCircleY = (!farmSilentMode || farmMixedMode)
+                     ? firstY + 328.0f : firstY + 194.0f;
+                 DrawToggle(l, leftX, farmCircleY, columnWidth, L"Farm FOV circle",
                             L"Show the creep aim radius", &drawFarmFovCircle);
                  if (drawFarmFovCircle)
-                     DrawSlider(l, rightX, firstY + 72, columnWidth, L"FOV opacity",
+                     DrawSlider(l, leftX, farmCircleY + 72, columnWidth, L"FOV opacity",
                                 &farmFovAlpha, 0.0f, 255.0f, L"%.0f");
              }
 
