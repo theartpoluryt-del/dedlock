@@ -29,6 +29,7 @@ struct Renderer {
     ComPtr<IDXGISurface> surface;
     ComPtr<ID2D1RenderTarget> target;
     ComPtr<ID2D1Bitmap> logoBitmap;
+    ComPtr<ID2D1Bitmap> previewHeroBitmap;
     ComPtr<ID2D1Bitmap> tabIcons[4];
     ComPtr<ID2D1Bitmap> sceneBitmap;
     ComPtr<ID2D1BitmapRenderTarget> blurTarget;
@@ -486,90 +487,135 @@ void DrawCombo(const Layout& l, int id, float x, float y, float width,
     }
 }
 
-void DrawEspPreview(float x, float y, float width, float height, bool enabled,
-                    bool boxes, bool skeleton, bool health, bool names,
-                    bool snaplines, const float* boxColor,
-                    const float* skeletonColor, const float* healthColor,
-                    const float* nameColor) {
-    FillRounded(Rect(x, y, x + width, y + height), 9,
-                Color(0.030f, 0.035f, 0.045f, 0.94f));
-    StrokeRounded(Rect(x, y, x + width, y + height), 9, Border(), 1.0f);
-    Text(L"ESP preview", Rect(x + 16, y + 12, x + width - 16, y + 36),
+void DrawEspChip(const Layout& l, float x, float y, float width,
+                 const wchar_t* label, bool* value,
+                 const float* colorValue = nullptr) {
+    const D2D1_RECT_F hit = Rect(x, y, x + width, y + 42);
+    const D2D1_RECT_F swatch = colorValue
+        ? Rect(x + width - 34, y + 10, x + width - 14, y + 32)
+        : Rect(0, 0, 0, 0);
+    const bool clickedSwatch = colorValue && Clicked(l, swatch);
+    if (Clicked(l, hit) && !clickedSwatch)
+        *value = !*value;
+    const bool hovered = Contains(hit, l.mouse);
+    if (*value) {
+        GlowRounded(hit, 6, Red(0.26f), 3, 1.0f);
+        GradientRounded(hit, 6, Color(0.42f, 0.025f, 0.075f, 0.92f),
+                        Color(0.17f, 0.030f, 0.055f, 0.96f), true);
+        StrokeRounded(hit, 6, Red(), 1.0f);
+    } else {
+        GradientRounded(hit, 6,
+                        hovered ? Color(0.105f, 0.115f, 0.14f)
+                                : Color(0.070f, 0.076f, 0.092f),
+                        Color(0.047f, 0.051f, 0.063f), true);
+        StrokeRounded(hit, 6, hovered ? Color(0.34f, 0.37f, 0.45f) : Border());
+    }
+    Text(label, Rect(x + 13, y, x + width - 48, y + 42),
+         g.regular.Get(), *value ? White() : Muted());
+    if (colorValue) {
+        FillRounded(swatch, 4,
+                    Color(colorValue[0], colorValue[1], colorValue[2]));
+        StrokeRounded(swatch, 4, Border(), 0.8f);
+        if (clickedSwatch) {
+            g.colorPopup = g.colorPopup == colorValue
+                ? nullptr : const_cast<float*>(colorValue);
+            g.colorPopupAnchor = swatch;
+            g.openCombo = 0;
+        }
+    } else {
+        Text(*value ? L"ON" : L"OFF", Rect(x + width - 52, y, x + width - 10, y + 42),
+             g.centered.Get(), *value ? Red() : Muted());
+    }
+}
+
+void DrawHeroEspPreview(float x, float y, float width, float height,
+                        const wchar_t* presetLabel, bool enabled,
+                        bool boxes, bool cornerBoxes,
+                        bool skeleton, bool health, bool healthValue,
+                        bool heroName, bool playerName, bool distance,
+                        bool snaplines, const float* boxColor,
+                        const float* skeletonColor, const float* healthColor,
+                        const float* nameColor, const float* playerColor,
+                        const float* healthValueColor) {
+    GlowRounded(Rect(x, y, x + width, y + height), 10,
+                Color(0, 0, 0, 0.65f), 5, 2.0f);
+    FillRounded(Rect(x, y, x + width, y + height), 10,
+                Color(0.026f, 0.030f, 0.039f, 0.97f));
+    StrokeRounded(Rect(x, y, x + width, y + height), 10, Border(), 1.0f);
+    Text(L"ESP Preview", Rect(x + 16, y + 10, x + width - 16, y + 42),
          g.semibold.Get(), White());
-    Text(enabled ? L"Live example" : L"ESP disabled",
-         Rect(x + 16, y + 36, x + width - 16, y + 58), g.regular.Get(),
-         enabled ? Muted() : Red(0.9f));
+    Text(enabled ? presetLabel : L"ESP disabled",
+         Rect(x + 16, y + 40, x + width - 16, y + 65),
+         g.regular.Get(), enabled ? Muted() : Red());
 
-    const float canvasLeft = x + 16.0f;
-    const float canvasTop = y + 68.0f;
-    const float canvasRight = x + 208.0f;
-    const float canvasBottom = y + height - 14.0f;
-    FillRounded(Rect(canvasLeft, canvasTop, canvasRight, canvasBottom), 6,
-                Color(0.055f, 0.065f, 0.085f, 0.90f));
-    StrokeRounded(Rect(canvasLeft, canvasTop, canvasRight, canvasBottom), 6,
-                  Color(0.20f, 0.24f, 0.32f, 0.75f));
+    const D2D1_RECT_F stage = Rect(x + 15, y + 74, x + width - 15, y + height - 16);
+    FillRounded(stage, 7, Color(0.008f, 0.010f, 0.014f, 1.0f));
+    StrokeRounded(stage, 7, Color(0.16f, 0.18f, 0.23f, 0.85f));
+    const D2D1_RECT_F modelRect = Rect(x + 49, y + 112, x + width - 31, y + height - 45);
+    if (g.previewHeroBitmap) {
+        // Front view from the in-game Infernus model reference sheet.
+        g.target->DrawBitmap(g.previewHeroBitmap.Get(), modelRect, 1.0f,
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+            Rect(485.0f, 115.0f, 925.0f, 1125.0f));
+    }
+    if (!enabled) return;
 
-    const float cx = (canvasLeft + canvasRight) * 0.5f;
-    const float top = canvasTop + 23.0f;
-    const float shoulder = top + 55.0f;
-    const float hip = top + 118.0f;
-    const float foot = top + 181.0f;
+    const float left = modelRect.left + 26.0f;
+    const float right = modelRect.right - 26.0f;
+    const float top = modelRect.top + 34.0f;
+    const float bottom = modelRect.bottom - 8.0f;
+    const float cx = (left + right) * 0.5f;
     const D2D1_COLOR_F box = Color(boxColor[0], boxColor[1], boxColor[2]);
     const D2D1_COLOR_F bones = Color(skeletonColor[0], skeletonColor[1], skeletonColor[2]);
     const D2D1_COLOR_F hp = Color(healthColor[0], healthColor[1], healthColor[2]);
-    const D2D1_COLOR_F name = Color(nameColor[0], nameColor[1], nameColor[2]);
-    const float left = cx - 38.0f;
-    const float right = cx + 38.0f;
     if (boxes) {
-        Line(D2D1::Point2F(left, shoulder), D2D1::Point2F(left + 18, shoulder), box);
-        Line(D2D1::Point2F(left, shoulder), D2D1::Point2F(left, shoulder + 18), box);
-        Line(D2D1::Point2F(right - 18, shoulder), D2D1::Point2F(right, shoulder), box);
-        Line(D2D1::Point2F(right, shoulder), D2D1::Point2F(right, shoulder + 18), box);
-        Line(D2D1::Point2F(left, foot), D2D1::Point2F(left + 18, foot), box);
-        Line(D2D1::Point2F(left, foot - 18), D2D1::Point2F(left, foot), box);
-        Line(D2D1::Point2F(right - 18, foot), D2D1::Point2F(right, foot), box);
-        Line(D2D1::Point2F(right, foot - 18), D2D1::Point2F(right, foot), box);
+        if (cornerBoxes) {
+            constexpr float c = 25.0f;
+            Line(D2D1::Point2F(left, top), D2D1::Point2F(left + c, top), box, 1.6f);
+            Line(D2D1::Point2F(left, top), D2D1::Point2F(left, top + c), box, 1.6f);
+            Line(D2D1::Point2F(right - c, top), D2D1::Point2F(right, top), box, 1.6f);
+            Line(D2D1::Point2F(right, top), D2D1::Point2F(right, top + c), box, 1.6f);
+            Line(D2D1::Point2F(left, bottom - c), D2D1::Point2F(left, bottom), box, 1.6f);
+            Line(D2D1::Point2F(left, bottom), D2D1::Point2F(left + c, bottom), box, 1.6f);
+            Line(D2D1::Point2F(right - c, bottom), D2D1::Point2F(right, bottom), box, 1.6f);
+            Line(D2D1::Point2F(right, bottom - c), D2D1::Point2F(right, bottom), box, 1.6f);
+        } else {
+            SetBrush(box);
+            g.target->DrawRectangle(Rect(left, top, right, bottom), g.brush.Get(), 1.6f);
+        }
     }
     if (health) {
-        FillRounded(Rect(left - 10, shoulder, left - 5, foot), 2,
-                    Color(0.12f, 0.14f, 0.17f));
-        FillRounded(Rect(left - 10, shoulder + 20, left - 5, foot), 2,
-                    hp);
+        FillRounded(Rect(left - 10, top, left - 5, bottom), 2, Color(0.10f, 0.11f, 0.14f));
+        FillRounded(Rect(left - 10, top + 54, left - 5, bottom), 2, hp);
     }
     if (skeleton) {
-        Line(D2D1::Point2F(cx, top + 12), D2D1::Point2F(cx, shoulder), bones, 1.4f);
-        Line(D2D1::Point2F(cx, shoulder), D2D1::Point2F(cx, hip), bones, 1.4f);
-        Line(D2D1::Point2F(cx, hip), D2D1::Point2F(cx - 20, foot), bones, 1.4f);
-        Line(D2D1::Point2F(cx, hip), D2D1::Point2F(cx + 20, foot), bones, 1.4f);
-        Line(D2D1::Point2F(cx, shoulder), D2D1::Point2F(cx - 28, shoulder + 39), bones, 1.4f);
-        Line(D2D1::Point2F(cx, shoulder), D2D1::Point2F(cx + 28, shoulder + 39), bones, 1.4f);
+        const float head = top + 54.0f;
+        const float shoulders = top + 115.0f;
+        const float hips = top + 250.0f;
+        Line(D2D1::Point2F(cx, head), D2D1::Point2F(cx, hips), bones, 1.4f);
+        Line(D2D1::Point2F(cx, shoulders), D2D1::Point2F(left + 20, top + 205), bones, 1.4f);
+        Line(D2D1::Point2F(cx, shoulders), D2D1::Point2F(right - 20, top + 205), bones, 1.4f);
+        Line(D2D1::Point2F(cx, hips), D2D1::Point2F(cx - 34, bottom), bones, 1.4f);
+        Line(D2D1::Point2F(cx, hips), D2D1::Point2F(cx + 34, bottom), bones, 1.4f);
     }
-    SetBrush(box);
-    g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, top), 12, 12), g.brush.Get());
-    if (names)
-        Text(L"Enemy", Rect(left - 4, top - 22, right + 36, top - 2),
-             g.regular.Get(), name);
+    float labelY = top - 46.0f;
+    if (heroName) {
+        Text(L"Infernus", Rect(left - 20, labelY, right + 20, labelY + 24),
+             g.centered.Get(), Color(nameColor[0], nameColor[1], nameColor[2]));
+        labelY += 22.0f;
+    }
+    if (playerName)
+        Text(L"Player", Rect(left - 20, labelY, right + 20, labelY + 24),
+             g.centered.Get(), Color(playerColor[0], playerColor[1], playerColor[2]));
+    if (healthValue)
+        Text(L"658 / 830", Rect(cx - 55, top + 6, cx + 55, top + 28),
+             g.centered.Get(), Color(healthValueColor[0], healthValueColor[1], healthValueColor[2]));
+    if (distance)
+        Text(L"12m", Rect(cx - 35, bottom + 2, cx + 35, bottom + 26),
+             g.centered.Get(), Muted());
     if (snaplines)
-        Line(D2D1::Point2F(cx, canvasBottom), D2D1::Point2F(canvasRight - 14, canvasBottom - 16),
-             Color(1.0f, 1.0f, 1.0f, 0.62f), 1.0f);
-
-    const float infoX = x + 230.0f;
-    Text(L"Preview follows the selected team", Rect(infoX, y + 76, x + width - 14, y + 116),
-         g.regular.Get(), Muted());
-    const auto chip = [&](float cy, const wchar_t* label, bool value,
-                          const D2D1_COLOR_F& accent) {
-        FillRounded(Rect(infoX, cy, x + width - 16, cy + 28), 5,
-                    Color(0.075f, 0.085f, 0.11f, 0.92f));
-        StrokeRounded(Rect(infoX, cy, x + width - 16, cy + 28), 5,
-                      value ? accent : Border(), 0.8f);
-        Text(label, Rect(infoX + 10, cy, x + width - 55, cy + 28),
-             g.regular.Get(), value ? White() : Muted());
-        Text(value ? L"ON" : L"OFF", Rect(x + width - 50, cy, x + width - 22, cy + 28),
-             g.centered.Get(), value ? accent : Muted());
-    };
-    chip(y + 128, L"Box", boxes, box);
-    chip(y + 162, L"Skeleton", skeleton, bones);
-    chip(y + 196, L"Health bar", health, hp);
+        Line(D2D1::Point2F(x + width * 0.5f, y + height - 18),
+             D2D1::Point2F(cx, bottom), Color(1, 1, 1, 0.70f), 1.0f);
 }
 
 void DrawKeyBind(const Layout& l, float x, float y, float width,
@@ -750,6 +796,7 @@ bool LoadEmbeddedBitmap(UINT resourceId, ComPtr<ID2D1Bitmap>& output) {
 
 void LoadEmbeddedAssets() {
     LoadEmbeddedBitmap(IDR_DEADLOCK_LOGO, g.logoBitmap);
+    LoadEmbeddedBitmap(IDR_ESP_PREVIEW_HERO, g.previewHeroBitmap);
     const UINT iconIds[4]{IDR_ICON_EYE, IDR_ICON_CROSSHAIR,
                           IDR_ICON_SPROUT, IDR_ICON_SETTINGS};
     for (int i = 0; i < 4; ++i)
@@ -803,6 +850,7 @@ bool PrepareBackgroundBlur(UINT width, UINT height) {
 void ResetTarget() {
     g.menuLayer.Reset();
     g.logoBitmap.Reset();
+    g.previewHeroBitmap.Reset();
     for (auto& icon : g.tabIcons) icon.Reset();
     g.blurBitmap.Reset();
     g.blurTarget.Reset();
@@ -1177,7 +1225,9 @@ void RenderD2DMenu(std::size_t playerCount) {
         cardTop = 190.0f;
     }
 
-    const D2D1_RECT_F cardRect = Rect(334, cardTop, 1414, 818);
+    const bool visualEditor = g.tab == 0;
+    const D2D1_RECT_F cardRect = Rect(334, cardTop,
+                                      visualEditor ? 1048.0f : 1414.0f, 818);
     GlowRounded(cardRect, 10, Color(0, 0, 0, 0.64f), 5, 2.0f);
     GradientRounded(cardRect, 10, Color(0.098f, 0.112f, 0.148f, 0.68f),
                     Color(0.105f, 0.116f, 0.154f, 0.71f), true);
@@ -1192,12 +1242,13 @@ void RenderD2DMenu(std::size_t playerCount) {
     Line(D2D1::Point2F(372, cardTop + 34), D2D1::Point2F(372, cardTop + 28), Red(), 1.4f);
     Text(cardTitles[g.tab], Rect(391, cardTop + 3, 700, cardTop + 43),
          g.semibold.Get(), White());
-    Line(D2D1::Point2F(875, cardTop + 58), D2D1::Point2F(875, 772), Border());
+    if (!visualEditor)
+        Line(D2D1::Point2F(875, cardTop + 58), D2D1::Point2F(875, 772), Border());
 
-    const float leftX = 392;
-    const float rightX = 908;
-    const float leftColumnWidth = 449;
-    const float rightColumnWidth = 462;
+    const float leftX = visualEditor ? 366.0f : 392.0f;
+    const float rightX = visualEditor ? 700.0f : 908.0f;
+    const float leftColumnWidth = visualEditor ? 312.0f : 449.0f;
+    const float rightColumnWidth = visualEditor ? 312.0f : 462.0f;
     const float leftColorWidth = leftColumnWidth;
     const float rightColorWidth = rightColumnWidth;
     const float columnWidth = leftColumnWidth;
@@ -1222,7 +1273,7 @@ void RenderD2DMenu(std::size_t playerCount) {
     g.rightContentBottom = viewportTop;
 
     g.target->PushAxisAlignedClip(
-        Rect(334.0f, viewportTop, 1414.0f, 818.0f),
+        Rect(334.0f, visualEditor ? cardTop : viewportTop, 1414.0f, 818.0f),
         D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
     if (g.tab == 0) {
@@ -1252,86 +1303,81 @@ void RenderD2DMenu(std::size_t playerCount) {
         float* teamHealthValueColor = g.visualTeam == 0 ? enemyHealthValueColor : teammateHealthValueColor;
         float* teamGlowColor = g.visualTeam == 0 ? enemyGlowColor : teammateGlowColor;
         bool* teamGlowEnabled = g.visualTeam == 0 ? &enemyGlowEnabled : &allyGlowEnabled;
-        const float leftFirstY = firstY + 276.0f;
-        DrawEspPreview(leftX, firstY, leftColumnWidth, 258.0f, *teamEsp,
-                       *teamBoxes, *teamBones, *teamHealth, *teamNames,
-                       *teamSnaplines, teamBoxColor, teamSkeletonColor,
-                       teamHealthColor, teamNameColor);
+        DrawHeroEspPreview(1066.0f, cardTop, 348.0f, 688.0f,
+                           g.visualTeam == 0 ? L"Enemy preset" :
+                           g.visualTeam == 1 ? L"Ally preset" : L"Creep preset",
+                           *teamEsp,
+                           *teamBoxes, *teamCornerBoxes, *teamBones,
+                           *teamHealth, *teamHealthValues, *teamNames,
+                           *teamPlayerNames, *teamDistance, *teamSnaplines,
+                           teamBoxColor, teamSkeletonColor, teamHealthColor,
+                           teamNameColor, teamPlayerColor, teamHealthValueColor);
+
+        Text(g.visualTeam == 0 ? L"Enemy ESP settings" :
+             g.visualTeam == 1 ? L"Ally ESP settings" : L"Creep ESP settings",
+             Rect(leftX, firstY + 4, rightX + rightColumnWidth, firstY + 34),
+             g.semibold.Get(), White());
 
         if (g.visualTeam == 2) {
-            DrawToggle(l, leftX, leftFirstY, leftColorWidth, L"Creep ESP",
-                       L"Highlight valid creeps", teamEsp);
-            float orbY = leftFirstY + 72;
-            if (*teamEsp) {
-                DrawToggle(l, leftX, leftFirstY + 72, leftColorWidth, L"Bounding boxes",
-                           L"Draw boxes around creeps", teamBoxes, teamBoxColor);
-                if (*teamBoxes) {
-                    DrawToggle(l, leftX, leftFirstY + 144, leftColorWidth, L"Corner boxes",
-                               L"Use corner-only box style", teamCornerBoxes, nullptr);
-                }
-                DrawToggle(l, leftX, leftFirstY + 216, leftColorWidth, L"Health bar",
-                           L"Show creep health", teamHealth, teamHealthColor);
-                DrawToggle(l, leftX, leftFirstY + 282, leftColorWidth, L"Health value",
-                            L"Show creep health value", teamHealthValues, creepHealthValueColor);
-                DrawToggle(l, leftX, leftFirstY + 348, leftColorWidth, L"Distance",
-                           L"Show distance to creep", teamDistance, nullptr);
-                orbY = leftFirstY + 414;
-            }
-            DrawToggle(l, leftX, orbY, leftColorWidth, L"Orb ESP",
-                       L"Highlight active soul orbs", &drawOrbEsp);
-            DrawToggle(l, rightX, firstY, rightColorWidth, L"Ally creep ESP",
-                       L"Highlight allied creeps", &allyCreepEspEnabled);
-            if (allyCreepEspEnabled) {
-                DrawToggle(l, rightX, firstY + 72, rightColorWidth, L"Bounding boxes",
-                           L"Draw boxes around allied creeps", &allyCreepBoxesEnabled, allyCreepBoxColor);
-                DrawToggle(l, rightX, firstY + 144, rightColorWidth, L"Corner boxes",
-                           L"Use corner-only box style", &allyCreepCornerBoxesEnabled);
-                DrawToggle(l, rightX, firstY + 216, rightColorWidth, L"Health bar",
-                           L"Show allied creep health", &allyCreepHealthEnabled, allyCreepHealthColor);
-                DrawToggle(l, rightX, firstY + 282, rightColorWidth, L"Health value",
-                            L"Show allied creep health value", &allyCreepHealthValuesEnabled,
-                            allyCreepHealthValueColor);
-                DrawToggle(l, rightX, firstY + 348, rightColorWidth, L"Distance",
-                           L"Show distance to allied creep", &allyCreepDistanceEnabled);
-            }
+            DrawEspChip(l, leftX, firstY + 48, leftColumnWidth, L"Creep ESP", teamEsp);
+            DrawEspChip(l, rightX, firstY + 48, rightColumnWidth, L"Ally creep ESP",
+                        &allyCreepEspEnabled);
+            DrawEspChip(l, leftX, firstY + 100, leftColumnWidth, L"Box",
+                        teamBoxes, teamBoxColor);
+            DrawEspChip(l, rightX, firstY + 100, rightColumnWidth, L"Ally box",
+                        &allyCreepBoxesEnabled, allyCreepBoxColor);
+            DrawEspChip(l, leftX, firstY + 152, leftColumnWidth, L"Corner box",
+                        teamCornerBoxes);
+            DrawEspChip(l, rightX, firstY + 152, rightColumnWidth, L"Ally corner box",
+                        &allyCreepCornerBoxesEnabled);
+            DrawEspChip(l, leftX, firstY + 204, leftColumnWidth, L"Health bar",
+                        teamHealth, teamHealthColor);
+            DrawEspChip(l, rightX, firstY + 204, rightColumnWidth, L"Ally health bar",
+                        &allyCreepHealthEnabled, allyCreepHealthColor);
+            DrawEspChip(l, leftX, firstY + 256, leftColumnWidth, L"Health value",
+                        teamHealthValues, creepHealthValueColor);
+            DrawEspChip(l, rightX, firstY + 256, rightColumnWidth, L"Ally health value",
+                        &allyCreepHealthValuesEnabled, allyCreepHealthValueColor);
+            DrawEspChip(l, leftX, firstY + 308, leftColumnWidth, L"Distance",
+                        teamDistance);
+            DrawEspChip(l, rightX, firstY + 308, rightColumnWidth, L"Ally distance",
+                        &allyCreepDistanceEnabled);
+            DrawEspChip(l, leftX, firstY + 360, leftColumnWidth, L"Soul orbs",
+                        &drawOrbEsp);
         } else {
-        DrawToggle(l, leftX, leftFirstY, leftColumnWidth, L"Enable ESP",
-                   L"Master overlay switch", teamEsp);
-        if (*teamEsp) {
-        DrawToggle(l, leftX, leftFirstY + 72, leftColorWidth, L"Bounding boxes",
-                   L"Draw boxes around enemies", teamBoxes, teamBoxColor);
-        if (*teamBoxes) {
-            DrawSlider(l, leftX, leftFirstY + 138, leftColumnWidth, L"Box thickness",
+            DrawEspChip(l, leftX, firstY + 48,
+                        rightX + rightColumnWidth - leftX, L"Enable ESP", teamEsp);
+            DrawEspChip(l, leftX, firstY + 100, leftColumnWidth, L"Box",
+                        teamBoxes, teamBoxColor);
+            DrawEspChip(l, rightX, firstY + 100, rightColumnWidth, L"Corner box",
+                        teamCornerBoxes);
+            DrawEspChip(l, leftX, firstY + 152, leftColumnWidth, L"Health bar",
+                        teamHealth, teamHealthColor);
+            DrawEspChip(l, rightX, firstY + 152, rightColumnWidth, L"Health value",
+                        teamHealthValues, teamHealthValueColor);
+            DrawEspChip(l, leftX, firstY + 204, leftColumnWidth, L"Skeleton",
+                        teamBones, teamSkeletonColor);
+            DrawEspChip(l, rightX, firstY + 204, rightColumnWidth, L"Hero name",
+                        teamNames, teamNameColor);
+            DrawEspChip(l, leftX, firstY + 256, leftColumnWidth, L"Player name",
+                        teamPlayerNames, teamPlayerColor);
+            DrawEspChip(l, rightX, firstY + 256, rightColumnWidth, L"Distance",
+                        teamDistance);
+            DrawEspChip(l, leftX, firstY + 308, leftColumnWidth, L"Snapline",
+                        teamSnaplines);
+            DrawEspChip(l, rightX, firstY + 308, rightColumnWidth, L"Model glow",
+                        teamGlowEnabled, teamGlowColor);
+            DrawSlider(l, leftX, firstY + 366,
+                       rightX + rightColumnWidth - leftX, L"Box thickness",
                        &boxThickness, 0.5f, 4.0f, L"%.2f px");
-            DrawToggle(l, leftX, leftFirstY + 198, leftColorWidth, L"Corner boxes",
-                       L"Use corner-only box style", teamCornerBoxes, nullptr);
-            DrawSlider(l, leftX, leftFirstY + 264, leftColumnWidth, L"Corner length",
+            DrawSlider(l, leftX, firstY + 424,
+                       rightX + rightColumnWidth - leftX, L"Corner length",
                        &cornerBoxLength, 0.10f, 0.50f, L"%.2f");
-        }
-        const float featureY = *teamBoxes ? leftFirstY + 324 : leftFirstY + 138;
-        DrawToggle(l, leftX, featureY, leftColorWidth, L"Health bar",
-                   L"Show health bar", teamHealth, teamHealthColor);
-        DrawToggle(l, leftX, featureY + 66, leftColorWidth, L"Health value",
-                   L"Show health value", teamHealthValues, teamHealthValueColor);
-        DrawToggle(l, leftX, featureY + 132, leftColorWidth, L"Skeleton",
-                   L"Render enemy skeleton", teamBones, teamSkeletonColor);
-
-        DrawToggle(l, rightX, firstY, rightColorWidth, L"Hero names",
-                   L"Show hero names", teamNames, teamNameColor);
-        DrawToggle(l, rightX, firstY + 72, rightColorWidth, L"Player names",
-                   L"Show player names", teamPlayerNames, teamPlayerColor);
-        DrawToggle(l, rightX, firstY + 144, rightColorWidth, L"Distance",
-                   L"Show distance to enemy", teamDistance, nullptr);
-        DrawToggle(l, rightX, firstY + 216, rightColumnWidth, L"Snaplines",
-                   L"Draw lines to enemy", teamSnaplines, nullptr);
-        DrawToggle(l, rightX, firstY + 288, rightColorWidth, L"Model glow",
-                   g.visualTeam == 0 ? L"Glow on enemy model" : L"Glow on ally model",
-                   teamGlowEnabled, teamGlowColor);
-        const wchar_t* glowModes[] = {L"HP-based fill", L"Normal fill"};
-        int* teamGlowMode = g.visualTeam == 0 ? &enemyGlowMode : &allyGlowMode;
-        DrawCombo(l, 401, rightX, firstY + 354, rightColorWidth, L"Glow mode",
-                  teamGlowMode, glowModes, 2);
-        }
+            const wchar_t* glowModes[] = {L"HP-based fill", L"Normal fill"};
+            int* teamGlowMode = g.visualTeam == 0 ? &enemyGlowMode : &allyGlowMode;
+            DrawCombo(l, 401, leftX, firstY + 486,
+                      rightX + rightColumnWidth - leftX, L"Glow mode",
+                      teamGlowMode, glowModes, 2);
         }
     } else if (g.tab == 1) {
         if (g.aimSubtab == 0) {
