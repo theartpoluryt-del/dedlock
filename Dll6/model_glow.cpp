@@ -251,11 +251,40 @@ __int64 __fastcall HookPlayerOutline(
 // written or spoofed.
 void __fastcall HookPlayerHealthGlowRender(
     void* renderer, void* arg1, void* arg2, void* arg3) {
-    // This callback is the actual model-fill submission on the current
-    // client. Suppressing it makes Normal fill completely invisible; the
-    // selected GlowType controls whether the pass is HP-clipped or full.
-    if (originalPlayerHealthGlowRender)
+    if (!originalPlayerHealthGlowRender) return;
+
+    // The current client uses the same renderer for both UI modes; its fill
+    // height is derived from the pawn's current health. For Normal fill,
+    // temporarily present every enabled glow target as fully healed while
+    // the renderer builds its draw list, then restore the real values before
+    // returning to the game. HP-based mode follows the untouched path.
+    if (glowMode != 1) {
         originalPlayerHealthGlowRender(renderer, arg1, arg2, arg3);
+        return;
+    }
+
+    struct SavedHealth {
+        uintptr_t pawn{};
+        int health{};
+    };
+    std::vector<SavedHealth> saved;
+    {
+        std::lock_guard<std::mutex> lock(heroPawnsMutex);
+        saved.reserve(heroPawns.size());
+        for (const uintptr_t pawn : heroPawns) {
+            if (!pawn || pawn == currentLocalPawn || !IsGlowEnabledForPawn(pawn))
+                continue;
+            const int maxHealth = Read<int>(pawn + Offsets::MaxHealth);
+            if (maxHealth <= 0) continue;
+            saved.push_back({pawn, Read<int>(pawn + Offsets::Health)});
+            Write<int>(pawn + Offsets::Health, maxHealth);
+        }
+    }
+
+    originalPlayerHealthGlowRender(renderer, arg1, arg2, arg3);
+
+    for (const SavedHealth& entry : saved)
+        Write<int>(entry.pawn + Offsets::Health, entry.health);
 }
 
 struct SavedPipelineState {
