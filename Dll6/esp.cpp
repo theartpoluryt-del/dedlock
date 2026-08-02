@@ -1248,9 +1248,15 @@ std::vector<PlayerData> GetPlayers() {
                 player.velocity.z * player.velocity.z > 2500.0f * 2500.0f) {
             player.velocity = {};
         }
+        // Keep the rendered transform as the bone/aim anchor, but place the
+        // ESP capsule at AbsOrigin.  The latter is the source used by the
+        // jitter-free c3d7f8ff build and is published slightly ahead of
+        // m_nodeToWorld while a hero is running.  Using m_nodeToWorld for the
+        // box was stable after the Present fence, but left a constant visual
+        // delay behind the model.
         player.visualAnchor = framePosition;
         player.hasVisualAnchor = true;
-        player.worldPos = framePosition;
+        player.worldPos = pos;
         const uintptr_t collision = Read<uintptr_t>(entity + Offsets::CollisionProperty);
         const Vector3 collisionMins = Read<Vector3>(collision + Offsets::CollisionMins);
         const Vector3 collisionMaxs = Read<Vector3>(collision + Offsets::CollisionMaxs);
@@ -1289,10 +1295,11 @@ std::vector<PlayerData> GetPlayers() {
                               : 0.0f;
         if (!std::isfinite(player.distance)) continue;
 
-        // Render origin and camera matrix are sampled in this Present and the
-        // resulting bounds are consumed without another coordinate read.
+        // AbsOrigin and the camera matrix are sampled in this fenced Present.
+        // This matches the proven c3 ESP path without adding screen-space
+        // smoothing or prediction, so starts/stops remain exact and stable.
         if (currentViewMatrixReady && GetEntityScreenBounds(
-                entity, framePosition, viewMatrix,
+                entity, pos, viewMatrix,
                 player.boxLeft, player.boxTop,
                 player.boxRight, player.boxBottom)) {
             players.push_back(player);
