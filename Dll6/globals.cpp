@@ -89,6 +89,8 @@ float teammateGlowColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
 int glowMode = 0;
 float enemyNameColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
 float teammateNameColor[4] = {0.35f, 0.75f, 1.00f, 1.00f};
+float enemySkeletonColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
+float teammateSkeletonColor[4] = {0.35f, 0.75f, 1.00f, 1.00f};
 float enemyHealthColor[4] = {0.20f, 1.00f, 0.25f, 1.00f};
 float teammateHealthColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
 float boxThickness = 1.20f;
@@ -97,10 +99,12 @@ bool creepEspEnabled = false, creepBoxesEnabled = true, creepCornerBoxesEnabled 
 bool creepHealthEnabled = true, creepHealthValuesEnabled = true, creepDistanceEnabled = true;
 float creepBoxColor[4] = {1.00f, 0.67f, 0.05f, 1.00f};
 float creepHealthColor[4] = {0.25f, 0.90f, 0.35f, 1.00f};
+float creepHealthValueColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
 bool allyCreepEspEnabled = false, allyCreepBoxesEnabled = true, allyCreepCornerBoxesEnabled = false;
 bool allyCreepHealthEnabled = true, allyCreepHealthValuesEnabled = true, allyCreepDistanceEnabled = true;
 float allyCreepBoxColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
 float allyCreepHealthColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
+float allyCreepHealthValueColor[4] = {0.70f, 0.85f, 1.00f, 1.00f};
 namespace {
 std::string ConfigPath() {
     // Manual-map injectors do not register the image in the loader list, so
@@ -196,6 +200,14 @@ void LoadConfig() {
         else if (key == "teammateNameG") teammateNameColor[1] = static_cast<float>(number);
         else if (key == "teammateNameB") teammateNameColor[2] = static_cast<float>(number);
         else if (key == "teammateNameA") teammateNameColor[3] = static_cast<float>(number);
+        if (key == "enemySkeletonR") enemySkeletonColor[0] = static_cast<float>(number);
+        else if (key == "enemySkeletonG") enemySkeletonColor[1] = static_cast<float>(number);
+        else if (key == "enemySkeletonB") enemySkeletonColor[2] = static_cast<float>(number);
+        else if (key == "enemySkeletonA") enemySkeletonColor[3] = static_cast<float>(number);
+        else if (key == "teammateSkeletonR") teammateSkeletonColor[0] = static_cast<float>(number);
+        else if (key == "teammateSkeletonG") teammateSkeletonColor[1] = static_cast<float>(number);
+        else if (key == "teammateSkeletonB") teammateSkeletonColor[2] = static_cast<float>(number);
+        else if (key == "teammateSkeletonA") teammateSkeletonColor[3] = static_cast<float>(number);
         if (key == "enemyPlayerNameR") enemyPlayerNameColor[0] = static_cast<float>(number);
         else if (key == "enemyPlayerNameG") enemyPlayerNameColor[1] = static_cast<float>(number);
         else if (key == "enemyPlayerNameB") enemyPlayerNameColor[2] = static_cast<float>(number);
@@ -244,6 +256,10 @@ void LoadConfig() {
         else if (key == "creepHealthG") creepHealthColor[1] = static_cast<float>(number);
         else if (key == "creepHealthB") creepHealthColor[2] = static_cast<float>(number);
         else if (key == "creepHealthA") creepHealthColor[3] = static_cast<float>(number);
+        else if (key == "creepHealthValueR") creepHealthValueColor[0] = static_cast<float>(number);
+        else if (key == "creepHealthValueG") creepHealthValueColor[1] = static_cast<float>(number);
+        else if (key == "creepHealthValueB") creepHealthValueColor[2] = static_cast<float>(number);
+        else if (key == "creepHealthValueA") creepHealthValueColor[3] = static_cast<float>(number);
         else if (key == "allyCreepBoxR") allyCreepBoxColor[0] = static_cast<float>(number);
         else if (key == "allyCreepBoxG") allyCreepBoxColor[1] = static_cast<float>(number);
         else if (key == "allyCreepBoxB") allyCreepBoxColor[2] = static_cast<float>(number);
@@ -252,6 +268,10 @@ void LoadConfig() {
         else if (key == "allyCreepHealthG") allyCreepHealthColor[1] = static_cast<float>(number);
         else if (key == "allyCreepHealthB") allyCreepHealthColor[2] = static_cast<float>(number);
         else if (key == "allyCreepHealthA") allyCreepHealthColor[3] = static_cast<float>(number);
+        else if (key == "allyCreepHealthValueR") allyCreepHealthValueColor[0] = static_cast<float>(number);
+        else if (key == "allyCreepHealthValueG") allyCreepHealthValueColor[1] = static_cast<float>(number);
+        else if (key == "allyCreepHealthValueB") allyCreepHealthValueColor[2] = static_cast<float>(number);
+        else if (key == "allyCreepHealthValueA") allyCreepHealthValueColor[3] = static_cast<float>(number);
         else if (key == "glowMode") glowMode = static_cast<int>(number);
         if (key == "drawOrbEsp") drawOrbEsp = value;
         else if (key == "drawSpectatorList") drawSpectatorList = value;
@@ -360,8 +380,16 @@ void SaveConfig() {
            << "enemyNameA " << enemyNameColor[3] << '\n'
            << "teammateNameR " << teammateNameColor[0] << '\n'
            << "teammateNameG " << teammateNameColor[1] << '\n'
-           << "teammateNameB " << teammateNameColor[2] << '\n'
-           << "teammateNameA " << teammateNameColor[3] << '\n'
+            << "teammateNameB " << teammateNameColor[2] << '\n'
+            << "teammateNameA " << teammateNameColor[3] << '\n'
+            << "enemySkeletonR " << enemySkeletonColor[0] << '\n'
+            << "enemySkeletonG " << enemySkeletonColor[1] << '\n'
+            << "enemySkeletonB " << enemySkeletonColor[2] << '\n'
+            << "enemySkeletonA " << enemySkeletonColor[3] << '\n'
+            << "teammateSkeletonR " << teammateSkeletonColor[0] << '\n'
+            << "teammateSkeletonG " << teammateSkeletonColor[1] << '\n'
+            << "teammateSkeletonB " << teammateSkeletonColor[2] << '\n'
+            << "teammateSkeletonA " << teammateSkeletonColor[3] << '\n'
            << "enemyPlayerNameR " << enemyPlayerNameColor[0] << '\n'
            << "enemyPlayerNameG " << enemyPlayerNameColor[1] << '\n'
            << "enemyPlayerNameB " << enemyPlayerNameColor[2] << '\n'
@@ -408,16 +436,24 @@ void SaveConfig() {
            << "creepBoxA " << creepBoxColor[3] << '\n'
            << "creepHealthR " << creepHealthColor[0] << '\n'
            << "creepHealthG " << creepHealthColor[1] << '\n'
-           << "creepHealthB " << creepHealthColor[2] << '\n'
-           << "creepHealthA " << creepHealthColor[3] << '\n'
+            << "creepHealthB " << creepHealthColor[2] << '\n'
+            << "creepHealthA " << creepHealthColor[3] << '\n'
+            << "creepHealthValueR " << creepHealthValueColor[0] << '\n'
+            << "creepHealthValueG " << creepHealthValueColor[1] << '\n'
+            << "creepHealthValueB " << creepHealthValueColor[2] << '\n'
+            << "creepHealthValueA " << creepHealthValueColor[3] << '\n'
            << "allyCreepBoxR " << allyCreepBoxColor[0] << '\n'
            << "allyCreepBoxG " << allyCreepBoxColor[1] << '\n'
            << "allyCreepBoxB " << allyCreepBoxColor[2] << '\n'
            << "allyCreepBoxA " << allyCreepBoxColor[3] << '\n'
            << "allyCreepHealthR " << allyCreepHealthColor[0] << '\n'
            << "allyCreepHealthG " << allyCreepHealthColor[1] << '\n'
-           << "allyCreepHealthB " << allyCreepHealthColor[2] << '\n'
-           << "allyCreepHealthA " << allyCreepHealthColor[3] << '\n'
+            << "allyCreepHealthB " << allyCreepHealthColor[2] << '\n'
+            << "allyCreepHealthA " << allyCreepHealthColor[3] << '\n'
+            << "allyCreepHealthValueR " << allyCreepHealthValueColor[0] << '\n'
+            << "allyCreepHealthValueG " << allyCreepHealthValueColor[1] << '\n'
+            << "allyCreepHealthValueB " << allyCreepHealthValueColor[2] << '\n'
+            << "allyCreepHealthValueA " << allyCreepHealthValueColor[3] << '\n'
            << "glowMode " << glowMode << '\n'
            << "drawOrbEsp " << drawOrbEsp << '\n'
            << "drawSpectatorList " << drawSpectatorList << '\n'

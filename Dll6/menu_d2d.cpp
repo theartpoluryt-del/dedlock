@@ -1161,6 +1161,7 @@ void RenderD2DMenu(std::size_t playerCount) {
         float* teamHealthColor = g.visualTeam == 0 ? enemyHealthBarColor :
                                  g.visualTeam == 1 ? teammateHealthBarColor : creepHealthColor;
         float* teamNameColor = g.visualTeam == 0 ? enemyNameColor : teammateNameColor;
+        float* teamSkeletonColor = g.visualTeam == 0 ? enemySkeletonColor : teammateSkeletonColor;
         float* teamPlayerColor = g.visualTeam == 0 ? enemyPlayerNameColor : teammatePlayerNameColor;
         float* teamHealthValueColor = g.visualTeam == 0 ? enemyHealthValueColor : teammateHealthValueColor;
         float* teamGlowColor = g.visualTeam == 0 ? enemyGlowColor : teammateGlowColor;
@@ -1179,7 +1180,7 @@ void RenderD2DMenu(std::size_t playerCount) {
                 DrawToggle(l, leftX, firstY + 216, leftColorWidth, L"Health bar",
                            L"Show creep health", teamHealth, teamHealthColor);
                 DrawToggle(l, leftX, firstY + 282, leftColorWidth, L"Health value",
-                           L"Show creep health value", teamHealthValues, teamHealthColor);
+                            L"Show creep health value", teamHealthValues, creepHealthValueColor);
                 DrawToggle(l, leftX, firstY + 348, leftColorWidth, L"Distance",
                            L"Show distance to creep", teamDistance, nullptr);
                 orbY = firstY + 414;
@@ -1196,7 +1197,8 @@ void RenderD2DMenu(std::size_t playerCount) {
                 DrawToggle(l, rightX, firstY + 216, rightColorWidth, L"Health bar",
                            L"Show allied creep health", &allyCreepHealthEnabled, allyCreepHealthColor);
                 DrawToggle(l, rightX, firstY + 282, rightColorWidth, L"Health value",
-                           L"Show allied creep health value", &allyCreepHealthValuesEnabled);
+                            L"Show allied creep health value", &allyCreepHealthValuesEnabled,
+                            allyCreepHealthValueColor);
                 DrawToggle(l, rightX, firstY + 348, rightColorWidth, L"Distance",
                            L"Show distance to allied creep", &allyCreepDistanceEnabled);
             }
@@ -1220,7 +1222,7 @@ void RenderD2DMenu(std::size_t playerCount) {
         DrawToggle(l, leftX, featureY + 66, leftColorWidth, L"Health value",
                    L"Show health value", teamHealthValues, teamHealthValueColor);
         DrawToggle(l, leftX, featureY + 132, leftColorWidth, L"Skeleton",
-                   L"Render enemy skeleton", teamBones, teamNameColor);
+                   L"Render enemy skeleton", teamBones, teamSkeletonColor);
 
         DrawToggle(l, rightX, firstY, rightColorWidth, L"Hero names",
                    L"Show hero names", teamNames, teamNameColor);

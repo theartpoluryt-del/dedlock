@@ -1807,6 +1807,8 @@ void RenderESP(const std::vector<PlayerData>& players) {
                                                    : (ally ? allyCreepHealthValuesEnabled : creepHealthValuesEnabled);
             const float* boxColor = ally ? allyCreepBoxColor : creepBoxColor;
             const float* healthColorValue = ally ? allyCreepHealthColor : creepHealthColor;
+            const float* healthValueColorValue = ally
+                ? allyCreepHealthValueColor : creepHealthValueColor;
             if (!drawThisCreep) continue;
             const ImColor color = neutral
                 ? ImColor(190, 190, 190, 150)
@@ -1869,7 +1871,11 @@ void RenderESP(const std::vector<PlayerData>& players) {
             if (drawHealthValues) {
                 char healthText[32]{};
                 std::snprintf(healthText, sizeof(healthText), "%d/%d", creep.health, creep.maxHealth);
-                drawList->AddText(ImVec2(left, top - 16.0f), ImColor(255, 255, 255, 220), healthText);
+                 const ImColor valueColor = neutral
+                     ? ImColor(190, 190, 190, 220)
+                     : ImColor(healthValueColorValue[0], healthValueColorValue[1],
+                               healthValueColorValue[2], healthValueColorValue[3]);
+                 drawList->AddText(ImVec2(left, top - 16.0f), valueColor, healthText);
             }
         }
         for (auto it = smoothedCreepBoxes.begin();
@@ -2111,6 +2117,8 @@ void RenderESP(const std::vector<PlayerData>& players) {
         const bool teamBones = ally ? allyBonesEnabled : enemyBonesEnabled;
         const ImColor boxColor = makeColor(ally ? teammateBoxColor : enemyBoxColor);
         const ImColor nameColor = makeColor(ally ? teammateNameColor : enemyNameColor);
+        const ImColor skeletonColor = makeColor(
+            ally ? teammateSkeletonColor : enemySkeletonColor);
         const ImColor playerNameColor = makeColor(ally ? teammatePlayerNameColor : enemyPlayerNameColor);
         const ImColor healthBarColor = makeColor(ally ? teammateHealthBarColor : enemyHealthBarColor);
         const ImColor healthValueColor = makeColor(ally ? teammateHealthValueColor : enemyHealthValueColor);
@@ -2125,7 +2133,7 @@ void RenderESP(const std::vector<PlayerData>& players) {
                                start.y + screenOffsetY),
                         ImVec2(end.x + screenOffsetX,
                                end.y + screenOffsetY),
-                        makeColor(ally ? teammateNameColor : enemyNameColor), 1.5f);
+                        skeletonColor, 1.5f);
                 }
             }
         }
