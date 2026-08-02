@@ -356,7 +356,11 @@ void ApplyHeroGlow(uintptr_t entity) {
     // glow pass is no longer active.
     {
         std::lock_guard lock(glowMutex);
-        const int targetGlowType = glowMode == 1 ? 2 : 1;
+        // The current client uses 2 for the HP-clipped pass and 3 for the
+        // complete, non-HP-clipped model fill.  Values 1/2 belong to the
+        // previous client build and make Normal fill render as the wrong
+        // highlight style (or not render at all).
+        const int targetGlowType = glowMode == 1 ? 3 : 2;
         const int currentType = Read<int>(glow + Offsets::GlowType);
         const auto modeIt = registeredGlowMode.find(entity);
         const bool modeChanged = modeIt == registeredGlowMode.end() ||
@@ -381,7 +385,7 @@ void ApplyHeroGlow(uintptr_t entity) {
         ? glowColor[3] * healthAlpha : 1.0f;
     Write<Vector3>(glow + Offsets::GlowColor,
                    { glowColor[0], glowColor[1], glowColor[2] });
-    Write<int>(glow + Offsets::GlowType, glowMode == 1 ? 2 : 1);
+    Write<int>(glow + Offsets::GlowType, glowMode == 1 ? 3 : 2);
     Write<int>(glow + Offsets::GlowTeam, -1);
     Write<int>(glow + Offsets::GlowRange, 0);
     Write<int>(glow + Offsets::GlowRangeMin, 0);
@@ -1012,7 +1016,8 @@ DWORD WINAPI GlowApplyWorker(LPVOID) {
             const uint8_t lifeState = Read<uint8_t>(pawn + Offsets::LifeState);
             const uint8_t team = Read<uint8_t>(pawn + Offsets::Team);
             if (health > 0 && lifeState == 0 && (team == 2 || team == 3) &&
-                pawn != currentLocalPawn && (localTeam == 0 || team != localTeam)) {
+                pawn != currentLocalPawn &&
+                (localTeam == 0 || localTeam == 2 || localTeam == 3)) {
                 if (glowEnabled) {
                     ApplyHeroGlow(pawn);
                 } else {
