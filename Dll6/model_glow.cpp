@@ -26,6 +26,8 @@ using DrawIndexedInstancedIndirectFn = void(STDMETHODCALLTYPE*)(
     ID3D11DeviceContext*, ID3D11Buffer*, UINT);
 using DrawInstancedIndirectFn = void(STDMETHODCALLTYPE*)(
     ID3D11DeviceContext*, ID3D11Buffer*, UINT);
+using CreateDeferredContextFn = HRESULT(STDMETHODCALLTYPE*)(
+    ID3D11Device*, UINT, ID3D11DeviceContext**);
 
 DrawModelFn originalDrawModel = nullptr;
 PlayerOutlineFn originalPlayerOutline = nullptr;
@@ -36,6 +38,7 @@ DrawIndexedInstancedFn originalDrawIndexedInstanced = nullptr;
 DrawInstancedFn originalDrawInstanced = nullptr;
 DrawIndexedInstancedIndirectFn originalDrawIndexedInstancedIndirect = nullptr;
 DrawInstancedIndirectFn originalDrawInstancedIndirect = nullptr;
+CreateDeferredContextFn originalCreateDeferredContext = nullptr;
 
 void* drawModelTarget = nullptr;
 void* playerOutlineTarget = nullptr;
@@ -46,6 +49,7 @@ void* drawIndexedInstancedTarget = nullptr;
 void* drawInstancedTarget = nullptr;
 void* drawIndexedInstancedIndirectTarget = nullptr;
 void* drawInstancedIndirectTarget = nullptr;
+void* createDeferredContextTarget = nullptr;
 
 ID3D11PixelShader* glowPixelShader = nullptr;
 ID3D11Buffer* glowColorBuffer = nullptr;
@@ -101,6 +105,22 @@ void LogGlowCounters() {
            << " glowDraw=" << glowDrawCallCount.load()
            << " glowPipeline=" << glowPipelineCount.load();
     LogGlowHook(stream.str().c_str());
+}
+
+bool InstallDrawHooksOnContext(ID3D11DeviceContext* context);
+
+HRESULT STDMETHODCALLTYPE HookCreateDeferredContext(
+    ID3D11Device* device, UINT flags, ID3D11DeviceContext** context) {
+    if (!originalCreateDeferredContext)
+        return E_FAIL;
+    const HRESULT result = originalCreateDeferredContext(device, flags, context);
+    if (SUCCEEDED(result) && context && *context) {
+        if (InstallDrawHooksOnContext(*context))
+            LogGlowHook("deferred D3D11 context draw hooks installed");
+        else
+            LogGlowHook("deferred D3D11 context draw hooks failed");
+    }
+    return result;
 }
 
 
@@ -728,9 +748,9 @@ bool InstallContextHook(
     return true;
 }
 
-bool InstallDrawHooks() {
-    if (!pContext || !CreateGlowResources()) return false;
-    void** vtable = *reinterpret_cast<void***>(pContext);
+bool InstallDrawHooksOnContext(ID3D11DeviceContext* context) {
+    if (!context || !CreateGlowResources()) return false;
+    void** vtable = *reinterpret_cast<void***>(context);
     if (!vtable) return false;
 
     const bool indexed = InstallContextHook(
@@ -755,8 +775,22 @@ bool InstallDrawHooks() {
         drawInstancedIndirectTarget, vtable[40],
         reinterpret_cast<void*>(&HookDrawInstancedIndirect),
         originalDrawInstancedIndirect);
+    bool deviceHook = true;
+    if (pDevice && !createDeferredContextTarget) {
+        void** deviceVtable = *reinterpret_cast<void***>(pDevice);
+        if (deviceVtable) {
+            deviceHook = InstallContextHook(
+                createDeferredContextTarget, deviceVtable[27],
+                reinterpret_cast<void*>(&HookCreateDeferredContext),
+                originalCreateDeferredContext);
+        }
+    }
     return indexed && draw && indexedInstanced && instanced &&
-        indexedIndirect && indirect;
+        indexedIndirect && indirect && deviceHook;
+}
+
+bool InstallDrawHooks() {
+    return InstallDrawHooksOnContext(pContext);
 }
 
 void RemoveHookTarget(void*& target) {
@@ -850,6 +884,7 @@ void RemoveModelGlowHook() {
     RemoveHookTarget(drawTarget);
     RemoveHookTarget(drawIndexedTarget);
     RemoveHookTarget(drawModelTarget);
+    RemoveHookTarget(createDeferredContextTarget);
     RemoveHookTarget(playerOutlineTarget);
     RemoveHookTarget(playerHealthGlowRenderTarget);
 
@@ -860,6 +895,7 @@ void RemoveModelGlowHook() {
     originalDraw = nullptr;
     originalDrawIndexed = nullptr;
     originalDrawModel = nullptr;
+    originalCreateDeferredContext = nullptr;
     originalPlayerOutline = nullptr;
     originalPlayerHealthGlowRender = nullptr;
 
