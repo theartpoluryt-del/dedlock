@@ -758,9 +758,15 @@ bool InstallModelGlowHook() {
     }
 
     if (!drawModelTarget) {
+        // SceneSystem's model submission lives in engine2 on the current
+        // client. Keep client.dll as a compatibility fallback for older
+        // builds where the routine was still emitted there.
+        HMODULE sceneSystem = GetModuleHandleA("engine2.dll");
         HMODULE client = GetModuleHandleA("client.dll");
-        const uintptr_t drawCandidate = client
-            ? FindPattern(client, DrawModelPattern) : 0;
+        uintptr_t drawCandidate = sceneSystem
+            ? FindPattern(sceneSystem, DrawModelPattern) : 0;
+        if (!drawCandidate && client)
+            drawCandidate = FindPattern(client, DrawModelPattern);
         if (drawCandidate && InstallContextHook(
                 drawModelTarget,
                 reinterpret_cast<void*>(drawCandidate),
