@@ -1237,8 +1237,9 @@ void RenderD2DMenu(std::size_t playerCount) {
                    g.visualTeam == 0 ? L"Glow on enemy model" : L"Glow on ally model",
                    teamGlowEnabled, teamGlowColor);
         const wchar_t* glowModes[] = {L"HP-based fill", L"Normal fill"};
+        int* teamGlowMode = g.visualTeam == 0 ? &enemyGlowMode : &allyGlowMode;
         DrawCombo(l, 401, rightX, firstY + 354, rightColorWidth, L"Glow mode",
-                  &glowMode, glowModes, 2);
+                  teamGlowMode, glowModes, 2);
         }
         }
     } else if (g.tab == 1) {

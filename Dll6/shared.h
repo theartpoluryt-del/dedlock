@@ -101,7 +101,7 @@ extern float enemyHealthBarColor[4], teammateHealthBarColor[4];
 extern float enemyHealthValueColor[4], teammateHealthValueColor[4];
 extern float enemyGlowColor[4], teammateGlowColor[4];
 extern bool enemyGlowEnabled, allyGlowEnabled;
-extern int glowMode;
+extern int enemyGlowMode, allyGlowMode;
 extern bool creepEspEnabled, creepBoxesEnabled, creepCornerBoxesEnabled;
 extern bool creepHealthEnabled, creepHealthValuesEnabled, creepDistanceEnabled;
 extern float creepBoxColor[4], creepHealthColor[4], creepHealthValueColor[4];

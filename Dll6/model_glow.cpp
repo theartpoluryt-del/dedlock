@@ -261,7 +261,8 @@ __int64 __fastcall HookPlayerOutline(
 
         // The current PlayerOutline contract uses mode 2 for HP-based fill
         // and mode 3 for the complete model fill.
-        return glowMode == 1 ? 3 : 2;
+        const int teamGlowMode = ally ? allyGlowMode : enemyGlowMode;
+        return teamGlowMode == 1 ? 3 : 2;
     }
 
     return originalResult;
@@ -479,7 +480,7 @@ void** __fastcall HookDrawModel(
         sceneView, sceneLayer, a7);
 
     if (!EnableExperimentalModelGlowPass ||
-        glowMode != 1 || !meshDraws || meshCount <= 0 ||
+        enemyGlowMode != 1 && allyGlowMode != 1 || !meshDraws || meshCount <= 0 ||
         !resourcesReady.load(std::memory_order_acquire)) {
         return result;
     }

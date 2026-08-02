@@ -87,7 +87,7 @@ float teammateHealthValueColor[4] = {0.70f, 0.85f, 1.00f, 1.00f};
 float enemyGlowColor[4] = {0.10f, 1.00f, 0.18f, 1.00f};
 float teammateGlowColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
 bool enemyGlowEnabled = true, allyGlowEnabled = false;
-int glowMode = 0;
+int enemyGlowMode = 0, allyGlowMode = 0;
 float enemyNameColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
 float teammateNameColor[4] = {0.35f, 0.75f, 1.00f, 1.00f};
 float enemySkeletonColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
@@ -275,7 +275,13 @@ void LoadConfig() {
         else if (key == "allyCreepHealthValueG") allyCreepHealthValueColor[1] = static_cast<float>(number);
         else if (key == "allyCreepHealthValueB") allyCreepHealthValueColor[2] = static_cast<float>(number);
         else if (key == "allyCreepHealthValueA") allyCreepHealthValueColor[3] = static_cast<float>(number);
-        else if (key == "glowMode") glowMode = static_cast<int>(number);
+        else if (key == "enemyGlowMode") enemyGlowMode = static_cast<int>(number);
+        else if (key == "allyGlowMode") allyGlowMode = static_cast<int>(number);
+        // Compatibility with older configs that had one shared mode.
+        else if (key == "glowMode") {
+            enemyGlowMode = static_cast<int>(number);
+            allyGlowMode = static_cast<int>(number);
+        }
         if (key == "drawOrbEsp") drawOrbEsp = value;
         else if (key == "drawSpectatorList") drawSpectatorList = value;
         if (key == "freeCam") freeCam = value;
@@ -459,7 +465,8 @@ void SaveConfig() {
             << "allyCreepHealthValueG " << allyCreepHealthValueColor[1] << '\n'
             << "allyCreepHealthValueB " << allyCreepHealthValueColor[2] << '\n'
             << "allyCreepHealthValueA " << allyCreepHealthValueColor[3] << '\n'
-           << "glowMode " << glowMode << '\n'
+           << "enemyGlowMode " << enemyGlowMode << '\n'
+           << "allyGlowMode " << allyGlowMode << '\n'
            << "drawOrbEsp " << drawOrbEsp << '\n'
            << "drawSpectatorList " << drawSpectatorList << '\n'
            << "freeCam " << freeCam << '\n'
