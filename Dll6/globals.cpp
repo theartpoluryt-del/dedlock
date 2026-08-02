@@ -86,6 +86,7 @@ float enemyHealthValueColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
 float teammateHealthValueColor[4] = {0.70f, 0.85f, 1.00f, 1.00f};
 float enemyGlowColor[4] = {0.10f, 1.00f, 0.18f, 1.00f};
 float teammateGlowColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
+bool enemyGlowEnabled = true, allyGlowEnabled = false;
 int glowMode = 0;
 float enemyNameColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
 float teammateNameColor[4] = {0.35f, 0.75f, 1.00f, 1.00f};
@@ -248,6 +249,8 @@ void LoadConfig() {
         else if (key == "teammateGlowG") teammateGlowColor[1] = static_cast<float>(number);
         else if (key == "teammateGlowB") teammateGlowColor[2] = static_cast<float>(number);
         else if (key == "teammateGlowA") teammateGlowColor[3] = static_cast<float>(number);
+        else if (key == "enemyGlowEnabled") enemyGlowEnabled = value;
+        else if (key == "allyGlowEnabled") allyGlowEnabled = value;
         if (key == "creepBoxR") creepBoxColor[0] = static_cast<float>(number);
         else if (key == "creepBoxG") creepBoxColor[1] = static_cast<float>(number);
         else if (key == "creepBoxB") creepBoxColor[2] = static_cast<float>(number);
@@ -414,6 +417,8 @@ void SaveConfig() {
            << "teammateGlowG " << teammateGlowColor[1] << '\n'
            << "teammateGlowB " << teammateGlowColor[2] << '\n'
            << "teammateGlowA " << teammateGlowColor[3] << '\n'
+           << "enemyGlowEnabled " << enemyGlowEnabled << '\n'
+           << "allyGlowEnabled " << allyGlowEnabled << '\n'
            << "enemyHealthBarR " << enemyHealthBarColor[0] << '\n'
            << "enemyHealthBarG " << enemyHealthBarColor[1] << '\n'
            << "enemyHealthBarB " << enemyHealthBarColor[2] << '\n'

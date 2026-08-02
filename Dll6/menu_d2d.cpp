@@ -1165,6 +1165,7 @@ void RenderD2DMenu(std::size_t playerCount) {
         float* teamPlayerColor = g.visualTeam == 0 ? enemyPlayerNameColor : teammatePlayerNameColor;
         float* teamHealthValueColor = g.visualTeam == 0 ? enemyHealthValueColor : teammateHealthValueColor;
         float* teamGlowColor = g.visualTeam == 0 ? enemyGlowColor : teammateGlowColor;
+        bool* teamGlowEnabled = g.visualTeam == 0 ? &enemyGlowEnabled : &allyGlowEnabled;
 
         if (g.visualTeam == 2) {
             DrawToggle(l, leftX, firstY, leftColorWidth, L"Creep ESP",
@@ -1233,7 +1234,8 @@ void RenderD2DMenu(std::size_t playerCount) {
         DrawToggle(l, rightX, firstY + 216, rightColumnWidth, L"Snaplines",
                    L"Draw lines to enemy", teamSnaplines, nullptr);
         DrawToggle(l, rightX, firstY + 288, rightColorWidth, L"Model glow",
-                   L"Glow on enemy model", &glowEnabled, teamGlowColor);
+                   g.visualTeam == 0 ? L"Glow on enemy model" : L"Glow on ally model",
+                   teamGlowEnabled, teamGlowColor);
         const wchar_t* glowModes[] = {L"HP-based fill", L"Normal fill"};
         DrawCombo(l, 401, rightX, firstY + 354, rightColorWidth, L"Glow mode",
                   &glowMode, glowModes, 2);

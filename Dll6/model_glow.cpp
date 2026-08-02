@@ -188,11 +188,15 @@ __int64 __fastcall HookPlayerOutline(
     const __int64 originalResult = originalPlayerOutline
         ? originalPlayerOutline(pawn, color, width) : 0;
 
-    if (glowEnabled && IsEnemyOutlinePawn(static_cast<uintptr_t>(pawn))) {
+    if (IsEnemyOutlinePawn(static_cast<uintptr_t>(pawn))) {
         const uint8_t localTeam = currentLocalPawn
             ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
         const uint8_t pawnTeam = Read<uint8_t>(static_cast<uintptr_t>(pawn) + Offsets::Team);
+        const bool validTeam = pawnTeam == 2 || pawnTeam == 3;
         const bool ally = localTeam >= 2 && localTeam <= 3 && pawnTeam == localTeam;
+        const bool teamGlowEnabled = ally ? allyGlowEnabled : enemyGlowEnabled;
+        if (!validTeam || !teamGlowEnabled)
+            return originalResult;
         const float* glowColor = ally ? teammateGlowColor : enemyGlowColor;
         float adjusted[4] = {
             glowColor[0], glowColor[1], glowColor[2], glowColor[3]};
@@ -213,9 +217,10 @@ __int64 __fastcall HookPlayerOutline(
 // written or spoofed.
 void __fastcall HookPlayerHealthGlowRender(
     void* renderer, void* arg1, void* arg2, void* arg3) {
-    // Normal fill must not use the renderer that derives the fill amount from
-    // current HP. Keep the original pass for the explicitly HP-based mode.
-    if (glowMode != 1 && originalPlayerHealthGlowRender)
+    // This callback is the actual model-fill submission on the current
+    // client. Suppressing it makes Normal fill completely invisible; the
+    // selected GlowType controls whether the pass is HP-clipped or full.
+    if (originalPlayerHealthGlowRender)
         originalPlayerHealthGlowRender(renderer, arg1, arg2, arg3);
 }
 
