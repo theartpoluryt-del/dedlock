@@ -87,9 +87,9 @@ constexpr size_t MaterialTintOffset = 0x04;
 constexpr size_t MaterialAlphaOffset = 0x10;
 // The engine's CPlayerHealthGlowRenderer now handles both selectable modes.
 // Keep the old experimental DrawModel duplicate pass out of the render path.
-// Normal fill is implemented by a second model submission.  The native
-// health renderer remains the source for HP-based fill.
-constexpr bool EnableExperimentalModelGlowPass = true;
+// The client outline query already supports the complete model fill as mode
+// 3. Keep the experimental duplicate model pass disabled.
+constexpr bool EnableExperimentalModelGlowPass = false;
 
 void LogGlowHook(const char* message) {
     std::ofstream log(
@@ -254,23 +254,14 @@ __int64 __fastcall HookPlayerOutline(
             return originalResult;
         const float* glowColor = ally ? teammateGlowColor : enemyGlowColor;
 
-        // The legacy glow worker is intentionally disabled. Keep the
-        // per-model CGlowProperty state synchronized at the point where the
-        // client asks for the outline; otherwise Normal fill inherits the
-        // previous HP-based state even though the UI mode changed.
-        const uintptr_t glow = static_cast<uintptr_t>(pawn) + Offsets::Glow;
-        Write<int>(glow + Offsets::GlowType, glowMode == 1 ? 2 : 1);
-        Write<float>(glow + Offsets::GlowTime, glowMode == 1 ? 0.0f : 1.0f);
-        Write<float>(glow + Offsets::GlowStartTime, 0.0f);
-        Write<bool>(glow + Offsets::GlowEligible, true);
-        Write<bool>(glow + Offsets::IsGlowing, true);
         float adjusted[4] = {
             glowColor[0], glowColor[1], glowColor[2], glowColor[3]};
         if (color) *color = GlowPackedColor(adjusted);
         if (width) *width = 4.0f;
 
-        // Type 1 is the HP-based pass; type 2 is the complete model fill.
-        return glowMode == 1 ? 2 : 1;
+        // The current PlayerOutline contract uses mode 2 for HP-based fill
+        // and mode 3 for the complete model fill.
+        return glowMode == 1 ? 3 : 2;
     }
 
     return originalResult;
@@ -282,40 +273,8 @@ __int64 __fastcall HookPlayerOutline(
 // written or spoofed.
 void __fastcall HookPlayerHealthGlowRender(
     void* renderer, void* arg1, void* arg2, void* arg3) {
-    if (!originalPlayerHealthGlowRender) return;
-
-    // The current client uses the same renderer for both UI modes; its fill
-    // height is derived from the pawn's current health. For Normal fill,
-    // temporarily present every enabled glow target as fully healed while
-    // the renderer builds its draw list, then restore the real values before
-    // returning to the game. HP-based mode follows the untouched path.
-    if (glowMode != 1) {
+    if (originalPlayerHealthGlowRender)
         originalPlayerHealthGlowRender(renderer, arg1, arg2, arg3);
-        return;
-    }
-
-    struct SavedHealth {
-        uintptr_t pawn{};
-        int health{};
-    };
-    std::vector<SavedHealth> saved;
-    {
-        std::lock_guard<std::mutex> lock(heroPawnsMutex);
-        saved.reserve(heroPawns.size());
-        for (const uintptr_t pawn : heroPawns) {
-            if (!pawn || pawn == currentLocalPawn || !IsGlowEnabledForPawn(pawn))
-                continue;
-            const int maxHealth = Read<int>(pawn + Offsets::MaxHealth);
-            if (maxHealth <= 0) continue;
-            saved.push_back({pawn, Read<int>(pawn + Offsets::Health)});
-            Write<int>(pawn + Offsets::Health, maxHealth);
-        }
-    }
-
-    originalPlayerHealthGlowRender(renderer, arg1, arg2, arg3);
-
-    for (const SavedHealth& entry : saved)
-        Write<int>(entry.pawn + Offsets::Health, entry.health);
 }
 
 struct SavedPipelineState {
