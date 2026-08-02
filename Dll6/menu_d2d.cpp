@@ -1258,8 +1258,10 @@ void RenderD2DMenu(std::size_t playerCount) {
     }
 
     const bool visualEditor = g.tab == 0;
+    const float visualPanelBottom = 790.0f;
     const D2D1_RECT_F cardRect = Rect(334, cardTop,
-                                      visualEditor ? 990.0f : 1414.0f, 818);
+                                      visualEditor ? 990.0f : 1414.0f,
+                                      visualEditor ? visualPanelBottom : 818.0f);
     GlowRounded(cardRect, 10, Color(0, 0, 0, 0.64f), 5, 2.0f);
     GradientRounded(cardRect, 10, Color(0.098f, 0.112f, 0.148f, 0.68f),
                     Color(0.105f, 0.116f, 0.154f, 0.71f), true);
