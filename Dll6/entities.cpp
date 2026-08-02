@@ -356,11 +356,9 @@ void ApplyHeroGlow(uintptr_t entity) {
     // glow pass is no longer active.
     {
         std::lock_guard lock(glowMutex);
-        // The current client uses 2 for the HP-clipped pass and 3 for the
-        // complete, non-HP-clipped model fill.  Values 1/2 belong to the
-        // previous client build and make Normal fill render as the wrong
-        // highlight style (or not render at all).
-        const int targetGlowType = glowMode == 1 ? 3 : 2;
+        // The current client uses type 1 for HP-based fill and type 2 for
+        // the complete model fill. Type 3 is not a visible fill pass here.
+        const int targetGlowType = glowMode == 1 ? 2 : 1;
         const int currentType = Read<int>(glow + Offsets::GlowType);
         const auto modeIt = registeredGlowMode.find(entity);
         const bool modeChanged = modeIt == registeredGlowMode.end() ||
@@ -385,7 +383,7 @@ void ApplyHeroGlow(uintptr_t entity) {
         ? glowColor[3] * healthAlpha : 1.0f;
     Write<Vector3>(glow + Offsets::GlowColor,
                    { glowColor[0], glowColor[1], glowColor[2] });
-    Write<int>(glow + Offsets::GlowType, glowMode == 1 ? 3 : 2);
+    Write<int>(glow + Offsets::GlowType, glowMode == 1 ? 2 : 1);
     Write<int>(glow + Offsets::GlowTeam, -1);
     Write<int>(glow + Offsets::GlowRange, 0);
     Write<int>(glow + Offsets::GlowRangeMin, 0);

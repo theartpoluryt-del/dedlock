@@ -238,9 +238,8 @@ __int64 __fastcall HookPlayerOutline(
         if (color) *color = GlowPackedColor(adjusted);
         if (width) *width = 4.0f;
 
-        // Mode 2 is the native HP-based fill. Mode 3 is the non-HP-clipped
-        // outline/fill mode. Mode 1 produces no fill in this client build.
-        return glowMode == 1 ? 3 : 2;
+        // Type 1 is the HP-based pass; type 2 is the complete model fill.
+        return glowMode == 1 ? 2 : 1;
     }
 
     return originalResult;
