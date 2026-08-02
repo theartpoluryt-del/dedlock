@@ -440,20 +440,22 @@ bool GetEntityBonePosition(uintptr_t entity, const char* boneName, Vector3& posi
     position = {};
     if (!entity || !boneName || !*boneName) return false;
     ResolveBoneFunctions();
-    if (!boneFunctions.getBoneIdByName) return false;
+    if (!boneFunctions.calcWorldSpaceBones ||
+        !boneFunctions.getBoneIdByName) return false;
 
     const uintptr_t sceneNode = Read<uintptr_t>(entity + Offsets::GameSceneNode);
     if (!sceneNode) return false;
 
     __try {
+        // Match the proven c3 visual path.  The per-Present depth fence has
+        // completed the rendered frame, so rebuilding once here produces the
+        // current world-space pose instead of consuming the lagging CPU cache.
+        boneFunctions.calcWorldSpaceBones(sceneNode, 0xFFFFFu);
         const int boneIndex = boneFunctions.getBoneIdByName(entity, boneName);
         if (boneIndex < 0 || boneIndex > 512) return false;
 
         // CModelState starts at CSkeletonInstance + 0x150 and the runtime
-        // bone pointer is the first field after its 0x80-byte prefix. Do not
-        // call CalcWorldSpaceBones from Present: the existing array is the
-        // animation snapshot that rendered the current backbuffer, while a
-        // forced calculation rebuilds it from newer simulation state.
+        // bone pointer is the first field after its 0x80-byte prefix.
         const uintptr_t bones = Read<uintptr_t>(sceneNode + 0x150 + 0x80);
         if (!bones) return false;
         const uintptr_t boneAddress =
@@ -479,7 +481,8 @@ bool GetEntityBoneSkeleton(uintptr_t entity, std::vector<BoneSegment>& segments)
     segments.clear();
     if (!entity) return false;
     ResolveBoneFunctions();
-    if (!boneFunctions.getBoneIdByName) return false;
+    if (!boneFunctions.calcWorldSpaceBones ||
+        !boneFunctions.getBoneIdByName) return false;
 
     const uintptr_t sceneNode = Read<uintptr_t>(entity + Offsets::GameSceneNode);
     if (!sceneNode) return false;
@@ -505,6 +508,7 @@ bool GetEntityBoneSkeleton(uintptr_t entity, std::vector<BoneSegment>& segments)
     };
 
     __try {
+        boneFunctions.calcWorldSpaceBones(sceneNode, 0xFFFFFu);
         const uintptr_t bones = Read<uintptr_t>(sceneNode + 0x150 + 0x80);
         if (!bones) return false;
 
@@ -722,24 +726,14 @@ bool CaptureDepthSnapshot() {
         return true;
     }
 
+    // Prefer the DSV that is still bound at this Present.  Mapping a copy of
+    // that exact resource fences the frame being displayed.  The tracked DSV
+    // is only a fallback for render paths that unbind depth before Present;
+    // preferring it introduced a stable one-frame phase delay for all ESP.
+    ID3D11DepthStencilView* depthView = nullptr;
+    pContext->OMGetRenderTargets(0, nullptr, &depthView);
     ID3D11Texture2D* depthTexture = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(trackedDepthMutex);
-        if (cachedGameDepth) {
-            depthTexture = cachedGameDepth;
-            depthTexture->AddRef();
-        }
-    }
-
-    // Fallback for the first frame, before OMSetRenderTargets has supplied
-    // the scene DSV.
-    if (!depthTexture) {
-        ID3D11DepthStencilView* depthView = nullptr;
-        pContext->OMGetRenderTargets(0, nullptr, &depthView);
-        if (!depthView) {
-            setDepthState(1);
-            return false;
-        }
+    if (depthView) {
         ID3D11Resource* resource = nullptr;
         depthView->GetResource(&resource);
         depthView->Release();
@@ -747,6 +741,18 @@ bool CaptureDepthSnapshot() {
             const HRESULT queryResult = resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&depthTexture));
             resource->Release();
             if (FAILED(queryResult) || !depthTexture) depthTexture = nullptr;
+        }
+        if (depthTexture) {
+            std::lock_guard<std::mutex> lock(trackedDepthMutex);
+            if (cachedGameDepth) cachedGameDepth->Release();
+            cachedGameDepth = depthTexture;
+            cachedGameDepth->AddRef();
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(trackedDepthMutex);
+        if (cachedGameDepth) {
+            depthTexture = cachedGameDepth;
+            depthTexture->AddRef();
         }
     }
 

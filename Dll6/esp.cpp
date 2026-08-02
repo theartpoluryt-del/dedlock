@@ -2034,8 +2034,8 @@ void RenderESP(const std::vector<PlayerData>& players) {
             ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
         const bool ally = localTeam != 0 && player.team == localTeam;
         const bool teamSnaplines = ally ? allySnaplinesEnabled : enemySnaplinesEnabled;
-        // worldPos and box bounds were produced from the same m_nodeToWorld
-        // sample and the same published view-projection matrix in GetPlayers.
+        // worldPos and box bounds use the fenced AbsOrigin sample. Bones are
+        // rebuilt from the same completed frame before they are projected.
         const Vector3 visualOrigin = player.worldPos;
         const float targetClipW =
             currentViewMatrix.m[3][0] * visualOrigin.x +
