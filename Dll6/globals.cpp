@@ -103,18 +103,31 @@ float allyCreepBoxColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
 float allyCreepHealthColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
 namespace {
 std::string ConfigPath() {
+    // Manual-map injectors do not register the image in the loader list, so
+    // GetModuleFileName(moduleHandle) can fail even though DllMain received a
+    // valid image base. The old relative fallback then read/wrote Dll6.ini in
+    // Deadlock's process working directory instead of next to the built DLL.
+    constexpr const char* StableConfigPath =
+        "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\Dll6.ini";
     char modulePath[MAX_PATH]{};
     if (!moduleHandle || !GetModuleFileNameA(moduleHandle, modulePath, MAX_PATH))
-        return "Dll6.ini";
+        return StableConfigPath;
     std::string path(modulePath);
     const size_t separator = path.find_last_of("\\/");
-    return (separator == std::string::npos ? std::string{} : path.substr(0, separator + 1)) + "Dll6.ini";
+    if (separator == std::string::npos) return StableConfigPath;
+    return path.substr(0, separator + 1) + "Dll6.ini";
 }
 }
 
 void LoadConfig() {
-    std::ifstream input(ConfigPath());
-    if (!input) return;
+    const std::string path = ConfigPath();
+    std::ifstream input(path);
+    if (!input) {
+        // Materialize the defaults once so every later injection has a stable,
+        // editable config file instead of silently loading nothing.
+        SaveConfig();
+        return;
+    }
     std::string key;
     double number = 0.0;
     while (input >> key >> number) {
