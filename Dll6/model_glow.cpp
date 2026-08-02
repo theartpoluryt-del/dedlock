@@ -240,6 +240,9 @@ static uint32_t GlowPackedColor(const float color[4]) {
 
 __int64 __fastcall HookPlayerOutline(
     __int64 pawn, uint32_t* color, float* width) {
+    const __int64 originalResult = originalPlayerOutline
+        ? originalPlayerOutline(pawn, color, width) : 0;
+
     if (IsEnemyOutlinePawn(static_cast<uintptr_t>(pawn))) {
         const uint8_t localTeam = currentLocalPawn
             ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
@@ -247,16 +250,8 @@ __int64 __fastcall HookPlayerOutline(
         const bool validTeam = pawnTeam == 2 || pawnTeam == 3;
         const bool ally = localTeam >= 2 && localTeam <= 3 && pawnTeam == localTeam;
         const bool teamGlowEnabled = ally ? allyGlowEnabled : enemyGlowEnabled;
-        // For real player pawns the feature owns the result completely.  Calling
-        // the game's function while this side is disabled leaves its previous
-        // team-independent result in the render queue, which made Enemy/Ally
-        // look coupled. Unknown/non-player objects still use the game result.
-        if (validTeam && !teamGlowEnabled)
-            return 0;
-        if (!validTeam)
-            return originalPlayerOutline
-                ? originalPlayerOutline(pawn, color, width) : 0;
-
+        if (!validTeam || !teamGlowEnabled)
+            return originalResult;
         const float* glowColor = ally ? teammateGlowColor : enemyGlowColor;
 
         float adjusted[4] = {
@@ -264,14 +259,12 @@ __int64 __fastcall HookPlayerOutline(
         if (color) *color = GlowPackedColor(adjusted);
         if (width) *width = 4.0f;
 
-        // The guide documents mode 2 for HP-based fill, but does not document
-        // mode 3 as Normal fill.  Use the native non-HP outline mode for Normal
-        // until a symbol/enum for a full-fill mode is available.
-        return glowMode == 1 ? 1 : 2;
+        // The current PlayerOutline contract uses mode 2 for HP-based fill
+        // and mode 3 for the complete model fill.
+        return glowMode == 1 ? 3 : 2;
     }
 
-    return originalPlayerOutline
-        ? originalPlayerOutline(pawn, color, width) : 0;
+    return originalResult;
 }
 
 // PlayerHealthGlowRenderer is the game pass that converts current HP into
