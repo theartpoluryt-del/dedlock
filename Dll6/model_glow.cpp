@@ -85,10 +85,8 @@ constexpr size_t MeshMaterialDescriptor = 0x08;
 constexpr size_t MaterialDescriptorSize = 0x108;
 constexpr size_t MaterialTintOffset = 0x04;
 constexpr size_t MaterialAlphaOffset = 0x10;
-// The native outline manager owns both selectable modes. In the current
-// client, CPlayerHealthGlowRenderer consumes only manager entries with mode 1;
-// mode 2 bypasses the health-clipped pass and marks the full model instead.
-// Keep the experimental duplicate DrawModel pass out of the render path.
+// The engine's CPlayerHealthGlowRenderer handles the existing HP-based path.
+// Keep the old experimental DrawModel duplicate pass out of the render path.
 constexpr bool EnableExperimentalModelGlowPass = false;
 
 void LogGlowHook(const char* message) {
@@ -259,18 +257,15 @@ __int64 __fastcall HookPlayerOutline(
         if (color) *color = GlowPackedColor(adjusted);
         if (width) *width = 4.0f;
 
-        // Verified against the current client call chain:
-        //   mode 1 -> CPlayerHealthGlowRenderer (height clipped by health)
-        //   mode 2 -> complete-model highlight, no health clipping
-        const int teamGlowMode = ally ? allyGlowMode : enemyGlowMode;
-        return teamGlowMode == 1 ? 2 : 1;
+        // Preserve the existing HP-based mode. Normal fill now follows the
+        // get_outline_mode hook contract supplied for the full outline: mode 2.
+        return 2;
     }
 
     return originalResult;
 }
 
-// PlayerHealthGlowRenderer converts mode-1 manager entries into the vertical
-// health fill. Normal fill uses mode 2 and therefore never enters that path.
+// Keep the native health renderer untouched; it owns the working HP fill.
 void __fastcall HookPlayerHealthGlowRender(
     void* renderer, void* arg1, void* arg2, void* arg3) {
     if (originalPlayerHealthGlowRender)

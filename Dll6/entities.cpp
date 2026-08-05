@@ -376,10 +376,12 @@ void ApplyHeroGlow(uintptr_t entity) {
     }
 
     const float* glowColor = ally ? teammateGlowColor : enemyGlowColor;
-    // Health controls the geometry height in the native mode-1 renderer. It
-    // must never be folded into alpha: doing so fades the whole model and made
-    // Normal fill visually indistinguishable from the HP-based variant.
-    const float glowAlpha = std::clamp(glowColor[3], 0.0f, 1.0f);
+    const int health = Read<int>(entity + Offsets::Health);
+    const int maxHealth = Read<int>(entity + Offsets::MaxHealth);
+    const float healthAlpha = maxHealth > 0
+        ? std::clamp(static_cast<float>(health) / maxHealth, 0.0f, 1.0f) : 0.0f;
+    const float glowAlpha = teamGlowMode == 0
+        ? glowColor[3] * healthAlpha : 1.0f;
     Write<Vector3>(glow + Offsets::GlowColor,
                    { glowColor[0], glowColor[1], glowColor[2] });
     Write<int>(glow + Offsets::GlowType, teamGlowMode == 1 ? 2 : 1);
@@ -392,7 +394,7 @@ void ApplyHeroGlow(uintptr_t entity) {
                        static_cast<uint8_t>(std::clamp(glowColor[2], 0.0f, 1.0f) * 255.0f),
                        static_cast<uint8_t>(std::clamp(glowAlpha, 0.0f, 1.0f) * 255.0f) });
     Write<bool>(glow + Offsets::GlowFlashing, false);
-    Write<float>(glow + Offsets::GlowTime, 0.0f);
+    Write<float>(glow + Offsets::GlowTime, teamGlowMode == 1 ? 0.0f : 1.0f);
     Write<float>(glow + Offsets::GlowStartTime, 0.0f);
     Write<bool>(glow + Offsets::GlowEligible, true);
     Write<bool>(glow + Offsets::IsGlowing, true);
