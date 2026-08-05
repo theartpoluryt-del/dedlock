@@ -559,7 +559,7 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
          g.regular.Get(), enabled ? Muted() : Red());
 
     const D2D1_RECT_F stage = Rect(x + 15, y + 74, x + width - 15, y + height - 24);
-    FillRounded(stage, 12, Color(0.008f, 0.010f, 0.014f, 1.0f));
+    FillRounded(stage, 12, Color(0.055f, 0.062f, 0.085f, 1.0f));
     StrokeRounded(stage, 12, Color(0.20f, 0.23f, 0.29f, 0.92f), 1.0f);
     // Keep the character aspect ratio from the source sheet. The previous
     // crop used coordinates for a 2048px image, while the embedded reference

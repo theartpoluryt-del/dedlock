@@ -16,8 +16,8 @@ using namespace DirectX;
 
 namespace {
 
-constexpr UINT kTargetWidth = 384;
-constexpr UINT kTargetHeight = 600;
+constexpr UINT kTargetWidth = 512;
+constexpr UINT kTargetHeight = 800;
 constexpr UINT kMaxJoints = 160;
 
 #pragma pack(push, 1)
@@ -330,9 +330,11 @@ float4 PSMain(VSOutput input) : SV_TARGET {
         return BaseFactor;
     float4 base = BaseTexture.Sample(LinearSampler, input.uv) * BaseFactor;
     float3 emissive = EmissiveTexture.Sample(LinearSampler, input.uv).rgb * EmissiveFactor.rgb;
-    float light = 0.38 + 0.62 * saturate(dot(normalize(input.normal), normalize(-LightDirection.xyz)));
-    float rim = pow(1.0 - saturate(abs(input.normal.z)), 3.0) * 0.16;
-    return float4(base.rgb * light + emissive * 0.80 + rim, base.a);
+    // Preview cards are small and must keep dark clothing, face details and
+    // boots readable. Use a soft front fill in addition to the key light.
+    float light = 0.72 + 0.48 * saturate(dot(normalize(input.normal), normalize(-LightDirection.xyz)));
+    float rim = pow(1.0 - saturate(abs(input.normal.z)), 3.0) * 0.22;
+    return float4(base.rgb * light + emissive + rim, base.a);
 }
 )";
 
@@ -642,7 +644,9 @@ bool RenderPreview3D(ID3D11Device* device, ID3D11DeviceContext* context,
     if (!UpdateBuffer(context, runtime.sceneBuffer.Get(), scene) ||
         !UpdateBones(context, frameIndex)) return false;
 
-    const float clear[4]{0, 0, 0, 0};
+    // Match the preview stage to the menu cards instead of compositing the
+    // character over an opaque black rectangle.
+    const float clear[4]{0.055f, 0.062f, 0.085f, 1.0f};
     context->OMSetRenderTargets(1, runtime.targetView.GetAddressOf(),
                                 runtime.depthView.Get());
     context->ClearRenderTargetView(runtime.targetView.Get(), clear);
