@@ -12,6 +12,7 @@ using DrawModelFn = void**(__fastcall*)(
     __int64, __int64, __int64*, int, __int64, __int64, __int64);
 using PlayerOutlineFn = __int64(__fastcall*)(
     __int64, uint32_t*, float*);
+using OutlineHealthFractionFn = float(__fastcall*)(__int64);
 using PlayerHealthGlowRenderFn = void(__fastcall*)(
     void*, void*, void*, void*);
 using DrawIndexedFn = void(STDMETHODCALLTYPE*)(
@@ -31,6 +32,7 @@ using CreateDeferredContextFn = HRESULT(STDMETHODCALLTYPE*)(
 
 DrawModelFn originalDrawModel = nullptr;
 PlayerOutlineFn originalPlayerOutline = nullptr;
+OutlineHealthFractionFn originalOutlineHealthFraction = nullptr;
 PlayerHealthGlowRenderFn originalPlayerHealthGlowRender = nullptr;
 DrawIndexedFn originalDrawIndexed = nullptr;
 DrawFn originalDraw = nullptr;
@@ -42,6 +44,7 @@ CreateDeferredContextFn originalCreateDeferredContext = nullptr;
 
 void* drawModelTarget = nullptr;
 void* playerOutlineTarget = nullptr;
+void* outlineHealthFractionTarget = nullptr;
 void* playerHealthGlowRenderTarget = nullptr;
 void* drawIndexedTarget = nullptr;
 void* drawTarget = nullptr;
@@ -75,6 +78,8 @@ constexpr char DrawModelPattern[] =
 constexpr char PlayerOutlinePattern[] =
     "4C 89 44 24 ? 48 89 54 24 ? 55 53 56 57 41 56 41 57 "
     "48 8D AC 24";
+constexpr char OutlineHealthFractionPattern[] =
+    "40 53 48 83 EC ? 48 8B 01 48 8B D9 FF 90 ? ? ? ? 85 C0 75";
 constexpr char PlayerHealthGlowRenderPattern[] =
     "48 8B C4 4C 89 48 20 48 89 48 08 55 48 8D A8 ? ? ? ? "
     "48 81 EC 20 06 00 00";
@@ -228,6 +233,17 @@ bool IsEnemyOutlinePawn(uintptr_t pawn) {
     return pawn != 0 && pawn != currentLocalPawn;
 }
 
+bool IsNormalFillPawn(uintptr_t pawn) {
+    if (!pawn || pawn == currentLocalPawn || !currentLocalPawn) return false;
+    const uint8_t localTeam = Read<uint8_t>(currentLocalPawn + Offsets::Team);
+    const uint8_t pawnTeam = Read<uint8_t>(pawn + Offsets::Team);
+    if ((localTeam != 2 && localTeam != 3) ||
+        (pawnTeam != 2 && pawnTeam != 3)) return false;
+    const bool ally = pawnTeam == localTeam;
+    return (ally ? allyGlowEnabled : enemyGlowEnabled) &&
+           (ally ? allyGlowMode : enemyGlowMode) == 1;
+}
+
 static uint32_t GlowPackedColor(const float color[4]) {
     const uint32_t r = static_cast<uint32_t>(std::clamp(color[0], 0.0f, 1.0f) * 255.0f);
     const uint32_t g = static_cast<uint32_t>(std::clamp(color[1], 0.0f, 1.0f) * 255.0f);
@@ -263,6 +279,15 @@ __int64 __fastcall HookPlayerOutline(
     }
 
     return originalResult;
+}
+
+// The mode hook selects the outline pipeline, while this native helper
+// supplies its vertical health fraction.  Only Normal fill replaces that
+// fraction; HP-based continues through the original function unchanged.
+float __fastcall HookOutlineHealthFraction(__int64 pawn) {
+    const float fraction = originalOutlineHealthFraction
+        ? originalOutlineHealthFraction(pawn) : 0.0f;
+    return IsNormalFillPawn(static_cast<uintptr_t>(pawn)) ? 1.0f : fraction;
 }
 
 // Keep the native health renderer untouched; it owns the working HP fill.
@@ -784,6 +809,21 @@ bool InstallModelGlowHook() {
         }
     }
 
+    if (!outlineHealthFractionTarget) {
+        HMODULE client = GetModuleHandleA("client.dll");
+        const uintptr_t candidate = client
+            ? FindPattern(client, OutlineHealthFractionPattern) : 0;
+        if (candidate && InstallContextHook(
+                outlineHealthFractionTarget,
+                reinterpret_cast<void*>(candidate),
+                reinterpret_cast<void*>(&HookOutlineHealthFraction),
+                originalOutlineHealthFraction)) {
+            LogGlowHook("client outline health fraction hook installed");
+        } else {
+            LogGlowHook("client outline health fraction pattern not found or hook failed");
+        }
+    }
+
     if (!drawModelTarget) {
         // The current model submission is emitted by scenesystem.dll. Keep
         // engine2/client as compatibility fallbacks for older builds.
@@ -840,6 +880,7 @@ void RemoveModelGlowHook() {
     RemoveHookTarget(drawModelTarget);
     RemoveHookTarget(createDeferredContextTarget);
     RemoveHookTarget(playerOutlineTarget);
+    RemoveHookTarget(outlineHealthFractionTarget);
     RemoveHookTarget(playerHealthGlowRenderTarget);
 
     originalDrawInstanced = nullptr;
@@ -851,6 +892,7 @@ void RemoveModelGlowHook() {
     originalDrawModel = nullptr;
     originalCreateDeferredContext = nullptr;
     originalPlayerOutline = nullptr;
+    originalOutlineHealthFraction = nullptr;
     originalPlayerHealthGlowRender = nullptr;
 
     if (glowRasterizerState) glowRasterizerState->Release();
