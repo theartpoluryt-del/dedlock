@@ -85,10 +85,10 @@ constexpr size_t MeshMaterialDescriptor = 0x08;
 constexpr size_t MaterialDescriptorSize = 0x108;
 constexpr size_t MaterialTintOffset = 0x04;
 constexpr size_t MaterialAlphaOffset = 0x10;
-// The engine's CPlayerHealthGlowRenderer now handles both selectable modes.
-// Keep the old experimental DrawModel duplicate pass out of the render path.
-// The client outline query already supports the complete model fill as mode
-// 3. Keep the experimental duplicate model pass disabled.
+// The native outline manager owns both selectable modes. In the current
+// client, CPlayerHealthGlowRenderer consumes only manager entries with mode 1;
+// mode 2 bypasses the health-clipped pass and marks the full model instead.
+// Keep the experimental duplicate DrawModel pass out of the render path.
 constexpr bool EnableExperimentalModelGlowPass = false;
 
 void LogGlowHook(const char* message) {
@@ -259,19 +259,18 @@ __int64 __fastcall HookPlayerOutline(
         if (color) *color = GlowPackedColor(adjusted);
         if (width) *width = 4.0f;
 
-        // The current PlayerOutline contract uses mode 2 for HP-based fill
-        // and mode 3 for the complete model fill.
+        // Verified against the current client call chain:
+        //   mode 1 -> CPlayerHealthGlowRenderer (height clipped by health)
+        //   mode 2 -> complete-model highlight, no health clipping
         const int teamGlowMode = ally ? allyGlowMode : enemyGlowMode;
-        return teamGlowMode == 1 ? 3 : 2;
+        return teamGlowMode == 1 ? 2 : 1;
     }
 
     return originalResult;
 }
 
-// PlayerHealthGlowRenderer is the game pass that converts current HP into
-// the vertical fill height.  In Normal fill we suppress only this HP pass;
-// the regular CGlow full-model pass remains enabled and entity health is never
-// written or spoofed.
+// PlayerHealthGlowRenderer converts mode-1 manager entries into the vertical
+// health fill. Normal fill uses mode 2 and therefore never enters that path.
 void __fastcall HookPlayerHealthGlowRender(
     void* renderer, void* arg1, void* arg2, void* arg3) {
     if (originalPlayerHealthGlowRender)

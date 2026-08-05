@@ -592,11 +592,11 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
         modelRect = Rect(previewCenterX - modelHalfWidth, modelTop,
                          previewCenterX + modelHalfWidth, modelBottom);
     }
-    if (!g.preview3dActive && g.previewHeroBitmap) {
-        // Front view from the in-game Infernus model reference sheet.
-        g.target->DrawBitmap(g.previewHeroBitmap.Get(), modelRect, 1.0f,
-            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-            Rect(620.0f, 170.0f, 1135.0f, 1310.0f));
+    if (!g.preview3dActive) {
+        Text(L"3D preview unavailable",
+             Rect(stage.left + 12, stage.top, stage.right - 12, stage.bottom),
+             g.centered.Get(), Red(0.82f));
+        return;
     }
     if (!enabled) return;
 
@@ -875,7 +875,6 @@ bool LoadEmbeddedBitmap(UINT resourceId, ComPtr<ID2D1Bitmap>& output) {
 
 void LoadEmbeddedAssets() {
     LoadEmbeddedBitmap(IDR_DEADLOCK_LOGO, g.logoBitmap);
-    LoadEmbeddedBitmap(IDR_ESP_PREVIEW_HERO, g.previewHeroBitmap);
     const UINT iconIds[4]{IDR_ICON_EYE, IDR_ICON_CROSSHAIR,
                           IDR_ICON_SPROUT, IDR_ICON_SETTINGS};
     for (int i = 0; i < 4; ++i)
@@ -884,7 +883,7 @@ void LoadEmbeddedAssets() {
 
 bool BindPreview3DFrame(const Preview3DFrame& frame,
                         ID3D11DeviceContext* context) {
-    if (!frame.texture || !g.target || g.softwareTarget) return false;
+    if (!frame.texture || !g.target || !context) return false;
     if (g.preview3dTexture.Get() != frame.texture || !g.preview3dBitmap) {
         g.preview3dBitmap.Reset();
         g.preview3dTexture.Reset();
@@ -894,7 +893,10 @@ bool BindPreview3DFrame(const Preview3DFrame& frame,
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
                               D2D1_ALPHA_MODE_PREMULTIPLIED),
             96.0f, 96.0f);
-        if (SUCCEEDED(frame.texture->QueryInterface(
+        // WIC software targets cannot share a DXGI surface. Use the staging
+        // texture readback below for those targets.
+        if (!g.softwareTarget &&
+            SUCCEEDED(frame.texture->QueryInterface(
                 IID_PPV_ARGS(surface.GetAddressOf()))) &&
             SUCCEEDED(g.target->CreateSharedBitmap(
                 __uuidof(IDXGISurface), surface.Get(), &properties,
@@ -1213,7 +1215,7 @@ void RenderD2DMenu(std::size_t playerCount) {
         static_cast<UINT>(io.DisplaySize.x),
         static_cast<UINT>(io.DisplaySize.y));
     g.preview3dActive = false;
-    if (!g.softwareTarget && g.tab == 0 && pDevice && pContext) {
+    if (g.tab == 0 && pDevice && pContext) {
         static const ULONGLONG previewStart = GetTickCount64();
         Preview3DFrame previewFrame{};
         const float previewTime = static_cast<float>(

@@ -361,8 +361,8 @@ void ApplyHeroGlow(uintptr_t entity) {
     // glow pass is no longer active.
     {
         std::lock_guard lock(glowMutex);
-        // The current client uses type 1 for HP-based fill and type 2 for
-        // the complete model fill. Type 3 is not a visible fill pass here.
+        // Keep CGlowProperty in sync with the outline-manager contract:
+        // type 1 is health-clipped, type 2 is the complete model fill.
         const int targetGlowType = teamGlowMode == 1 ? 2 : 1;
         const int currentType = Read<int>(glow + Offsets::GlowType);
         const auto modeIt = registeredGlowMode.find(entity);
@@ -376,12 +376,10 @@ void ApplyHeroGlow(uintptr_t entity) {
     }
 
     const float* glowColor = ally ? teammateGlowColor : enemyGlowColor;
-    const int health = Read<int>(entity + Offsets::Health);
-    const int maxHealth = Read<int>(entity + Offsets::MaxHealth);
-    const float healthAlpha = maxHealth > 0
-        ? std::clamp(static_cast<float>(health) / maxHealth, 0.0f, 1.0f) : 0.0f;
-    const float glowAlpha = teamGlowMode == 0
-        ? glowColor[3] * healthAlpha : 1.0f;
+    // Health controls the geometry height in the native mode-1 renderer. It
+    // must never be folded into alpha: doing so fades the whole model and made
+    // Normal fill visually indistinguishable from the HP-based variant.
+    const float glowAlpha = std::clamp(glowColor[3], 0.0f, 1.0f);
     Write<Vector3>(glow + Offsets::GlowColor,
                    { glowColor[0], glowColor[1], glowColor[2] });
     Write<int>(glow + Offsets::GlowType, teamGlowMode == 1 ? 2 : 1);
@@ -394,7 +392,7 @@ void ApplyHeroGlow(uintptr_t entity) {
                        static_cast<uint8_t>(std::clamp(glowColor[2], 0.0f, 1.0f) * 255.0f),
                        static_cast<uint8_t>(std::clamp(glowAlpha, 0.0f, 1.0f) * 255.0f) });
     Write<bool>(glow + Offsets::GlowFlashing, false);
-    Write<float>(glow + Offsets::GlowTime, teamGlowMode == 1 ? 0.0f : 1.0f);
+    Write<float>(glow + Offsets::GlowTime, 0.0f);
     Write<float>(glow + Offsets::GlowStartTime, 0.0f);
     Write<bool>(glow + Offsets::GlowEligible, true);
     Write<bool>(glow + Offsets::IsGlowing, true);
@@ -1017,12 +1015,18 @@ DWORD WINAPI GlowApplyWorker(LPVOID) {
             if (health > 0 && lifeState == 0 && (team == 2 || team == 3) &&
                 pawn != currentLocalPawn &&
                 (localTeam == 0 || localTeam == 2 || localTeam == 3)) {
-                if (glowEnabled) {
+                const bool ally = localTeam >= 2 && localTeam <= 3 && team == localTeam;
+                const bool teamGlowEnabled = ally ? allyGlowEnabled : enemyGlowEnabled;
+                if (glowEnabled && teamGlowEnabled) {
                     ApplyHeroGlow(pawn);
                 } else {
                     Write<bool>(pawn + Offsets::Glow + Offsets::GlowEligible, false);
                     Write<bool>(pawn + Offsets::Glow + Offsets::IsGlowing, false);
                     Write<int>(pawn + Offsets::Glow + Offsets::GlowType, 0);
+                    std::lock_guard lock(glowMutex);
+                    registeredGlowMode.erase(pawn);
+                    registeredGlows.erase(pawn);
+                    queuedGlows.erase(pawn);
                 }
             }
         }
