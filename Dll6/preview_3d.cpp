@@ -621,7 +621,7 @@ bool RenderPreview3D(ID3D11Device* device, ID3D11DeviceContext* context,
     // A preview card needs a stable, front-facing hero-card composition.
     // Perspective made whichever leg was closer to the camera appear huge,
     // giving the model an unwanted bottom-up angle in the narrow portrait UI.
-    const float yaw = XM_PI;
+    const float yaw = 0.0f;
     // VRF has already converted Source coordinates to glTF metres/Y-up.
     const XMMATRIX world = XMMatrixTranslation(0.08f, -1.32f, 0.0f) *
                            XMMatrixRotationY(yaw);
