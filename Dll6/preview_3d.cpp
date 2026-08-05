@@ -618,19 +618,20 @@ bool RenderPreview3D(ID3D11Device* device, ID3D11DeviceContext* context,
         runtime.header.frameCount - 1,
         static_cast<uint32_t>(animationTime * runtime.header.fps));
 
-    const float yaw = XM_PI +
-        std::sin(elapsedSeconds * 0.42f) * XMConvertToRadians(7.0f);
+    // A preview card needs a stable, front-facing hero-card composition.
+    // Perspective made whichever leg was closer to the camera appear huge,
+    // giving the model an unwanted bottom-up angle in the narrow portrait UI.
+    const float yaw = XM_PI;
     // VRF has already converted Source coordinates to glTF metres/Y-up.
-    // Center the 2.64 m model around the preview camera before applying the
-    // subtle showroom rotation.
     const XMMATRIX world = XMMatrixTranslation(0.08f, -1.32f, 0.0f) *
                            XMMatrixRotationY(yaw);
     const XMMATRIX view = XMMatrixLookAtLH(
-        XMVectorSet(0, 0, -10.6f, 1), XMVectorZero(),
+        XMVectorSet(0, 0.04f, -10.6f, 1), XMVectorSet(0, 0.04f, 0, 1),
         XMVectorSet(0, 1, 0, 0));
-    const XMMATRIX projection = XMMatrixPerspectiveFovLH(
-        XMConvertToRadians(25.0f),
-        static_cast<float>(kTargetWidth) / kTargetHeight, 1.0f, 1000.0f);
+    const float heroCardHeight = 3.55f;
+    const XMMATRIX projection = XMMatrixOrthographicLH(
+        heroCardHeight * static_cast<float>(kTargetWidth) / kTargetHeight,
+        heroCardHeight, 1.0f, 1000.0f);
 
     SceneConstants scene{};
     XMStoreFloat4x4(&scene.viewProjection,
