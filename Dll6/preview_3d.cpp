@@ -18,7 +18,10 @@ namespace {
 
 constexpr UINT kTargetWidth = 512;
 constexpr UINT kTargetHeight = 800;
-constexpr UINT kMaxJoints = 160;
+// The source model has four independent skin palettes (157 joints each).
+// Keep their inverse-bind transforms independent instead of forcing every
+// mesh through skin 0.
+constexpr UINT kMaxJoints = 640;
 
 #pragma pack(push, 1)
 struct AssetHeader {
@@ -266,7 +269,7 @@ cbuffer Scene : register(b0) {
     float4 LightDirection;
     float4 ModelParameters;
 };
-cbuffer Skin : register(b1) { float4 BoneRows[480]; };
+cbuffer Skin : register(b1) { float4 BoneRows[1920]; };
 cbuffer Material : register(b2) {
     float4 BaseFactor;
     float4 EmissiveFactor;
