@@ -543,6 +543,56 @@ bool GetEntityBoneSkeleton(uintptr_t entity, std::vector<BoneSegment>& segments)
     return !segments.empty();
 }
 
+bool GetEntityPreviewSkeleton(uintptr_t entity,
+                              std::array<Vector3, 18>& points,
+                              std::array<bool, 18>& valid) {
+    points = {};
+    valid = {};
+    if (!entity) return false;
+    ResolveBoneFunctions();
+    if (!boneFunctions.calcWorldSpaceBones ||
+        !boneFunctions.getBoneIdByName) return false;
+    const uintptr_t sceneNode = Read<uintptr_t>(entity + Offsets::GameSceneNode);
+    if (!sceneNode) return false;
+    static constexpr const char* names[18]{
+        "head", "spine_3", "spine_2",
+        "arm_upper_L", "arm_lower_L", "hand_L", "wrist_L",
+        "arm_upper_R", "arm_lower_R", "hand_R", "wrist_R",
+        "spine_0", "leg_upper_L", "leg_lower_L", "foot_L",
+        "leg_upper_R", "leg_lower_R", "foot_R"
+    };
+    __try {
+        boneFunctions.calcWorldSpaceBones(sceneNode, 0xFFFFFu);
+        const uintptr_t bones = Read<uintptr_t>(sceneNode + 0x1D0);
+        if (!bones) return false;
+        for (size_t i = 0; i < std::size(names); ++i) {
+            int index = boneFunctions.getBoneIdByName(entity, names[i]);
+            const auto tryBone = [&](const char* alternate) {
+                if (index < 0)
+                    index = boneFunctions.getBoneIdByName(entity, alternate);
+            };
+            if (i == 4) { tryBone("forearm_L"); tryBone("elbow_L"); }
+            if (i == 5 || i == 6) { tryBone("wrist_L"); tryBone("hand_L"); }
+            if (i == 8) { tryBone("forearm_R"); tryBone("elbow_R"); }
+            if (i == 9 || i == 10) { tryBone("wrist_R"); tryBone("hand_R"); }
+            if (i == 14) { tryBone("ankle_L"); tryBone("leg_L_IKTARGET"); }
+            if (i == 17) { tryBone("ankle_R"); tryBone("leg_R_IKTARGET"); }
+            if (index < 0 || index > 512) continue;
+            const Vector3 position = Read<Vector3>(
+                bones + static_cast<uintptr_t>(index) * 0x20);
+            if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+                !std::isfinite(position.z)) continue;
+            points[i] = position;
+            valid[i] = true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        points = {};
+        valid = {};
+        return false;
+    }
+    return std::count(valid.begin(), valid.end(), true) >= 10;
+}
+
 bool GetAimAnglesFromScreen(float screenX, float screenY, Vector3& angles) {
     if (!currentViewMatrixReady) return false;
 

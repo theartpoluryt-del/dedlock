@@ -6,6 +6,7 @@
 #include <d3dcompiler.h>
 #include <psapi.h>
 #include <algorithm>
+#include <array>
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -48,6 +49,8 @@ struct EspStatus { bool entitySystemReady=false, localPawnFound=false, heroPawns
 struct WindowSearchData { DWORD processId; HWND window; };
 typedef HRESULT(__stdcall* PresentFn)(IDXGISwapChain*, UINT, UINT);
 constexpr UINT ApplyGlowMessage = WM_APP + 0x4D;
+constexpr UINT PanoramaPreviewUiMessage = WM_APP + 0x4E;
+constexpr UINT PanoramaPreviewGlowMessage = WM_APP + 0x4F;
 extern bool freeCam;
 extern bool freeCamActive;
 extern int freeCamKey;
@@ -109,6 +112,9 @@ extern bool allyCreepEspEnabled, allyCreepBoxesEnabled, allyCreepCornerBoxesEnab
 extern bool allyCreepHealthEnabled, allyCreepHealthValuesEnabled, allyCreepDistanceEnabled;
 extern float allyCreepBoxColor[4], allyCreepHealthColor[4], allyCreepHealthValueColor[4];
 extern float boxThickness, cornerBoxLength;
+extern bool fovChangerEnabled, overrideScopeFov;
+extern int menuTheme; extern float menuAccentColor[4];
+extern float cameraFov, scopedCameraFov;
 extern volatile ULONGLONG lastSilentAttackAppliedAt;
 extern volatile LONG autoOrbAttackAppliedCount;
 extern bool farmToggleMode, farmToggleActive, farmToggleLastDown;
@@ -121,6 +127,7 @@ extern bool runtimeOffsetsReady;
 extern std::string runtimeBuildKey;
 bool InitializeNativeGlow();
 bool RegisterNativeGlow(uintptr_t entity);
+bool RegisterNativePreviewGlow(uintptr_t entity);
 extern bool nativeGlowReady;
 std::string GetEntityDesignerName(uint32_t);
 extern bool orbEntityEventsAvailable;
@@ -137,6 +144,8 @@ extern ID3D11Device* pDevice; extern ID3D11DeviceContext* pContext; extern ID3D1
 template<typename T> T Read(uintptr_t address) { T value{}; if (!address) return value; __try { value=*reinterpret_cast<T*>(address); } __except(EXCEPTION_EXECUTE_HANDLER) { value=T{}; } return value; }
 template<typename T> void Write(uintptr_t address,const T& value) { if (!address) return; __try { *reinterpret_cast<T*>(address)=value; } __except(EXCEPTION_EXECUTE_HANDLER) {} }
  bool WorldToScreen(const Vector3&,Vector2&,const Matrix4x4&); void ArmGameDepthCapture(); void TrackGameDepthStencil(ID3D11DepthStencilView*); bool CaptureDepthSnapshot(); bool ReadDepthAt(float,float,float&); bool IsDepthBufferPopulated(); bool GetEntityBonePosition(uintptr_t,const char*,Vector3&); bool GetEntityBoneSkeleton(uintptr_t,std::vector<BoneSegment>&); bool GetAimPointScreen(const PlayerData&,float,Vector2&); bool GetAimAnglesFromScreen(float,float,Vector3&); bool IsAimPointVisible(const PlayerData&,float,float,float); bool IsWorldAimPointVisible(const Vector3&,uintptr_t=0); void ProcessAimVisibilityTraces(); void AimAtClosestEnemy(const std::vector<PlayerData>&); void FarmAimAssist(const std::vector<PlayerData>&); void AutoLastHitOrbs(); void AutoParry(const std::vector<PlayerData>&); void ReleaseAimResources();
+bool GetEntityPreviewSkeleton(uintptr_t, std::array<Vector3,18>&,
+                              std::array<bool,18>&);
 bool InstallMeleeStateMonitor(); void RemoveMeleeStateMonitor();
 bool InstallSoundEventHook(); void RemoveSoundEventHook();
 bool InstallModelGlowHook(); void RemoveModelGlowHook();

@@ -724,6 +724,7 @@ bool InitializeRuntimeOffsets() {
 namespace {
 using NativeGlowRegisterFn = void(__fastcall*)(uintptr_t);
 NativeGlowRegisterFn nativeGlowRegister = nullptr;
+NativeGlowRegisterFn nativePreviewGlowRegister = nullptr;
 
 uintptr_t FindNativeGlowWrapper() {
     const char* pattern =
@@ -740,7 +741,14 @@ uintptr_t FindNativeGlowWrapper() {
 }
 
 bool InitializeNativeGlow() {
+    const uintptr_t previewWrapper = FindModulePattern(
+        reinterpret_cast<HMODULE>(clientBase),
+        "48 89 5C 24 18 57 48 83 EC 30 48 8B F9 E8 ? ? ? ? "
+        "48 8B 07 4C 8D 44 24 48 48 8D 54 24 40 C7 44 24 40 00 00 00 00 "
+        "48 8B CF FF 90 60 09 00 00 8B D8 E8 ? ? ? ? F3 0F 10 44 24 48 "
+        "4C 8D 4C 24 40 44 8B C3 F3 0F 11 44 24 20 48 8B D7 48 8B C8 E8 ? ? ? ?");
     const uintptr_t wrapper = FindNativeGlowWrapper();
+    nativePreviewGlowRegister = reinterpret_cast<NativeGlowRegisterFn>(previewWrapper);
     if (!wrapper) {
         nativeGlowReady = false;
         return false;
@@ -749,6 +757,17 @@ bool InitializeNativeGlow() {
     nativeGlowReady = true;
     printf("[+] Native glow wrapper: %p\n", reinterpret_cast<void*>(wrapper));
     return true;
+}
+
+bool RegisterNativePreviewGlow(uintptr_t entity) {
+    if (!nativePreviewGlowRegister || !entity) return false;
+    __try {
+        nativePreviewGlowRegister(entity);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        nativePreviewGlowRegister = nullptr;
+        return false;
+    }
 }
 
 bool RegisterNativeGlow(uintptr_t entity) {

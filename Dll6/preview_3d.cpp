@@ -16,12 +16,15 @@ using namespace DirectX;
 
 namespace {
 
-constexpr UINT kTargetWidth = 512;
-constexpr UINT kTargetHeight = 800;
-// The source model has four independent skin palettes (157 joints each).
-// Keep their inverse-bind transforms independent instead of forcing every
-// mesh through skin 0.
-constexpr UINT kMaxJoints = 640;
+// The bitmap is displayed in a small portrait card, so rendering directly at
+// the old 512x800 size caused a second, very visible downsample in D2D. Keep
+// a 2x working surface and let the card do only the final resize.
+constexpr UINT kTargetWidth = 1024;
+constexpr UINT kTargetHeight = 1600;
+// The asset currently contains five independent skin palettes (157 joints
+// each, 785 joints total). Keep all palettes addressable; forcing the model
+// through the first palette is what makes detached limbs disappear.
+constexpr UINT kMaxJoints = 800;
 
 #pragma pack(push, 1)
 struct AssetHeader {
@@ -182,25 +185,33 @@ bool DecodeImage(ID3D11Device* device, const uint8_t* bytes, uint32_t size,
     D3D11_TEXTURE2D_DESC description{};
     description.Width = width;
     description.Height = height;
-    description.MipLevels = 1;
+    // Build a complete mip chain. The source atlases are up to 4096px wide
+    // while the preview is only a few hundred pixels on screen; sampling mip
+    // 0 directly smears fine facial/clothing detail during the D2D resize.
+    description.MipLevels = 0;
     description.ArraySize = 1;
     // The preview target is consumed by a D2D UNORM bitmap. Keep texture
     // sampling in the same color space so the model does not become too dark
     // from an unmatched sRGB decode/encode pair.
     description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     description.SampleDesc.Count = 1;
-    description.Usage = D3D11_USAGE_IMMUTABLE;
-    description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    D3D11_SUBRESOURCE_DATA data{};
-    data.pSysMem = pixels.data();
-    data.SysMemPitch = stride;
+    description.Usage = D3D11_USAGE_DEFAULT;
+    description.BindFlags = D3D11_BIND_SHADER_RESOURCE |
+                            D3D11_BIND_RENDER_TARGET;
+    description.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
     ComPtr<ID3D11Texture2D> texture;
     if (FAILED(device->CreateTexture2D(
-            &description, &data, texture.GetAddressOf())) ||
+            &description, nullptr, texture.GetAddressOf())) ||
         FAILED(device->CreateShaderResourceView(
             texture.Get(), nullptr, output.GetAddressOf()))) {
         return false;
     }
+    ComPtr<ID3D11DeviceContext> context;
+    device->GetImmediateContext(context.GetAddressOf());
+    if (!context) return false;
+    context->UpdateSubresource(texture.Get(), 0, nullptr, pixels.data(),
+                               stride, 0);
+    context->GenerateMips(output.Get());
     return true;
 }
 
@@ -269,7 +280,7 @@ cbuffer Scene : register(b0) {
     float4 LightDirection;
     float4 ModelParameters;
 };
-cbuffer Skin : register(b1) { float4 BoneRows[1920]; };
+cbuffer Skin : register(b1) { float4 BoneRows[2400]; };
 cbuffer Material : register(b2) {
     float4 BaseFactor;
     float4 EmissiveFactor;
@@ -295,7 +306,12 @@ VSOutput VSMain(VSInput input) {
     float4 localPosition = 0;
     float3 localNormal = 0;
     [unroll] for (int i = 0; i < 4; ++i) {
-        uint row = input.joints[i] * 3;
+        uint joint = input.joints[i];
+        // Keep malformed/unused influences from indexing the constant buffer.
+        // Valid vertices in the bundled asset use five 157-joint palettes.
+        if (joint >= 800 || input.weights[i] <= 0.0)
+            continue;
+        uint row = joint * 3;
         float4 position = float4(input.position, 1.0);
         float3 skinnedPosition = float3(
             dot(BoneRows[row + 0], position),
@@ -454,7 +470,7 @@ bool Initialize(ID3D11Device* device) {
     if (std::memcmp(runtime.header.magic, "D6P3D001", 8) != 0 ||
         runtime.header.version != 1 ||
         runtime.header.jointCount > kMaxJoints ||
-        runtime.header.pointCount != 18 ||
+        (runtime.header.pointCount != 18 && runtime.header.pointCount != 0) ||
         !runtime.header.vertexCount || !runtime.header.indexCount ||
         !runtime.header.frameCount) {
         return false;
@@ -647,9 +663,9 @@ bool RenderPreview3D(ID3D11Device* device, ID3D11DeviceContext* context,
     if (!UpdateBuffer(context, runtime.sceneBuffer.Get(), scene) ||
         !UpdateBones(context, frameIndex)) return false;
 
-    // Match the preview stage to the menu cards instead of compositing the
-    // character over an opaque black rectangle.
-    const float clear[4]{0.055f, 0.062f, 0.085f, 1.0f};
+    // Match the ESP panel exactly. Keeping both APIs at opaque black avoids
+    // a visible horizontal seam from their different colour pipelines.
+    const float clear[4]{0.0f, 0.0f, 0.0f, 1.0f};
     context->OMSetRenderTargets(1, runtime.targetView.GetAddressOf(),
                                 runtime.depthView.Get());
     context->ClearRenderTargetView(runtime.targetView.Get(), clear);

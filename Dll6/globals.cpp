@@ -96,6 +96,12 @@ float enemyHealthColor[4] = {0.20f, 1.00f, 0.25f, 1.00f};
 float teammateHealthColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
 float boxThickness = 1.20f;
 float cornerBoxLength = 0.24f;
+bool fovChangerEnabled = false;
+bool overrideScopeFov = false;
+int menuTheme = 0;
+float menuAccentColor[4] = {0.15f, 0.62f, 1.00f, 1.00f};
+float cameraFov = 90.0f;
+float scopedCameraFov = 90.0f;
 bool creepEspEnabled = false, creepBoxesEnabled = true, creepCornerBoxesEnabled = false;
 bool creepHealthEnabled = true, creepHealthValuesEnabled = true, creepDistanceEnabled = true;
 float creepBoxColor[4] = {1.00f, 0.67f, 0.05f, 1.00f};
@@ -287,6 +293,14 @@ void LoadConfig() {
         if (key == "freeCam") freeCam = value;
         else if (key == "freeCamKey") freeCamKey = static_cast<int>(number);
         else if (key == "freeCamSpeed") freeCamSpeed = static_cast<float>(number);
+        else if (key == "fovChangerEnabled") fovChangerEnabled = value;
+        else if (key == "menuTheme") menuTheme = std::clamp(static_cast<int>(number), 0, 2);
+        else if (key == "menuAccentR") menuAccentColor[0] = std::clamp(static_cast<float>(number), 0.0f, 1.0f);
+        else if (key == "menuAccentG") menuAccentColor[1] = std::clamp(static_cast<float>(number), 0.0f, 1.0f);
+        else if (key == "menuAccentB") menuAccentColor[2] = std::clamp(static_cast<float>(number), 0.0f, 1.0f);
+        else if (key == "overrideScopeFov") overrideScopeFov = value;
+        else if (key == "cameraFov") cameraFov = static_cast<float>(number);
+        else if (key == "scopedCameraFov") scopedCameraFov = static_cast<float>(number);
         if (key == "farmAssist") farmAssist = value;
         if (key == "autoLastHitOrbs") autoLastHitOrbs = value;
         else if (key == "autoLastHitOrbsAutoFire") autoLastHitOrbsAutoFire = value;
@@ -472,6 +486,14 @@ void SaveConfig() {
            << "freeCam " << freeCam << '\n'
            << "freeCamKey " << freeCamKey << '\n'
            << "freeCamSpeed " << freeCamSpeed << '\n'
+           << "fovChangerEnabled " << fovChangerEnabled << '\n'
+           << "menuTheme " << menuTheme << '\n'
+           << "menuAccentR " << menuAccentColor[0] << '\n'
+           << "menuAccentG " << menuAccentColor[1] << '\n'
+           << "menuAccentB " << menuAccentColor[2] << '\n'
+           << "overrideScopeFov " << overrideScopeFov << '\n'
+           << "cameraFov " << cameraFov << '\n'
+           << "scopedCameraFov " << scopedCameraFov << '\n'
            << "farmAssist " << farmAssist << '\n'
            << "autoLastHitOrbs " << autoLastHitOrbs << '\n'
            << "autoLastHitOrbsAutoFire " << autoLastHitOrbsAutoFire << '\n'

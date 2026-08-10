@@ -2,6 +2,7 @@
 #include <fstream>
 #include <MinHook.h>
 #include "menu_d2d.h"
+#include "panorama_preview.h"
 
 using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(
     ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*,
@@ -78,6 +79,7 @@ void ShutdownOverlay() {
     RemoveOrbEntityHooks();
     RemoveMeleeStateMonitor();
     RemoveDepthCaptureHook();
+    ShutdownPanoramaPreview();
     ShutdownD2DMenu();
     // All project hooks have been disabled and removed above. Reset MinHook
     // itself so a later reinjection cannot retain trampolines into this DLL.
@@ -144,9 +146,14 @@ void ShutdownOverlay() {
 }
 
 DWORD WINAPI UnloadThread(LPVOID) {
-    // The VMT is restored before this thread starts; wait for the current Present call to return.
-    Sleep(250);
-    FreeLibraryAndExitThread(moduleHandle, 0);
+    // The graphics driver may still be unwinding Present on one or more
+    // render-worker threads after the VMT/WndProc were restored. Releasing the
+    // image here races those return addresses and was the source of the Del
+    // crash. The module is already fully inert after ShutdownOverlay(); leave
+    // its image resident for the current game session and retire this helper
+    // thread safely. A fresh game session then loads the next build normally.
+    Sleep(500);
+    ExitThread(0);
 }
 
 void RequestUnload() {
@@ -304,6 +311,14 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     UpdateVisibleAimCamera();
     const bool d2dMenuReady = PrepareD2DMenu(pSwapChain);
     const bool softwareD2DMenu = d2dMenuReady && UsesSoftwareD2DMenu();
+    float previewLeft = 0.0f, previewTop = 0.0f;
+    float previewRight = 0.0f, previewBottom = 0.0f;
+    const bool previewVisible = d2dMenuReady &&
+        GetD2DPreviewCaptureRect(previewLeft, previewTop,
+                                 previewRight, previewBottom);
+    UpdatePanoramaPreview(pSwapChain, pContext,
+                          previewLeft, previewTop, previewRight, previewBottom,
+                          previewVisible);
     std::size_t sessionPlayerCount = 0;
     {
         std::lock_guard<std::mutex> lock(heroPawnsMutex);
@@ -337,6 +352,16 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 }
 
 LRESULT __stdcall hkWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == PanoramaPreviewUiMessage) {
+        ProcessPanoramaPreviewUiThread();
+        return 0;
+    }
+    if (uMsg == PanoramaPreviewGlowMessage) {
+        const bool applied = RegisterNativePreviewGlow(
+            static_cast<uintptr_t>(wParam));
+        ReportPanoramaPreviewGlowRegistration(applied);
+        return 0;
+    }
     if (uMsg == ApplyGlowMessage) {
         const uintptr_t glow = static_cast<uintptr_t>(wParam);
         const uintptr_t entity = glow - Offsets::Glow;
@@ -347,6 +372,13 @@ LRESULT __stdcall hkWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         std::lock_guard lock(glowMutex);
         queuedGlows.erase(entity);
         if (applied) registeredGlows.insert(entity);
+        return 0;
+    }
+
+    if (uMsg == WM_KEYUP && wParam == VK_DELETE) {
+        // Keep a keyboard-only unload path for hot-reload workflows.  It uses
+        // the same orderly shutdown path as the Misc page button.
+        RequestUnload();
         return 0;
     }
 

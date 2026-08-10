@@ -1,6 +1,7 @@
 #include "shared.h"
 #include "menu_d2d.h"
 #include "preview_3d.h"
+#include "panorama_preview.h"
 #include "resource.h"
 
 #include <d2d1.h>
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <cwchar>
 #include <string>
 #include <unordered_map>
@@ -24,6 +26,7 @@ namespace {
 
 constexpr float kDesignWidth = 1448.0f;
 constexpr float kDesignHeight = 840.0f;
+constexpr float kMainWindowWidth = 996.0f;
 
 struct Renderer {
     ComPtr<ID2D1Factory> factory;
@@ -35,6 +38,10 @@ struct Renderer {
     ComPtr<ID2D1Bitmap> previewHeroBitmap;
     ComPtr<ID2D1Bitmap> preview3dBitmap;
     ComPtr<ID3D11Texture2D> preview3dTexture;
+    ComPtr<ID3D11Texture2D> previewReadbackTexture;
+    DXGI_FORMAT previewReadbackFormat = DXGI_FORMAT_UNKNOWN;
+    UINT previewReadbackWidth = 0;
+    UINT previewReadbackHeight = 0;
     Preview3DFrame preview3dFrame{};
     std::vector<uint8_t> preview3dPixels;
     bool preview3dShared = false;
@@ -73,6 +80,7 @@ struct Renderer {
     bool positionInitialized = false;
     bool draggingWindow = false;
     bool wasOpen = false;
+    bool settingsOpen = false;
     float* colorPopup = nullptr;
     D2D1_RECT_F colorPopupAnchor{};
     D2D1_RECT_F comboPopupRect{};
@@ -114,10 +122,12 @@ D2D1_COLOR_F Color(float r, float gg, float b, float a = 1.0f) {
     return D2D1::ColorF(r, gg, b, a);
 }
 
-D2D1_COLOR_F White(float a = 1.0f) { return Color(0.94f, 0.945f, 0.965f, a); }
-D2D1_COLOR_F Muted(float a = 1.0f) { return Color(0.58f, 0.59f, 0.66f, a); }
-D2D1_COLOR_F Red(float a = 1.0f) { return Color(0.94f, 0.025f, 0.12f, a); }
-D2D1_COLOR_F Border(float a = 1.0f) { return Color(0.145f, 0.16f, 0.205f, a); }
+D2D1_COLOR_F White(float a = 1.0f) { return Color(0.88f, 0.89f, 0.92f, a); }
+D2D1_COLOR_F Muted(float a = 1.0f) { return Color(0.47f, 0.49f, 0.54f, a); }
+D2D1_COLOR_F Red(float a = 1.0f) {
+    return Color(menuAccentColor[0], menuAccentColor[1], menuAccentColor[2], a);
+}
+D2D1_COLOR_F Border(float a = 1.0f) { return Color(0.115f, 0.125f, 0.145f, a); }
 
 D2D1_RECT_F Rect(float left, float top, float right, float bottom) {
     return D2D1::RectF(left, top, right, bottom);
@@ -366,49 +376,32 @@ void DrawToggle(const Layout& l, float x, float y, float width,
     const float baseY = y;
     NoteContent(x, baseY + 66.0f);
     y = ScrolledY(x, y);
-    const D2D1_RECT_F hit = Rect(x, y, x + width, y + 66);
+    const D2D1_RECT_F hit = Rect(x, y, x + width, y + 44);
     const D2D1_RECT_F colorRect = colorValue
-        ? Rect(x + width - 22, y + 13, x + width, y + 37)
+        ? Rect(x + width - 22, y + 10, x + width, y + 32)
         : Rect(0, 0, 0, 0);
     const bool clickedColor = colorValue && Clicked(l, colorRect);
     if (ColumnVisible(x, y, 66.0f) && Clicked(l, hit) && !clickedColor)
         *value = !*value;
     if (!g.colorPopup && Contains(hit, l.mouse)) {
-        FillRounded(Rect(x + 4, y + 3, x + width - 4, y + 62), 5,
-                    Color(0.26f, 0.30f, 0.38f, 0.075f));
-        StrokeRounded(Rect(x + 4, y + 3, x + width - 4, y + 62), 5,
-                      Color(0.42f, 0.48f, 0.60f, 0.16f), 0.8f);
+        FillRounded(Rect(x + 3, y + 2, x + width - 3, y + 42), 3,
+                    Color(1, 1, 1, 0.025f));
     }
     const float targetAnimation = *value ? 1.0f : 0.0f;
     auto [toggleIt, inserted] = g.toggleAnimation.emplace(value, targetAnimation);
     float& animation = toggleIt->second;
     animation += ((*value ? 1.0f : 0.0f) - animation) * 0.18f;
 
-    Text(label, Rect(x, y + 5, x + width - 110, y + 30), g.medium.Get(), White());
-    if (description)
-        Text(description, Rect(x, y + 29, x + width - 110, y + 54),
-             g.regular.Get(), Muted());
+    Text(label, Rect(x + 2, y + 8, x + width - 110, y + 34), g.regular.Get(), White());
 
     const float colorOffset = colorValue ? 34.0f : 0.0f;
-    const D2D1_RECT_F track = Rect(x + width - 62 - colorOffset, y + 14,
-                                   x + width - 20 - colorOffset, y + 36);
-    const D2D1_COLOR_F off = Color(0.16f, 0.17f, 0.20f);
-    GradientRounded(track, 11,
-                    Color(off.r + (1.0f - off.r) * animation,
-                          off.g + (0.12f - off.g) * animation,
-                          off.b + (0.19f - off.b) * animation),
-                    Color(off.r + (0.78f - off.r) * animation,
-                          off.g + (0.01f - off.g) * animation,
-                          off.b + (0.08f - off.b) * animation), true);
-    if (animation > 0.05f) {
-        GlowRounded(track, 11, Red(animation * 0.42f), 3, 1.2f);
-        FillRounded(Rect(track.left + 3, track.top + 3, track.right - 3,
-                         track.top + 8), 4,
-                    Color(1.0f, 0.42f, 0.50f, animation * 0.10f));
-    }
-    const float knob = track.left + 11 + animation * 20.0f;
+    const D2D1_RECT_F track = Rect(x + width - 47 - colorOffset, y + 12,
+                                   x + width - 17 - colorOffset, y + 28);
+    const D2D1_COLOR_F off = Color(0.17f, 0.19f, 0.22f);
+    FillRounded(track, 8, animation > 0.02f ? Red(0.84f) : off);
+    const float knob = track.left + 8 + animation * 14.0f;
     SetBrush(White());
-    g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knob, track.top + 11), 8, 8),
+    g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knob, track.top + 8), 6, 6),
                           g.brush.Get());
 
     if (colorValue) {
@@ -423,24 +416,20 @@ void DrawToggle(const Layout& l, float x, float y, float width,
             g.openCombo = 0;
         }
     }
-    Line(D2D1::Point2F(x, y + 65), D2D1::Point2F(x + width, y + 65),
-         Color(0.16f, 0.17f, 0.20f, 0.75f));
+    Line(D2D1::Point2F(x, y + 43), D2D1::Point2F(x + width, y + 43), Border(0.72f));
 }
 
 void DrawSlider(const Layout& l, float x, float y, float width,
                 const wchar_t* label, float* value, float minimum, float maximum,
                 const wchar_t* format) {
     const float baseY = y;
-    NoteContent(x, baseY + 48.0f);
+    NoteContent(x, baseY + 60.0f);
     y = ScrolledY(x, y);
-    const D2D1_RECT_F row = Rect(x, y, x + width, y + 48);
-    FillRounded(row, 6, Color(0.047f, 0.050f, 0.061f, 0.78f));
-    StrokeRounded(row, 6, Border(0.8f));
-    Text(label, Rect(x + 17, y + 12, x + 150, y + 38), g.regular.Get(), White());
-    const float trackStart = x + 150;
-    const float trackEnd = x + width - 108;
-    const D2D1_RECT_F sliderHit = Rect(trackStart - 8, y, trackEnd + 8, y + 48);
-    if (ColumnVisible(x, y, 48.0f) && l.clicked && Contains(sliderHit, l.mouse))
+    Text(label, Rect(x + 2, y + 2, x + width - 82, y + 27), g.regular.Get(), White());
+    const float trackStart = x + 2;
+    const float trackEnd = x + width - 2;
+    const D2D1_RECT_F sliderHit = Rect(trackStart - 4, y + 25, trackEnd + 4, y + 58);
+    if (ColumnVisible(x, y, 60.0f) && l.clicked && Contains(sliderHit, l.mouse))
         g.activeSlider = value;
     if (!l.down && g.activeSlider == value) g.activeSlider = nullptr;
     if (l.down && g.activeSlider == value) {
@@ -451,21 +440,20 @@ void DrawSlider(const Layout& l, float x, float y, float width,
     auto [sliderIt, inserted] = g.sliderAnimation.emplace(value, fraction);
     float& animated = sliderIt->second;
     animated += (fraction - animated) * 0.20f;
-    FillRounded(Rect(trackStart, y + 22, trackEnd, y + 26), 2, Color(0.17f, 0.18f, 0.22f));
-    FillRounded(Rect(trackStart, y + 22, trackStart + (trackEnd - trackStart) * animated, y + 26),
+    FillRounded(Rect(trackStart, y + 39, trackEnd, y + 43), 2, Color(0.16f, 0.17f, 0.20f));
+    FillRounded(Rect(trackStart, y + 39, trackStart + (trackEnd - trackStart) * animated, y + 43),
                 2, Red());
     const float knob = trackStart + (trackEnd - trackStart) * animated;
     SetBrush(Color(0.035f, 0.037f, 0.045f));
-    g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knob, y + 24), 8, 8), g.brush.Get());
+    g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knob, y + 41), 7, 7), g.brush.Get());
     SetBrush(Red());
-    g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(knob, y + 24), 8, 8), g.brush.Get(), 1.8f);
+    g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(knob, y + 41), 7, 7), g.brush.Get(), 1.5f);
     SetBrush(White());
-    g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knob, y + 24), 3, 3), g.brush.Get());
+    g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knob, y + 41), 2.5f, 2.5f), g.brush.Get());
 
     wchar_t output[48]{};
     std::swprintf(output, 48, format, *value);
-    const D2D1_RECT_F valueRect = Rect(x + width - 92, y, x + width, y + 48);
-    StrokeRounded(valueRect, 6, Border());
+    const D2D1_RECT_F valueRect = Rect(x + width - 74, y, x + width, y + 27);
     Text(output, valueRect, g.centered.Get(), Muted());
 }
 
@@ -473,10 +461,12 @@ void DrawCombo(const Layout& l, int id, float x, float y, float width,
                const wchar_t* label, int* value,
                const wchar_t* const* items, int count) {
     const float baseY = y;
-    NoteContent(x, baseY + 42.0f);
+    const bool compact = width <= 320.0f;
+    NoteContent(x, baseY + (compact ? 58.0f : 42.0f));
     y = ScrolledY(x, y);
-    Text(label, Rect(x, y + 8, x + width - 150, y + 38), g.regular.Get(), White());
-    const D2D1_RECT_F button = Rect(x + width - 150, y, x + width, y + 42);
+    Text(label, Rect(x, y + 2, compact ? x + width : x + width - 150, y + 24), g.regular.Get(), White());
+    const D2D1_RECT_F button = compact ? Rect(x, y + 25, x + width, y + 55)
+                                      : Rect(x + width - 150, y, x + width, y + 42);
     GradientRounded(button, 6, Color(0.075f, 0.078f, 0.094f),
                     Color(0.050f, 0.052f, 0.064f), true);
     StrokeRounded(button, 6, Border());
@@ -507,18 +497,8 @@ void DrawEspChip(const Layout& l, float x, float y, float width,
     if (Clicked(l, hit) && !clickedSwatch)
         *value = !*value;
     const bool hovered = Contains(hit, l.mouse);
-    if (*value) {
-        GlowRounded(hit, 6, Red(0.26f), 3, 1.0f);
-        GradientRounded(hit, 6, Color(0.42f, 0.025f, 0.075f, 0.92f),
-                        Color(0.17f, 0.030f, 0.055f, 0.96f), true);
-        StrokeRounded(hit, 6, Red(), 1.0f);
-    } else {
-        GradientRounded(hit, 6,
-                        hovered ? Color(0.105f, 0.115f, 0.14f)
-                                : Color(0.070f, 0.076f, 0.092f),
-                        Color(0.047f, 0.051f, 0.063f), true);
-        StrokeRounded(hit, 6, hovered ? Color(0.34f, 0.37f, 0.45f) : Border());
-    }
+    if (hovered) FillRounded(Rect(x + 2, y + 1, x + width - 2, y + 40), 3,
+                             Color(1, 1, 1, 0.025f));
     Text(label, Rect(x + 13, y, x + width - 48, y + 42),
          g.regular.Get(), *value ? White() : Muted());
     if (colorValue) {
@@ -532,9 +512,77 @@ void DrawEspChip(const Layout& l, float x, float y, float width,
             g.openCombo = 0;
         }
     } else {
-        Text(*value ? L"ON" : L"OFF", Rect(x + width - 52, y, x + width - 10, y + 42),
-             g.centered.Get(), *value ? Red() : Muted());
+        const D2D1_RECT_F track = Rect(x + width - 40, y + 13, x + width - 10, y + 29);
+        FillRounded(track, 8, *value ? Red(0.84f) : Color(0.17f, 0.19f, 0.22f));
+        SetBrush(White());
+        g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(*value ? track.right - 8 : track.left + 8,
+                                                           track.top + 8), 6, 6), g.brush.Get());
     }
+}
+
+void DrawNavigationIcon(int variant, float x, float y, bool selected) {
+    const D2D1_COLOR_F c = selected ? White() : Muted();
+    if (variant == 0) { DrawEye(x, y, c); return; }                 // Enemy
+    SetBrush(c);
+    if (variant == 1) {                                             // Ally
+        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x - 5, y - 3), 5, 5), g.brush.Get(), 1.4f);
+        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x + 5, y - 3), 5, 5), g.brush.Get(), 1.4f);
+        Line(D2D1::Point2F(x - 12, y + 10), D2D1::Point2F(x + 12, y + 10), c, 1.6f); return;
+    }
+    if (variant == 2) {                                             // Creep
+        g.target->DrawRectangle(Rect(x - 8, y - 8, x + 8, y + 8), g.brush.Get(), 1.5f);
+        Line(D2D1::Point2F(x - 12, y), D2D1::Point2F(x - 8, y), c, 1.4f);
+        Line(D2D1::Point2F(x + 8, y), D2D1::Point2F(x + 12, y), c, 1.4f); return;
+    }
+    if (variant == 3) {                                             // Player aim
+        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 8, 8), g.brush.Get(), 1.5f);
+        Line(D2D1::Point2F(x - 13, y), D2D1::Point2F(x + 13, y), c, 1.4f);
+        Line(D2D1::Point2F(x, y - 13), D2D1::Point2F(x, y + 13), c, 1.4f); return;
+    }
+    if (variant == 4) {                                             // Creep aim
+        Line(D2D1::Point2F(x - 9, y + 8), D2D1::Point2F(x, y - 9), c, 1.6f);
+        Line(D2D1::Point2F(x, y - 9), D2D1::Point2F(x + 9, y + 8), c, 1.6f);
+        Line(D2D1::Point2F(x - 6, y + 2), D2D1::Point2F(x + 6, y + 2), c, 1.4f); return;
+    }
+    DrawTabIcon(2, x, y, selected);                                 // Misc
+}
+
+void DrawSectionHeading(float x, float y, float width, const wchar_t* title) {
+    Text(title, Rect(x, y, x + width, y + 27), g.semibold.Get(), White());
+    Line(D2D1::Point2F(x, y + 31), D2D1::Point2F(x + width, y + 31), Border(0.92f));
+}
+
+float PreviewTileWidth(const wchar_t* label) {
+    constexpr float kHorizontalPadding = 9.0f;
+    if (!label || !g.writeFactory || !g.regular)
+        return 18.0f;
+
+    ComPtr<IDWriteTextLayout> layout;
+    const UINT32 length = static_cast<UINT32>(std::wcslen(label));
+    if (FAILED(g.writeFactory->CreateTextLayout(label, length, g.regular.Get(),
+                                                512.0f, 36.0f, &layout))) {
+        return 18.0f + length * 8.0f;
+    }
+    DWRITE_TEXT_METRICS metrics{};
+    if (FAILED(layout->GetMetrics(&metrics)))
+        return 18.0f + length * 8.0f;
+    return std::ceil(metrics.widthIncludingTrailingWhitespace) + kHorizontalPadding * 2.0f;
+}
+
+float DrawPreviewTile(const Layout& l, float x, float y,
+                      const wchar_t* label, bool* value) {
+    const float width = PreviewTileWidth(label);
+    const D2D1_RECT_F r = Rect(x, y, x + width, y + 36);
+    if (Clicked(l, r)) *value = !*value;
+    const bool hover = Contains(r, l.mouse);
+    // Off state intentionally mirrors the reference: compact matte-grey tags
+    // with no outline, indicator dot, or coloured glow.
+    FillRounded(r, 4, *value ? Color(Red().r, Red().g, Red().b, 0.22f)
+                             : Color(0.18f, 0.19f, 0.21f, hover ? 1.0f : 0.92f));
+    if (*value) StrokeRounded(r, 4, Red(0.70f), 0.8f);
+    Text(label, Rect(x + 9, y, x + width - 9, y + 36), g.regular.Get(),
+         *value ? White() : Muted());
+    return width;
 }
 
 void DrawHeroEspPreview(float x, float y, float width, float height,
@@ -545,11 +593,15 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
                         bool snaplines, const float* boxColor,
                         const float* skeletonColor, const float* healthColor,
                         const float* nameColor, const float* playerColor,
-                        const float* healthValueColor) {
+                        const float* healthValueColor, const Layout& l,
+                        bool* enabledToggle, bool* boxesToggle, bool* cornerToggle,
+                        bool* skeletonToggle, bool* healthToggle, bool* healthValueToggle,
+                        bool* heroNameToggle, bool* playerNameToggle, bool* distanceToggle,
+                        bool* snaplineToggle, bool* glowToggle) {
     GlowRounded(Rect(x, y, x + width, y + height), 16,
                 Color(0, 0, 0, 0.65f), 5, 2.0f);
-    FillRounded(Rect(x, y, x + width, y + height), 16,
-                Color(0.026f, 0.030f, 0.039f, 0.97f));
+    FillRounded(Rect(x, y, x + width, y + height), 8,
+                Color(0.0f, 0.0f, 0.0f, 1.0f));
     StrokeRounded(Rect(x, y, x + width, y + height), 16,
                   Color(0.24f, 0.27f, 0.34f, 0.92f), 1.1f);
     Text(L"ESP Preview", Rect(x + 16, y + 10, x + width - 16, y + 42),
@@ -558,9 +610,47 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
          Rect(x + 16, y + 40, x + width - 16, y + 65),
          g.regular.Get(), enabled ? Muted() : Red());
 
-    const D2D1_RECT_F stage = Rect(x + 15, y + 74, x + width - 15, y + height - 24);
-    FillRounded(stage, 12, Color(0.055f, 0.062f, 0.085f, 1.0f));
-    StrokeRounded(stage, 12, Color(0.20f, 0.23f, 0.29f, 0.92f), 1.0f);
+    // The tag flow occupies three 36px rows. Anchor it to the panel bottom
+    // and donate the reclaimed space to the model preview above it.
+    constexpr float kTileHeight = 36.0f;
+    constexpr float kTileRows = 3.0f;
+    constexpr float kTileGapY = 8.0f;
+    constexpr float kPreviewBottomPadding = 16.0f;
+    const float tileY = y + height -
+        (kTileRows * kTileHeight + (kTileRows - 1.0f) * kTileGapY + kPreviewBottomPadding);
+    const D2D1_RECT_F captureRect = Rect(
+        x + 15, y + 74, x + width - 15, tileY - 16.0f);
+    const D2D1_RECT_F stage = captureRect;
+    // Single, uninterrupted preview surface — no nested grey viewport.
+    FillRect(stage, Color(0.0f, 0.0f, 0.0f, 1.0f));
+    // Compact left-aligned tag flow: exactly the visual rhythm of the
+    // supplied preview rather than a two-column settings grid.
+    constexpr float kTileGapX = 8.0f;
+    const float tileLeft = x + 16.0f;
+    const float tileRight = x + width - 16.0f;
+    float tileCursorX = tileLeft;
+    float tileCursorY = tileY;
+    const auto drawFlowTile = [&](const wchar_t* label, bool* value) {
+        const float tileWidth = PreviewTileWidth(label);
+        // Wrap only when the next measured tile does not fit. This avoids
+        // the large unused right edge caused by the old hand-made rows.
+        if (tileCursorX > tileLeft && tileCursorX + tileWidth > tileRight) {
+            tileCursorX = tileLeft;
+            tileCursorY += 36.0f + kTileGapY;
+        }
+        DrawPreviewTile(l, tileCursorX, tileCursorY, label, value);
+        tileCursorX += tileWidth + kTileGapX;
+    };
+    drawFlowTile(L"Skeleton", skeletonToggle);
+    drawFlowTile(L"Box", boxesToggle);
+    drawFlowTile(L"Distance", distanceToggle);
+    drawFlowTile(L"Hero name", heroNameToggle);
+    drawFlowTile(L"Player name", playerNameToggle);
+    drawFlowTile(L"Corner box", cornerToggle);
+    drawFlowTile(L"Health", healthToggle);
+    drawFlowTile(L"Health bar", healthValueToggle);
+    drawFlowTile(L"Model glow", glowToggle);
+    drawFlowTile(L"Snapline", snaplineToggle);
     // Keep the character aspect ratio from the source sheet. The previous
     // crop used coordinates for a 2048px image, while the embedded reference
     // is 2515px wide; that selected half of two poses and pushed the hero out
@@ -571,11 +661,38 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
     // common 1080p resolutions.
     const float previewCenterX = x + width * 0.5f;
     D2D1_RECT_F modelRect{};
-    const D2D1_RECT_F renderRect = Rect(stage.left + 2.0f, stage.top + 2.0f,
-                                        stage.right - 2.0f, stage.bottom - 2.0f);
+    const D2D1_RECT_F renderRect = captureRect;
     if (g.preview3dActive && g.preview3dBitmap) {
-        g.target->DrawBitmap(g.preview3dBitmap.Get(), renderRect, 1.0f,
-                             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        // The capture texture is created in physical backbuffer pixels. Draw
+        // it in the same coordinate space so the D2D menu scale does not add
+        // a second blur-producing resample.
+        D2D1_MATRIX_3X2_F menuTransform{};
+        g.target->GetTransform(&menuTransform);
+        const D2D1_RECT_F physicalRect = Rect(
+            std::floor(renderRect.left * menuTransform._11 + menuTransform._31),
+            std::floor(renderRect.top * menuTransform._22 + menuTransform._32),
+            std::floor(renderRect.right * menuTransform._11 + menuTransform._31),
+            std::floor(renderRect.bottom * menuTransform._22 + menuTransform._32));
+        // Preserve the 3D target's aspect ratio while filling the preview.
+        // A tiny centred crop is preferable to stretching the hero vertically.
+        const D2D1_SIZE_F sourceSize = g.preview3dBitmap->GetSize();
+        const float destinationAspect = (physicalRect.right - physicalRect.left) /
+                                        (physicalRect.bottom - physicalRect.top);
+        const float sourceAspect = sourceSize.width / sourceSize.height;
+        D2D1_RECT_F sourceRect = Rect(0.0f, 0.0f, sourceSize.width, sourceSize.height);
+        if (destinationAspect < sourceAspect) {
+            const float croppedWidth = sourceSize.height * destinationAspect;
+            sourceRect.left = (sourceSize.width - croppedWidth) * 0.5f;
+            sourceRect.right = sourceRect.left + croppedWidth;
+        } else if (destinationAspect > sourceAspect) {
+            const float croppedHeight = sourceSize.width / destinationAspect;
+            sourceRect.top = (sourceSize.height - croppedHeight) * 0.5f;
+            sourceRect.bottom = sourceRect.top + croppedHeight;
+        }
+        g.target->SetTransform(D2D1::Matrix3x2F::Identity());
+        g.target->DrawBitmap(g.preview3dBitmap.Get(), physicalRect, 1.0f,
+                             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, sourceRect);
+        g.target->SetTransform(menuTransform);
         const float renderWidth = renderRect.right - renderRect.left;
         const float renderHeight = renderRect.bottom - renderRect.top;
         modelRect = Rect(
@@ -584,8 +701,8 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
             renderRect.left + g.preview3dFrame.right * renderWidth,
             renderRect.top + g.preview3dFrame.bottom * renderHeight);
     } else {
-        const float modelTop = y + 158.0f;
-        const float modelBottom = y + height - 72.0f;
+        const float modelTop = renderRect.top;
+        const float modelBottom = renderRect.bottom;
         const float modelHeight = modelBottom - modelTop;
         constexpr float sourceAspect = 515.0f / 1140.0f;
         const float modelHalfWidth = modelHeight * sourceAspect * 0.5f;
@@ -593,17 +710,17 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
                          previewCenterX + modelHalfWidth, modelBottom);
     }
     if (!g.preview3dActive) {
-        Text(L"3D preview unavailable",
+        Text(L"Panorama preview unavailable",
              Rect(stage.left + 12, stage.top, stage.right - 12, stage.bottom),
              g.centered.Get(), Red(0.82f));
         return;
     }
     if (!enabled) return;
 
-    const float left = modelRect.left + 7.0f;
-    const float right = modelRect.right - 7.0f;
-    const float top = modelRect.top + 8.0f;
-    const float bottom = modelRect.bottom - 8.0f;
+    const float left = (std::max)(stage.left + 2.0f, modelRect.left - 3.0f);
+    const float right = (std::min)(stage.right - 2.0f, modelRect.right + 3.0f);
+    const float top = (std::max)(stage.top + 2.0f, modelRect.top - 9.0f);
+    const float bottom = (std::min)(stage.bottom - 2.0f, modelRect.bottom + 5.0f);
     const float cx = (left + right) * 0.5f;
     const D2D1_COLOR_F box = Color(boxColor[0], boxColor[1], boxColor[2]);
     const D2D1_COLOR_F bones = Color(skeletonColor[0], skeletonColor[1], skeletonColor[2]);
@@ -650,9 +767,6 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
                 Line(points[segment[0]], points[segment[1]], bones, 1.4f);
             }
         }
-        SetBrush(bones);
-        g.target->DrawEllipse(D2D1::Ellipse(points[0], 8.0f, 10.0f),
-                              g.brush.Get(), 1.3f);
     } else if (skeleton) {
         const float bodyHeight = bottom - top;
         const float head = top + bodyHeight * 0.055f;
@@ -660,9 +774,6 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
         const float shoulders = top + bodyHeight * 0.21f;
         const float hips = top + bodyHeight * 0.52f;
         const float knees = top + bodyHeight * 0.76f;
-        SetBrush(bones);
-        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, head), 10, 13),
-                              g.brush.Get(), 1.3f);
         Line(D2D1::Point2F(cx, head + 13), D2D1::Point2F(cx, neck), bones, 1.4f);
         Line(D2D1::Point2F(cx, neck), D2D1::Point2F(cx, hips), bones, 1.4f);
         Line(D2D1::Point2F(cx, shoulders),
@@ -693,7 +804,7 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
         Text(L"12m", Rect(cx - 35, bottom + 2, cx + 35, bottom + 26),
              g.centered.Get(), Muted());
     if (snaplines)
-        Line(D2D1::Point2F(x + width * 0.5f, y + height - 18),
+        Line(D2D1::Point2F(x + width * 0.5f, stage.bottom - 8),
              D2D1::Point2F(cx, bottom), Color(1, 1, 1, 0.70f), 1.0f);
 }
 
@@ -884,6 +995,63 @@ void LoadEmbeddedAssets() {
 bool BindPreview3DFrame(const Preview3DFrame& frame,
                         ID3D11DeviceContext* context) {
     if (!frame.texture || !g.target || !context) return false;
+    const auto readFramePixels = [&](std::vector<uint8_t>& pixels,
+                                     uint32_t& width, uint32_t& height,
+                                     uint32_t& stride) -> bool {
+        D3D11_TEXTURE2D_DESC sourceDescription{};
+        frame.texture->GetDesc(&sourceDescription);
+        const bool bgra = sourceDescription.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                          sourceDescription.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        const bool rgba = sourceDescription.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                          sourceDescription.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        if ((!bgra && !rgba) || sourceDescription.SampleDesc.Count != 1)
+            return false;
+        if (!g.previewReadbackTexture ||
+            g.previewReadbackWidth != sourceDescription.Width ||
+            g.previewReadbackHeight != sourceDescription.Height ||
+            g.previewReadbackFormat != sourceDescription.Format) {
+            g.previewReadbackTexture.Reset();
+            ComPtr<ID3D11Device> sourceDevice;
+            frame.texture->GetDevice(sourceDevice.GetAddressOf());
+            if (!sourceDevice) return false;
+            D3D11_TEXTURE2D_DESC staging = sourceDescription;
+            staging.Usage = D3D11_USAGE_STAGING;
+            staging.BindFlags = 0;
+            staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            staging.MiscFlags = 0;
+            if (FAILED(sourceDevice->CreateTexture2D(
+                    &staging, nullptr, g.previewReadbackTexture.GetAddressOf())))
+                return false;
+            g.previewReadbackWidth = sourceDescription.Width;
+            g.previewReadbackHeight = sourceDescription.Height;
+            g.previewReadbackFormat = sourceDescription.Format;
+        }
+        context->CopyResource(g.previewReadbackTexture.Get(), frame.texture);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(context->Map(g.previewReadbackTexture.Get(), 0,
+                                D3D11_MAP_READ, 0, &mapped))) return false;
+        width = sourceDescription.Width;
+        height = sourceDescription.Height;
+        stride = width * 4;
+        pixels.resize(static_cast<size_t>(stride) * height);
+        for (uint32_t row = 0; row < height; ++row) {
+            const auto* source = static_cast<const uint8_t*>(mapped.pData) +
+                static_cast<size_t>(row) * mapped.RowPitch;
+            auto* destination = pixels.data() + static_cast<size_t>(row) * stride;
+            if (bgra) {
+                std::memcpy(destination, source, stride);
+            } else {
+                for (uint32_t column = 0; column < width; ++column) {
+                    destination[column * 4 + 0] = source[column * 4 + 2];
+                    destination[column * 4 + 1] = source[column * 4 + 1];
+                    destination[column * 4 + 2] = source[column * 4 + 0];
+                    destination[column * 4 + 3] = source[column * 4 + 3];
+                }
+            }
+        }
+        context->Unmap(g.previewReadbackTexture.Get(), 0);
+        return true;
+    };
     if (g.preview3dTexture.Get() != frame.texture || !g.preview3dBitmap) {
         g.preview3dBitmap.Reset();
         g.preview3dTexture.Reset();
@@ -891,7 +1059,7 @@ bool BindPreview3DFrame(const Preview3DFrame& frame,
         ComPtr<IDXGISurface> surface;
         const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
-                              D2D1_ALPHA_MODE_PREMULTIPLIED),
+                              D2D1_ALPHA_MODE_IGNORE),
             96.0f, 96.0f);
         // WIC software targets cannot share a DXGI surface. Use the staging
         // texture readback below for those targets.
@@ -904,8 +1072,7 @@ bool BindPreview3DFrame(const Preview3DFrame& frame,
             g.preview3dShared = true;
         } else {
             uint32_t width = 0, height = 0, stride = 0;
-            if (!ReadPreview3DPixels(context, g.preview3dPixels,
-                                     width, height, stride) ||
+            if (!readFramePixels(g.preview3dPixels, width, height, stride) ||
                 FAILED(g.target->CreateBitmap(
                     D2D1::SizeU(width, height), g.preview3dPixels.data(),
                     stride, properties, g.preview3dBitmap.GetAddressOf()))) {
@@ -916,8 +1083,7 @@ bool BindPreview3DFrame(const Preview3DFrame& frame,
         g.preview3dTexture = frame.texture;
     } else if (!g.preview3dShared) {
         uint32_t width = 0, height = 0, stride = 0;
-        if (!ReadPreview3DPixels(context, g.preview3dPixels,
-                                 width, height, stride) ||
+        if (!readFramePixels(g.preview3dPixels, width, height, stride) ||
             FAILED(g.preview3dBitmap->CopyFromMemory(
                 nullptr, g.preview3dPixels.data(), stride))) {
             return false;
@@ -977,6 +1143,10 @@ void ResetTarget() {
     g.previewHeroBitmap.Reset();
     g.preview3dBitmap.Reset();
     g.preview3dTexture.Reset();
+    g.previewReadbackTexture.Reset();
+    g.previewReadbackFormat = DXGI_FORMAT_UNKNOWN;
+    g.previewReadbackWidth = 0;
+    g.previewReadbackHeight = 0;
     g.preview3dFrame = {};
     g.preview3dPixels.clear();
     g.preview3dShared = false;
@@ -1216,19 +1386,41 @@ void RenderD2DMenu(std::size_t playerCount) {
         static_cast<UINT>(io.DisplaySize.y));
     g.preview3dActive = false;
     if (g.tab == 0 && pDevice && pContext) {
-        static const ULONGLONG previewStart = GetTickCount64();
         Preview3DFrame previewFrame{};
-        const float previewTime = static_cast<float>(
-            GetTickCount64() - previewStart) * 0.001f;
-        const bool previewGlowEnabled =
-            g.visualTeam == 0 ? enemyEspEnabled && enemyGlowEnabled :
-            g.visualTeam == 1 ? allyEspEnabled && allyGlowEnabled : false;
-        const float* previewGlowColor =
-            g.visualTeam == 0 ? enemyGlowColor : teammateGlowColor;
-        if (RenderPreview3D(pDevice, pContext, previewTime,
-                            previewGlowEnabled, previewGlowColor,
-                            previewFrame))
+        SetPanoramaPreviewRole(g.visualTeam);
+        ID3D11Texture2D* panoramaTexture = GetPanoramaPreviewTexture();
+        if (panoramaTexture) {
+            previewFrame.texture = panoramaTexture;
+            previewFrame.left = 0.0f;
+            previewFrame.top = 0.0f;
+            previewFrame.right = 1.0f;
+            previewFrame.bottom = 1.0f;
+            std::array<Preview3DPoint, 18> skeleton{};
+            if (GetPanoramaPreviewSkeleton(skeleton.data(), skeleton.size())) {
+                previewFrame.skeleton = skeleton;
+                float left = 1.0f, top = 1.0f, right = 0.0f, bottom = 0.0f;
+                size_t visibleJoints = 0;
+                for (const Preview3DPoint& point : skeleton) {
+                    if (!point.visible) continue;
+                    left = (std::min)(left, point.x);
+                    top = (std::min)(top, point.y);
+                    right = (std::max)(right, point.x);
+                    bottom = (std::max)(bottom, point.y);
+                    ++visibleJoints;
+                }
+                if (visibleJoints >= 6 && right > left && bottom > top) {
+                    const float padX = (std::max)(0.035f, (right - left) * 0.16f);
+                    const float padTop = (std::max)(0.035f, (bottom - top) * 0.08f);
+                    const float padBottom = (std::max)(0.030f, (bottom - top) * 0.05f);
+                    previewFrame.left = std::clamp(left - padX, 0.0f, 1.0f);
+                    previewFrame.top = std::clamp(top - padTop, 0.0f, 1.0f);
+                    previewFrame.right = std::clamp(right + padX, 0.0f, 1.0f);
+                    previewFrame.bottom = std::clamp(bottom + padBottom, 0.0f, 1.0f);
+                }
+            }
             g.preview3dActive = BindPreview3DFrame(previewFrame, pContext);
+            ReportPanoramaPreviewBinding(g.preview3dActive);
+        }
     }
     g.target->BeginDraw();
     g.target->SetTransform(D2D1::Matrix3x2F::Identity());
@@ -1259,117 +1451,112 @@ void RenderD2DMenu(std::size_t playerCount) {
              Color(0.008f, 0.010f, 0.016f, 0.18f));
     g.target->SetTransform(D2D1::Matrix3x2F(safeScale, 0, 0, safeScale, l.x, l.y));
 
-    const D2D1_RECT_F window = Rect(0, 0, kDesignWidth, kDesignHeight);
-    GlowRounded(window, 14, Color(0, 0, 0, 0.78f), 8, 3.0f);
-    GradientRounded(window, 14, Color(0.068f, 0.074f, 0.105f, 0.56f),
-                    Color(0.063f, 0.069f, 0.100f, 0.59f), true);
+    // The preview is deliberately not part of this rectangle: it is a
+    // companion window attached to the right edge, like the reference UI.
+    const D2D1_RECT_F window = Rect(0, 0, kMainWindowWidth, kDesignHeight);
+    GlowRounded(window, 12, Color(0, 0, 0, 0.78f), 10, 3.0f);
+    GradientRounded(window, 4, Color(0.018f, 0.020f, 0.024f, 0.985f),
+                    Color(0.010f, 0.012f, 0.015f, 0.99f), true);
     // A subtle cool sheen keeps the panel translucent without turning it black.
-    GradientRounded(Rect(1, 1, kDesignWidth - 1, 170), 13,
+    GradientRounded(Rect(1, 1, kMainWindowWidth - 1, 170), 13,
                     Color(0.20f, 0.24f, 0.31f, 0.055f),
                     Color(0.05f, 0.07f, 0.11f, 0.0f), true);
-    StrokeRounded(window, 14, Color(0.39f, 0.13f, 0.20f, 0.58f), 1.0f);
+    StrokeRounded(window, 4, Color(1, 1, 1, 0.08f), 1.0f);
 
-    GradientRounded(Rect(0, 0, kDesignWidth, 62), 14,
-                    Color(0.050f, 0.068f, 0.094f, 0.52f),
-                    Color(0.092f, 0.052f, 0.076f, 0.52f));
-    FillRect(Rect(0, 52, kDesignWidth, 62), Color(0.060f, 0.063f, 0.086f, 0.52f));
-    Line(D2D1::Point2F(0, 62), D2D1::Point2F(kDesignWidth, 62), Border());
-    Line(D2D1::Point2F(313, 62), D2D1::Point2F(313, kDesignHeight), Border());
+    FillRect(Rect(0, 0, kMainWindowWidth, 70), Color(0.009f, 0.010f, 0.013f, 0.99f));
+    Line(D2D1::Point2F(0, 70), D2D1::Point2F(kMainWindowWidth, 70), Border());
+    Line(D2D1::Point2F(298, 0), D2D1::Point2F(298, kDesignHeight), Border());
 
     DrawLogo();
-    Text(L"Axiom", Rect(104, 6, 300, 56), g.title.Get(), White());
-    Line(D2D1::Point2F(1402, 21), D2D1::Point2F(1418, 37), Muted(), 1.6f);
-    Line(D2D1::Point2F(1418, 21), D2D1::Point2F(1402, 37), Muted(), 1.6f);
-    if (Clicked(l, Rect(1388, 8, 1433, 53))) {
+    Text(L"AXIOM", Rect(104, 9, 285, 57), g.title.Get(), White());
+    const D2D1_RECT_F save = Rect(326, 16, 438, 54);
+    FillRounded(save, 3, Color(1, 1, 1, 0.025f));
+    StrokeRounded(save, 3, Border(), 0.9f);
+    Text(L"Save", save, g.centered.Get(), Muted());
+    const D2D1_RECT_F profile = Rect(458, 16, 675, 54);
+    FillRounded(profile, 3, Color(1, 1, 1, 0.025f));
+    StrokeRounded(profile, 3, Border(), 0.9f);
+    Text(L"Global", Rect(475, 16, 620, 54), g.regular.Get(), White());
+    Line(D2D1::Point2F(648, 31), D2D1::Point2F(654, 37), Muted(), 1.3f);
+    Line(D2D1::Point2F(654, 37), D2D1::Point2F(660, 31), Muted(), 1.3f);
+    if (Clicked(l, save)) SaveConfig();
+    const D2D1_RECT_F gear = Rect(874, 12, 916, 54);
+    if (Clicked(l, gear)) g.settingsOpen = !g.settingsOpen;
+    const D2D1_COLOR_F gearColor = g.settingsOpen ? Red() : Muted();
+    SetBrush(gearColor);
+    g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(895, 31), 8, 8), g.brush.Get(), 2.0f);
+    for (int i = 0; i < 8; ++i) {
+        const float a = i * 0.78539816f;
+        Line(D2D1::Point2F(895 + std::cos(a) * 11, 31 + std::sin(a) * 11),
+             D2D1::Point2F(895 + std::cos(a) * 15, 31 + std::sin(a) * 15), gearColor, 2.0f);
+    }
+    // Search icon beside the settings button, matching the compact toolbar.
+    SetBrush(Muted());
+    g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(947, 29), 6, 6), g.brush.Get(), 1.5f);
+    Line(D2D1::Point2F(952, 34), D2D1::Point2F(959, 41), Muted(), 1.5f);
+    Line(D2D1::Point2F(964, 24), D2D1::Point2F(976, 36), Muted(), 1.4f);
+    Line(D2D1::Point2F(976, 24), D2D1::Point2F(964, 36), Muted(), 1.4f);
+    if (Clicked(l, Rect(958, 8, 990, 53))) {
         SaveConfig();
         SetMenuOpen(false);
     }
 
-    FillRect(Rect(0, 62, 313, kDesignHeight), Color(0.065f, 0.080f, 0.115f, 0.56f));
-    const wchar_t* tabs[] = {L"Visuals", L"Aim assist", L"Misc"};
-    for (int i = 0; i < 3; ++i) {
-        const float top = 88.0f + i * 74.0f;
-        const D2D1_RECT_F tab = Rect(18, top, 292, top + 68);
-        const bool selected = g.tab == i;
-        if (Clicked(l, tab)) {
-            g.tab = i;
-            g.pageAlpha = 0.0f;
-            g.pageShift = 14.0f;
-            g.openCombo = 0;
-        }
+    FillRect(Rect(0, 70, 298, kDesignHeight), Color(0.025f, 0.027f, 0.031f, 0.99f));
+    auto section = [&](const wchar_t* label, float y) {
+        Text(label, Rect(28, y, 260, y + 18), g.regular.Get(), Muted(0.52f));
+    };
+    auto nav = [&](const wchar_t* label, float y, int icon, bool selected,
+                   auto activate) {
+        const D2D1_RECT_F row = Rect(14, y, 284, y + 42);
+        if (Clicked(l, row)) { activate(); g.pageAlpha = 0.0f; g.pageShift = 12.0f; g.openCombo = 0; }
         if (selected) {
-            g.tabHighlightY += (top - g.tabHighlightY) * 0.20f;
-            const D2D1_RECT_F highlight = Rect(18, g.tabHighlightY, 292,
-                                               g.tabHighlightY + 68);
-            GlowRounded(highlight, 9, Red(0.40f), 7, 1.8f);
-            GradientRounded(highlight, 9, Color(0.205f, 0.085f, 0.110f, 0.80f),
-                            Color(0.125f, 0.100f, 0.125f, 0.91f));
-            InnerGlow(highlight, 9);
-            StrokeRounded(highlight, 9, Red(0.92f), 1.2f);
+            FillRounded(row, 3, Color(1, 1, 1, 0.105f));
             SetBrush(Red());
-            g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(270, top + 34), 5, 5),
-                                  g.brush.Get());
-        } else if (Contains(tab, l.mouse)) {
-            FillRounded(tab, 9, Color(1, 1, 1, 0.035f));
-        }
-        DrawTabIcon(i, 46, top + 34, selected);
-        Text(tabs[i], Rect(78, top + 20, 245, top + 52),
-             g.medium.Get(), selected ? Red() : Muted());
+            g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(263, y + 21), 3.6f, 3.6f), g.brush.Get());
+        } else if (Contains(row, l.mouse)) FillRounded(row, 3, Color(1, 1, 1, 0.028f));
+        DrawNavigationIcon(icon, 43, y + 21, selected);
+        Text(label, Rect(74, y + 5, 242, y + 36), g.medium.Get(), selected ? White() : Muted());
+    };
+    section(L"VISUALS", 100);
+    nav(L"Enemy", 124, 0, g.tab == 0 && g.visualTeam == 0, [&] { g.tab = 0; g.visualTeam = 0; });
+    nav(L"Ally", 168, 1, g.tab == 0 && g.visualTeam == 1, [&] { g.tab = 0; g.visualTeam = 1; });
+    nav(L"Creep", 212, 2, g.tab == 0 && g.visualTeam == 2, [&] { g.tab = 0; g.visualTeam = 2; });
+    section(L"AIM ASSIST", 278);
+    nav(L"Player aim", 302, 3, g.tab == 1 && g.aimSubtab == 0, [&] { g.tab = 1; g.aimSubtab = 0; });
+    nav(L"Creep aim", 346, 4, g.tab == 1 && g.aimSubtab != 0, [&] { g.tab = 1; g.aimSubtab = 1; });
+    section(L"MISCELLANEOUS", 412);
+    nav(L"Misc", 436, 5, g.tab == 2, [&] { g.tab = 2; });
+
+    if (g.settingsOpen) {
+        const D2D1_RECT_F settings = Rect(620, 68, 950, 334);
+        GlowRounded(settings, 9, Color(0, 0, 0, 0.74f), 7, 2.0f);
+        FillRounded(settings, 9, Color(0.025f, 0.028f, 0.037f, 0.99f));
+        StrokeRounded(settings, 9, Border(), 1.0f);
+        Text(L"Menu settings", Rect(640, 83, 900, 113), g.semibold.Get(), White());
+        Text(L"Accent color", Rect(640, 120, 790, 144), g.regular.Get(), Muted());
+        wchar_t hex[16]{};
+        std::swprintf(hex, 16, L"#%02X%02X%02X",
+                      static_cast<int>(menuAccentColor[0] * 255.0f),
+                      static_cast<int>(menuAccentColor[1] * 255.0f),
+                      static_cast<int>(menuAccentColor[2] * 255.0f));
+        FillRounded(Rect(824, 116, 930, 144), 3, Color(1, 1, 1, 0.035f));
+        StrokeRounded(Rect(824, 116, 930, 144), 3, Border(), 0.8f);
+        Text(hex, Rect(824, 116, 930, 144), g.centered.Get(), White());
+        DrawSlider(l, 640, 151, 290, L"Red", &menuAccentColor[0], 0.0f, 1.0f, L"%.2f");
+        DrawSlider(l, 640, 207, 290, L"Green", &menuAccentColor[1], 0.0f, 1.0f, L"%.2f");
+        DrawSlider(l, 640, 263, 290, L"Blue", &menuAccentColor[2], 0.0f, 1.0f, L"%.2f");
+        if (!l.down) SaveConfig();
     }
 
     const float contentX = 349.0f + g.pageShift;
-    Text(tabs[g.tab], Rect(contentX, 73, 700, 113), g.title.Get(),
+    const wchar_t* pageTitle = g.tab == 0 ? (g.visualTeam == 0 ? L"Enemy" :
+                                             g.visualTeam == 1 ? L"Ally" : L"Creep") :
+                                g.tab == 1 ? (g.aimSubtab == 0 ? L"Player aim" : L"Creep aim") :
+                                             L"Misc";
+    Text(pageTitle, Rect(contentX, 83, 700, 113), g.title.Get(),
          Color(White().r, White().g, White().b, g.pageAlpha));
 
-    float cardTop = 130.0f;
-    if (g.tab == 0) {
-        const D2D1_RECT_F enemy = Rect(contentX, 124, contentX + 140, 164);
-        const D2D1_RECT_F ally = Rect(contentX + 146, 124, contentX + 286, 164);
-        const D2D1_RECT_F creep = Rect(contentX + 292, 124, contentX + 432, 164);
-        auto segment = [&](const D2D1_RECT_F& r, int value, const wchar_t* label) {
-            if (Clicked(l, r)) g.visualTeam = value;
-            const bool selected = g.visualTeam == value;
-            if (selected) {
-                GlowRounded(r, 7, Red(0.40f), 5, 1.4f);
-                GradientRounded(r, 7, Color(0.45f, 0.035f, 0.085f),
-                                Color(0.19f, 0.030f, 0.060f), true);
-                InnerGlow(r, 7);
-                StrokeRounded(r, 7, Red(), 1.0f);
-            } else {
-                GradientRounded(r, 7, Color(0.085f, 0.092f, 0.11f),
-                                Color(0.060f, 0.063f, 0.075f), true);
-                StrokeRounded(r, 7, Border());
-            }
-            Text(label, r, g.centered.Get(), selected ? White() : Muted());
-        };
-        segment(enemy, 0, L"Enemy");
-        segment(ally, 1, L"Ally");
-        segment(creep, 2, L"Creep");
-        cardTop = 190.0f;
-    }
-    if (g.tab == 1) {
-        const D2D1_RECT_F human = Rect(contentX, 124, contentX + 180, 164);
-        const D2D1_RECT_F farm = Rect(contentX + 186, 124, contentX + 366, 164);
-        auto aimSegment = [&](const D2D1_RECT_F& r, int value, const wchar_t* label) {
-            if (Clicked(l, r)) g.aimSubtab = value;
-            const bool selected = g.aimSubtab == value;
-            if (selected) {
-                GlowRounded(r, 7, Red(0.40f), 5, 1.4f);
-                GradientRounded(r, 7, Color(0.45f, 0.035f, 0.085f),
-                                Color(0.19f, 0.030f, 0.060f), true);
-                InnerGlow(r, 7);
-                StrokeRounded(r, 7, Red(), 1.0f);
-            } else {
-                GradientRounded(r, 7, Color(0.085f, 0.092f, 0.11f),
-                                Color(0.060f, 0.063f, 0.075f), true);
-                StrokeRounded(r, 7, Border());
-            }
-            Text(label, r, g.centered.Get(), selected ? White() : Muted());
-        };
-        aimSegment(human, 0, L"Human");
-        aimSegment(farm, 1, L"Farm");
-        cardTop = 190.0f;
-    }
+    const float cardTop = 120.0f;
 
     const bool visualEditor = g.tab == 0;
     // All tabs share one bottom edge. Their top can differ (Aim has subtabs),
@@ -1378,29 +1565,21 @@ void RenderD2DMenu(std::size_t playerCount) {
     const float visualPanelBottom = contentPanelBottom;
     const float visualPanelHeight = visualPanelBottom - cardTop;
     const D2D1_RECT_F cardRect = Rect(334, cardTop,
-                                      visualEditor ? 990.0f : 1414.0f,
+                                      996.0f,
                                       contentPanelBottom);
-    GlowRounded(cardRect, 10, Color(0, 0, 0, 0.64f), 5, 2.0f);
-    GradientRounded(cardRect, 10, Color(0.098f, 0.112f, 0.148f, 0.68f),
-                    Color(0.105f, 0.116f, 0.154f, 0.71f), true);
-    StrokeRounded(cardRect, 10, Border(), 1.0f);
+    FillRect(cardRect, Color(0.010f, 0.011f, 0.014f, 0.56f));
 
     const wchar_t* cardTitles[] = {L"Overlay", L"Aim configuration",
                                     L"Farm configuration", L"Miscellaneous"};
-    StrokeRounded(Rect(348, cardTop + 10, 380, cardTop + 42), 6, Red(), 1.4f);
-    Line(D2D1::Point2F(356, cardTop + 18), D2D1::Point2F(362, cardTop + 18), Red(), 1.4f);
-    Line(D2D1::Point2F(356, cardTop + 18), D2D1::Point2F(356, cardTop + 24), Red(), 1.4f);
-    Line(D2D1::Point2F(372, cardTop + 34), D2D1::Point2F(366, cardTop + 34), Red(), 1.4f);
-    Line(D2D1::Point2F(372, cardTop + 34), D2D1::Point2F(372, cardTop + 28), Red(), 1.4f);
-    Text(cardTitles[g.tab], Rect(391, cardTop + 3, 700, cardTop + 43),
+    Text(cardTitles[g.tab], Rect(350, cardTop + 10, 700, cardTop + 42),
          g.semibold.Get(), White());
-    if (!visualEditor)
-        Line(D2D1::Point2F(875, cardTop + 58), D2D1::Point2F(875, 772), Border());
+    Line(D2D1::Point2F(350, cardTop + 50), D2D1::Point2F(992, cardTop + 50), Border());
+    if (!visualEditor) Line(D2D1::Point2F(655, cardTop + 66), D2D1::Point2F(655, 772), Border());
 
-    const float leftX = visualEditor ? 350.0f : 392.0f;
-    const float rightX = visualEditor ? 660.0f : 908.0f;
-    const float leftColumnWidth = visualEditor ? 288.0f : 449.0f;
-    const float rightColumnWidth = visualEditor ? 308.0f : 462.0f;
+    const float leftX = visualEditor ? 350.0f : 330.0f;
+    const float rightX = visualEditor ? 660.0f : 675.0f;
+    const float leftColumnWidth = visualEditor ? 288.0f : 300.0f;
+    const float rightColumnWidth = visualEditor ? 308.0f : 300.0f;
     const float leftColorWidth = leftColumnWidth;
     const float rightColorWidth = rightColumnWidth;
     const float columnWidth = leftColumnWidth;
@@ -1416,7 +1595,7 @@ void RenderD2DMenu(std::size_t playerCount) {
         if (l.mouse.x >= leftX && l.mouse.x < rightX)
             g.leftColumnScroll = std::clamp(g.leftColumnScroll + scrollStep,
                                             -previousLeftMax, 0.0f);
-        else if (l.mouse.x >= rightX && l.mouse.x <= 1414.0f)
+        else if (l.mouse.x >= rightX && l.mouse.x <= 996.0f)
             g.rightColumnScroll = std::clamp(g.rightColumnScroll + scrollStep,
                                              -previousRightMax, 0.0f);
     }
@@ -1425,7 +1604,8 @@ void RenderD2DMenu(std::size_t playerCount) {
     g.rightContentBottom = viewportTop;
 
     g.target->PushAxisAlignedClip(
-        Rect(334.0f, visualEditor ? cardTop : viewportTop, 1414.0f,
+        Rect(334.0f, visualEditor ? 0.0f : viewportTop,
+             visualEditor ? 1436.0f : 996.0f,
              visualEditor ? kDesignHeight : 818.0f),
         D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
@@ -1456,7 +1636,7 @@ void RenderD2DMenu(std::size_t playerCount) {
         float* teamHealthValueColor = g.visualTeam == 0 ? enemyHealthValueColor : teammateHealthValueColor;
         float* teamGlowColor = g.visualTeam == 0 ? enemyGlowColor : teammateGlowColor;
         bool* teamGlowEnabled = g.visualTeam == 0 ? &enemyGlowEnabled : &allyGlowEnabled;
-        DrawHeroEspPreview(1008.0f, cardTop, 406.0f, visualPanelHeight,
+        DrawHeroEspPreview(1020.0f, 0.0f, 410.0f, kDesignHeight,
                            g.visualTeam == 0 ? L"Enemy preset" :
                            g.visualTeam == 1 ? L"Ally preset" : L"Creep preset",
                            *teamEsp,
@@ -1464,14 +1644,14 @@ void RenderD2DMenu(std::size_t playerCount) {
                            *teamHealth, *teamHealthValues, *teamNames,
                            *teamPlayerNames, *teamDistance, *teamSnaplines,
                            teamBoxColor, teamSkeletonColor, teamHealthColor,
-                           teamNameColor, teamPlayerColor, teamHealthValueColor);
+                           teamNameColor, teamPlayerColor, teamHealthValueColor, l,
+                           teamEsp, teamBoxes, teamCornerBoxes, teamBones,
+                           teamHealth, teamHealthValues, teamNames, teamPlayerNames,
+                           teamDistance, teamSnaplines, teamGlowEnabled);
 
-        Text(g.visualTeam == 0 ? L"Enemy ESP settings" :
-             g.visualTeam == 1 ? L"Ally ESP settings" : L"Creep ESP settings",
-             Rect(leftX, firstY + 4, rightX + rightColumnWidth, firstY + 34),
-             g.semibold.Get(), White());
-
-        if (g.visualTeam == 2) {
+        // Boolean ESP controls live in the preview companion window. Keep the
+        // old in-card layout disabled so controls cannot be duplicated.
+        if (false) { if (g.visualTeam == 2) {
             DrawEspChip(l, leftX, firstY + 48, leftColumnWidth, L"Creep ESP", teamEsp);
             DrawEspChip(l, rightX, firstY + 48, rightColumnWidth, L"Ally creep ESP",
                         &allyCreepEspEnabled);
@@ -1498,37 +1678,57 @@ void RenderD2DMenu(std::size_t playerCount) {
             DrawEspChip(l, leftX, firstY + 360, leftColumnWidth, L"Soul orbs",
                         &drawOrbEsp);
         } else {
-            DrawEspChip(l, leftX, firstY + 48,
-                        rightX + rightColumnWidth - leftX, L"Enable ESP", teamEsp);
-            DrawEspChip(l, leftX, firstY + 100, leftColumnWidth, L"Box",
-                        teamBoxes, teamBoxColor);
-            DrawEspChip(l, rightX, firstY + 100, rightColumnWidth, L"Corner box",
-                        teamCornerBoxes);
-            DrawEspChip(l, leftX, firstY + 152, leftColumnWidth, L"Health bar",
-                        teamHealth, teamHealthColor);
-            DrawEspChip(l, rightX, firstY + 152, rightColumnWidth, L"Health value",
-                        teamHealthValues, teamHealthValueColor);
-            DrawEspChip(l, leftX, firstY + 204, leftColumnWidth, L"Skeleton",
-                        teamBones, teamSkeletonColor);
-            DrawEspChip(l, rightX, firstY + 204, rightColumnWidth, L"Hero name",
-                        teamNames, teamNameColor);
-            DrawEspChip(l, leftX, firstY + 256, leftColumnWidth, L"Player name",
-                        teamPlayerNames, teamPlayerColor);
-            DrawEspChip(l, rightX, firstY + 256, rightColumnWidth, L"Distance",
-                        teamDistance);
-            DrawEspChip(l, leftX, firstY + 308, leftColumnWidth, L"Snapline",
-                        teamSnaplines);
-            DrawEspChip(l, rightX, firstY + 308, rightColumnWidth, L"Model glow",
+            DrawSectionHeading(leftX, firstY + 10, leftColumnWidth, L"Main");
+            DrawSectionHeading(rightX, firstY + 10, rightColumnWidth, L"Details");
+            DrawEspChip(l, leftX, firstY + 50, leftColumnWidth, L"Enable ESP", teamEsp);
+            DrawEspChip(l, rightX, firstY + 50, rightColumnWidth, L"Model glow",
                         teamGlowEnabled, teamGlowColor);
-            DrawSlider(l, leftX, firstY + 366,
+            DrawEspChip(l, leftX, firstY + 102, leftColumnWidth, L"Box",
+                        teamBoxes, teamBoxColor);
+            DrawEspChip(l, rightX, firstY + 102, rightColumnWidth, L"Corner box",
+                        teamCornerBoxes);
+            DrawEspChip(l, leftX, firstY + 154, leftColumnWidth, L"Health bar",
+                        teamHealth, teamHealthColor);
+            DrawEspChip(l, rightX, firstY + 154, rightColumnWidth, L"Health value",
+                        teamHealthValues, teamHealthValueColor);
+            DrawEspChip(l, leftX, firstY + 206, leftColumnWidth, L"Skeleton",
+                        teamBones, teamSkeletonColor);
+            DrawEspChip(l, rightX, firstY + 206, rightColumnWidth, L"Hero name",
+                        teamNames, teamNameColor);
+            DrawEspChip(l, leftX, firstY + 258, leftColumnWidth, L"Player name",
+                        teamPlayerNames, teamPlayerColor);
+            DrawEspChip(l, rightX, firstY + 258, rightColumnWidth, L"Distance",
+                        teamDistance);
+            DrawEspChip(l, leftX, firstY + 310, leftColumnWidth, L"Snapline",
+                        teamSnaplines);
+            DrawSectionHeading(leftX, firstY + 372,
+                               rightX + rightColumnWidth - leftX, L"Appearance");
+            DrawSlider(l, leftX, firstY + 418,
                        rightX + rightColumnWidth - leftX, L"Box thickness",
                        &boxThickness, 0.5f, 4.0f, L"%.2f px");
-            DrawSlider(l, leftX, firstY + 424,
+            DrawSlider(l, leftX, firstY + 470,
                        rightX + rightColumnWidth - leftX, L"Corner length",
                        &cornerBoxLength, 0.10f, 0.50f, L"%.2f");
             const wchar_t* glowModes[] = {L"HP-based fill", L"Normal fill"};
             int* teamGlowMode = g.visualTeam == 0 ? &enemyGlowMode : &allyGlowMode;
-            DrawCombo(l, 401, leftX, firstY + 486,
+            DrawCombo(l, 401, leftX, firstY + 530,
+                      rightX + rightColumnWidth - leftX, L"Glow mode",
+                      teamGlowMode, glowModes, 2);
+        }
+        } else {
+            DrawSectionHeading(leftX, firstY + 18,
+                               rightX + rightColumnWidth - leftX, L"Appearance");
+            DrawToggle(l, leftX, firstY + 58,
+                       rightX + rightColumnWidth - leftX, L"Enable ESP", L"", teamEsp);
+            DrawSlider(l, leftX, firstY + 126,
+                       rightX + rightColumnWidth - leftX, L"Box thickness",
+                       &boxThickness, 0.5f, 4.0f, L"%.2f px");
+            DrawSlider(l, leftX, firstY + 194,
+                       rightX + rightColumnWidth - leftX, L"Corner length",
+                       &cornerBoxLength, 0.10f, 0.50f, L"%.2f");
+            const wchar_t* glowModes[] = {L"HP-based fill", L"Normal fill"};
+            int* teamGlowMode = g.visualTeam == 0 ? &enemyGlowMode : &allyGlowMode;
+            DrawCombo(l, 401, leftX, firstY + 266,
                       rightX + rightColumnWidth - leftX, L"Glow mode",
                       teamGlowMode, glowModes, 2);
         }
@@ -1730,17 +1930,28 @@ void RenderD2DMenu(std::size_t playerCount) {
                        &freeCamSpeed, 50.0f, 5000.0f, L"%.0f u/s");
         }
 
-        Text(L"Session", Rect(rightX, firstY, rightX + columnWidth, firstY + 38),
+        DrawToggle(l, rightX, firstY, columnWidth, L"FOV Changer",
+                   L"Override the normal camera field of view", &fovChangerEnabled);
+        DrawSlider(l, rightX, firstY + 72, columnWidth, L"Camera FOV",
+                   &cameraFov, 60.0f, 140.0f, L"%.0f deg");
+        DrawToggle(l, rightX, firstY + 144, columnWidth, L"Override Scope FOV",
+                   L"Use a separate field of view while scoped", &overrideScopeFov);
+        DrawSlider(l, rightX, firstY + 216, columnWidth, L"Scoped FOV",
+                   &scopedCameraFov, 20.0f, 140.0f, L"%.0f deg");
+
+        Text(L"Session", Rect(rightX, firstY + 294,
+             rightX + columnWidth, firstY + 332),
              g.semibold.Get(), White());
         wchar_t status[80]{};
         std::swprintf(status, 80, L"%.0f FPS    %zu players", io.Framerate, playerCount);
-        Text(status, Rect(rightX, firstY + 45, rightX + columnWidth, firstY + 80),
+        Text(status, Rect(rightX, firstY + 339,
+             rightX + columnWidth, firstY + 374),
              g.regular.Get(), Muted());
         Text(L"Unload the module and restore all hooks safely.",
-             Rect(rightX, firstY + 112, rightX + columnWidth, firstY + 152),
+             Rect(rightX, firstY + 398, rightX + columnWidth, firstY + 438),
              g.regular.Get(), Muted());
-        const D2D1_RECT_F unload = Rect(rightX, firstY + 170,
-                                       rightX + columnWidth, firstY + 214);
+        const D2D1_RECT_F unload = Rect(rightX, firstY + 456,
+                                       rightX + columnWidth, firstY + 500);
         GradientRounded(unload, 7, Color(1.0f, 0.10f, 0.19f), Color(0.60f, 0.01f, 0.06f), true);
         InnerGlow(unload, 7);
         Text(L"Unload DLL", unload, g.centered.Get(), White());
@@ -1787,8 +1998,33 @@ void RenderD2DMenu(std::size_t playerCount) {
     g.wasOpen = menuOpen;
 }
 
+bool GetD2DPreviewCaptureRect(float& left, float& top,
+                              float& right, float& bottom) {
+    if (!menuOpen || !g.ready || g.tab != 0 || g.visualTeam >= 2 ||
+        !g.positionInitialized || g.menuAlpha <= 0.01f) return false;
+    ImGuiIO& io = ImGui::GetIO();
+    const float scale = (std::min)(io.DisplaySize.x * 0.925f / kDesignWidth,
+                                   io.DisplaySize.y * 0.958f / kDesignHeight) * 0.54f;
+    const float safeScale = (std::max)(0.32f, scale);
+    constexpr float cardTop = 0.0f;
+    constexpr float x = 1020.0f;
+    // Keep Panorama's physical capture exactly aligned with DrawHeroEspPreview.
+    // The old height - 260 value was from the pre-flow tile layout and made
+    // the captured animation stretch vertically into the larger stage.
+    constexpr float tileRows = 3.0f;
+    constexpr float tileHeight = 36.0f;
+    constexpr float tileGap = 8.0f;
+    constexpr float bottomPadding = 16.0f;
+    constexpr float captureBottom = kDesignHeight -
+        (tileRows * tileHeight + (tileRows - 1.0f) * tileGap + bottomPadding) - 16.0f;
+    left = std::floor(g.windowX + (x + 15.0f) * safeScale);
+    top = std::floor(g.windowY + (cardTop + 74.0f) * safeScale);
+    right = std::floor(g.windowX + (x + 410.0f - 15.0f) * safeScale);
+    bottom = std::floor(g.windowY + captureBottom * safeScale);
+    return right > left && bottom > top;
+}
+
 void ShutdownD2DMenu() {
-    ShutdownPreview3D();
     ResetTarget();
     g.regular.Reset();
     g.medium.Reset();

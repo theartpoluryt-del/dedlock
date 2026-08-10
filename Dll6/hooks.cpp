@@ -265,6 +265,9 @@ FreeCameraUpdateFn originalFreeCameraUpdate = nullptr;
 void* freeCameraUpdateTarget = nullptr;
 GameplayCameraUpdateFn originalGameplayCameraUpdate = nullptr;
 void* gameplayCameraUpdateTarget = nullptr;
+using GetRenderFovFn = float(__fastcall*)(uintptr_t);
+GetRenderFovFn originalGetRenderFov = nullptr;
+void* getRenderFovTarget = nullptr;
 std::atomic<uintptr_t> freeCameraUserCmd{0};
 std::chrono::steady_clock::time_point lastFreeCameraUpdate{};
 std::mutex freeCameraLifecycleMutex;
@@ -275,6 +278,42 @@ Vector3 freeCameraStartAngles{};
 bool freeCameraStartAnglesReady = false;
 
 void FlushCurrentCameraAimInternal(uintptr_t camera = 0);
+
+float __fastcall hkGetRenderFov(uintptr_t camera) {
+    const float stockFov = originalGetRenderFov
+        ? originalGetRenderFov(camera) : 90.0f;
+    if (!std::isfinite(stockFov) ||
+        (!fovChangerEnabled && !overrideScopeFov)) return stockFov;
+
+    // Deadlock uses approximately 70 degrees for the stock scoped view.
+    const bool scoped = stockFov <= 70.5f;
+    if (scoped && overrideScopeFov)
+        return std::clamp(scopedCameraFov, 20.0f, 140.0f);
+    if (fovChangerEnabled)
+        return std::clamp(cameraFov, 20.0f, 140.0f);
+    return stockFov;
+}
+
+bool EnsureGetRenderFovHook() {
+    if (getRenderFovTarget && originalGetRenderFov) return true;
+    const uintptr_t address = FindUniqueClientPattern("F3 0F 10 41 50 C3");
+    if (!address) return false;
+
+    const MH_STATUS initStatus = MH_Initialize();
+    if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED)
+        return false;
+    void* target = reinterpret_cast<void*>(address);
+    const MH_STATUS createStatus = MH_CreateHook(
+        target, reinterpret_cast<void*>(&hkGetRenderFov),
+        reinterpret_cast<void**>(&originalGetRenderFov));
+    if (createStatus != MH_OK && createStatus != MH_ERROR_ALREADY_CREATED)
+        return false;
+    const MH_STATUS enableStatus = MH_EnableHook(target);
+    if (enableStatus != MH_OK && enableStatus != MH_ERROR_ENABLED)
+        return false;
+    getRenderFovTarget = target;
+    return true;
+}
 
 using GetAsyncKeyStateFn = SHORT(WINAPI*)(int);
 using GetKeyStateFn = SHORT(WINAPI*)(int);
@@ -1519,6 +1558,8 @@ void FlushCurrentCameraAimInternal(uintptr_t camera) {
 
 void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3) {
     EnsureGameplayCameraUpdateHook();
+    if (fovChangerEnabled || overrideScopeFov)
+        EnsureGetRenderFovHook();
     if (!currentLocalPawn) {
         const uintptr_t resolvedPawn = FindLocalPawnFromController();
         if (resolvedPawn) currentLocalPawn = resolvedPawn;
@@ -2097,6 +2138,12 @@ void RemoveUserCmdHook() {
         MH_RemoveHook(gameplayCameraUpdateTarget);
         gameplayCameraUpdateTarget = nullptr;
         originalGameplayCameraUpdate = nullptr;
+    }
+    if (getRenderFovTarget) {
+        MH_DisableHook(getRenderFovTarget);
+        MH_RemoveHook(getRenderFovTarget);
+        getRenderFovTarget = nullptr;
+        originalGetRenderFov = nullptr;
     }
     if (applyInputCommandHookInstalled && applyInputCommandTarget) {
         MH_DisableHook(applyInputCommandTarget);
