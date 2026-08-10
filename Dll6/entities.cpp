@@ -175,6 +175,38 @@ bool GetEntityRenderPosition(uintptr_t entity, Vector3& position) {
     return GetEntityPosition(entity, position);
 }
 
+bool GetEntityRenderTransformPosition(uintptr_t entity, Vector3& position) {
+    position = {};
+    if (!entity) return false;
+    const uintptr_t sceneNode =
+        Read<uintptr_t>(entity + Offsets::GameSceneNode);
+    if (!sceneNode) return false;
+
+    // CGameSceneNode::m_nodeToWorld starts at +0x10 in the current layout;
+    // its CTransform position is the transform consumed by scene rendering.
+    // Unlike m_vRenderOrigin, this field is populated for hero pawns (the
+    // latter is FLT_MAX for Training Dummy in the current client).
+    constexpr uintptr_t NodeToWorldPosition = 0x10;
+    const uintptr_t address = sceneNode + NodeToWorldPosition;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const Vector3 first = Read<Vector3>(address);
+        const Vector3 second = Read<Vector3>(address);
+        if (std::memcmp(&first, &second, sizeof(first)) != 0) continue;
+        position = second;
+        return std::isfinite(position.x) &&
+               std::isfinite(position.y) &&
+               std::isfinite(position.z) &&
+               std::fabs(position.x) < 100000.0f &&
+               std::fabs(position.y) < 100000.0f &&
+               std::fabs(position.z) < 100000.0f &&
+               (std::fabs(position.x) > 0.01f ||
+                std::fabs(position.y) > 0.01f ||
+                std::fabs(position.z) > 0.01f);
+    }
+    position = {};
+    return false;
+}
+
 bool GetXpOrbPosition(uintptr_t entity, Vector3& position) {
     const uintptr_t sceneNode = Read<uintptr_t>(entity + Offsets::GameSceneNode);
     if (sceneNode) {
@@ -318,38 +350,41 @@ void ApplyHeroGlow(uintptr_t entity) {
     }
     const uintptr_t glow = entity + Offsets::Glow;
     bool shouldNotify = false;
+    const uint8_t localTeam = currentLocalPawn
+        ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
+    const uint8_t entityTeam = Read<uint8_t>(entity + Offsets::Team);
+    const bool ally = localTeam >= 2 && localTeam <= 3 && entityTeam == localTeam;
+    const int teamGlowMode = ally ? allyGlowMode : enemyGlowMode;
 
     // The client can reset m_iGlowType after a network update even though the
     // property object remains alive. Re-register whenever the complete-model
     // glow pass is no longer active.
     {
         std::lock_guard lock(glowMutex);
-        const int targetGlowType = glowMode == 1 ? 2 : 1;
+        // Keep CGlowProperty in sync with the outline-manager contract:
+        // type 1 is health-clipped, type 2 is the complete model fill.
+        const int targetGlowType = teamGlowMode == 1 ? 2 : 1;
         const int currentType = Read<int>(glow + Offsets::GlowType);
         const auto modeIt = registeredGlowMode.find(entity);
         const bool modeChanged = modeIt == registeredGlowMode.end() ||
-            modeIt->second != glowMode;
+            modeIt->second != teamGlowMode;
         if ((currentType != targetGlowType || modeChanged) &&
             queuedGlows.insert(entity).second) {
             shouldNotify = true;
         }
-        if (shouldNotify) registeredGlowMode[entity] = glowMode;
+        if (shouldNotify) registeredGlowMode[entity] = teamGlowMode;
     }
 
-    const uint8_t localTeam = currentLocalPawn
-        ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
-    const uint8_t entityTeam = Read<uint8_t>(entity + Offsets::Team);
-    const bool ally = localTeam >= 2 && localTeam <= 3 && entityTeam == localTeam;
     const float* glowColor = ally ? teammateGlowColor : enemyGlowColor;
     const int health = Read<int>(entity + Offsets::Health);
     const int maxHealth = Read<int>(entity + Offsets::MaxHealth);
     const float healthAlpha = maxHealth > 0
         ? std::clamp(static_cast<float>(health) / maxHealth, 0.0f, 1.0f) : 0.0f;
-    const float glowAlpha = glowMode == 0
+    const float glowAlpha = teamGlowMode == 0
         ? glowColor[3] * healthAlpha : 1.0f;
     Write<Vector3>(glow + Offsets::GlowColor,
                    { glowColor[0], glowColor[1], glowColor[2] });
-    Write<int>(glow + Offsets::GlowType, glowMode == 1 ? 2 : 1);
+    Write<int>(glow + Offsets::GlowType, teamGlowMode == 1 ? 2 : 1);
     Write<int>(glow + Offsets::GlowTeam, -1);
     Write<int>(glow + Offsets::GlowRange, 0);
     Write<int>(glow + Offsets::GlowRangeMin, 0);
@@ -359,7 +394,7 @@ void ApplyHeroGlow(uintptr_t entity) {
                        static_cast<uint8_t>(std::clamp(glowColor[2], 0.0f, 1.0f) * 255.0f),
                        static_cast<uint8_t>(std::clamp(glowAlpha, 0.0f, 1.0f) * 255.0f) });
     Write<bool>(glow + Offsets::GlowFlashing, false);
-    Write<float>(glow + Offsets::GlowTime, glowMode == 1 ? 0.0f : 1.0f);
+    Write<float>(glow + Offsets::GlowTime, teamGlowMode == 1 ? 0.0f : 1.0f);
     Write<float>(glow + Offsets::GlowStartTime, 0.0f);
     Write<bool>(glow + Offsets::GlowEligible, true);
     Write<bool>(glow + Offsets::IsGlowing, true);
@@ -980,13 +1015,20 @@ DWORD WINAPI GlowApplyWorker(LPVOID) {
             const uint8_t lifeState = Read<uint8_t>(pawn + Offsets::LifeState);
             const uint8_t team = Read<uint8_t>(pawn + Offsets::Team);
             if (health > 0 && lifeState == 0 && (team == 2 || team == 3) &&
-                pawn != currentLocalPawn && (localTeam == 0 || team != localTeam)) {
-                if (glowEnabled) {
+                pawn != currentLocalPawn &&
+                (localTeam == 0 || localTeam == 2 || localTeam == 3)) {
+                const bool ally = localTeam >= 2 && localTeam <= 3 && team == localTeam;
+                const bool teamGlowEnabled = ally ? allyGlowEnabled : enemyGlowEnabled;
+                if (glowEnabled && teamGlowEnabled) {
                     ApplyHeroGlow(pawn);
                 } else {
                     Write<bool>(pawn + Offsets::Glow + Offsets::GlowEligible, false);
                     Write<bool>(pawn + Offsets::Glow + Offsets::IsGlowing, false);
                     Write<int>(pawn + Offsets::Glow + Offsets::GlowType, 0);
+                    std::lock_guard lock(glowMutex);
+                    registeredGlowMode.erase(pawn);
+                    registeredGlows.erase(pawn);
+                    queuedGlows.erase(pawn);
                 }
             }
         }

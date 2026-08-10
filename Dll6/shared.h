@@ -6,6 +6,7 @@
 #include <d3dcompiler.h>
 #include <psapi.h>
 #include <algorithm>
+#include <array>
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -37,7 +38,7 @@ inline uintptr_t EntityChunks=0x10, HighestEntityIndex=0x20A0,
 }
 struct Vector3 { float x,y,z; }; struct Vector2 { float x,y; }; struct Matrix4x4 { float m[4][4]; }; struct ColorRGBA { uint8_t r,g,b,a; };
 struct BoneSegment { Vector3 start; Vector3 end; };
-struct PlayerData { uintptr_t entity{}; Vector3 pos; Vector3 worldPos; Vector3 visualAnchor; Vector3 headPos; Vector3 bodyPos; bool hasVisualAnchor=false; bool hasHeadBone=false; bool hasBodyBone=false; std::vector<BoneSegment> bones; float boxLeft,boxTop,boxRight,boxBottom; float modelMinZ,modelMaxZ,modelHeight; int health,maxHealth,team; float distance; std::string heroName; std::string playerName; };
+struct PlayerData { uintptr_t entity{}; Vector3 pos; Vector3 velocity{}; Vector3 worldPos; Vector3 visualAnchor; Vector3 headPos; Vector3 bodyPos; bool hasVisualAnchor=false; bool hasHeadBone=false; bool hasBodyBone=false; std::vector<BoneSegment> bones; float boxLeft,boxTop,boxRight,boxBottom; float modelMinZ,modelMaxZ,modelHeight; int health,maxHealth,team; float distance; std::string heroName; std::string playerName; };
 struct FarmTarget { uintptr_t entity{}; Vector3 pos{}; int health{}; int maxHealth{}; uint8_t team{}; std::string className; };
 struct OrbTarget { uintptr_t entity{}; Vector3 pos{}; std::string className; uint32_t handle{}; uint8_t team{}; };
 extern bool autoLastHitOrbsAutoFire, autoLastHitOrbsToggleMode, autoLastHitOrbsKeyCapture, autoLastHitOrbsActive, orbAimVisibilityCheck;
@@ -48,6 +49,8 @@ struct EspStatus { bool entitySystemReady=false, localPawnFound=false, heroPawns
 struct WindowSearchData { DWORD processId; HWND window; };
 typedef HRESULT(__stdcall* PresentFn)(IDXGISwapChain*, UINT, UINT);
 constexpr UINT ApplyGlowMessage = WM_APP + 0x4D;
+constexpr UINT PanoramaPreviewUiMessage = WM_APP + 0x4E;
+constexpr UINT PanoramaPreviewGlowMessage = WM_APP + 0x4F;
 extern bool freeCam;
 extern bool freeCamActive;
 extern int freeCamKey;
@@ -94,22 +97,26 @@ extern bool enemySnaplinesEnabled, allySnaplinesEnabled;
 extern bool enemyBonesEnabled, allyBonesEnabled;
 extern float enemyBoxColor[4], teammateBoxColor[4];
 extern float enemyNameColor[4], teammateNameColor[4];
+extern float enemySkeletonColor[4], teammateSkeletonColor[4];
 extern float enemyHealthColor[4], teammateHealthColor[4];
 extern float enemyPlayerNameColor[4], teammatePlayerNameColor[4];
 extern float enemyHealthBarColor[4], teammateHealthBarColor[4];
 extern float enemyHealthValueColor[4], teammateHealthValueColor[4];
 extern float enemyGlowColor[4], teammateGlowColor[4];
-extern int glowMode;
+extern bool enemyGlowEnabled, allyGlowEnabled;
+extern int enemyGlowMode, allyGlowMode;
 extern bool creepEspEnabled, creepBoxesEnabled, creepCornerBoxesEnabled;
 extern bool creepHealthEnabled, creepHealthValuesEnabled, creepDistanceEnabled;
-extern float creepBoxColor[4], creepHealthColor[4];
+extern float creepBoxColor[4], creepHealthColor[4], creepHealthValueColor[4];
 extern bool allyCreepEspEnabled, allyCreepBoxesEnabled, allyCreepCornerBoxesEnabled;
 extern bool allyCreepHealthEnabled, allyCreepHealthValuesEnabled, allyCreepDistanceEnabled;
-extern float allyCreepBoxColor[4], allyCreepHealthColor[4];
-extern bool localEspEnabled, localBoxesEnabled, localCornerBoxesEnabled;
-extern bool localHealthEnabled, localHealthValuesEnabled, localBonesEnabled;
-extern float localBoxColor[4], localHealthColor[4];
+extern float allyCreepBoxColor[4], allyCreepHealthColor[4], allyCreepHealthValueColor[4];
 extern float boxThickness, cornerBoxLength;
+extern float enemyBoxThickness, allyBoxThickness;
+extern float enemyCornerBoxLength, allyCornerBoxLength;
+extern bool fovChangerEnabled, overrideScopeFov;
+extern int menuTheme; extern float menuAccentColor[4];
+extern float cameraFov, scopedCameraFov;
 extern volatile ULONGLONG lastSilentAttackAppliedAt;
 extern volatile LONG autoOrbAttackAppliedCount;
 extern bool farmToggleMode, farmToggleActive, farmToggleLastDown;
@@ -122,6 +129,7 @@ extern bool runtimeOffsetsReady;
 extern std::string runtimeBuildKey;
 bool InitializeNativeGlow();
 bool RegisterNativeGlow(uintptr_t entity);
+bool RegisterNativePreviewGlow(uintptr_t entity);
 extern bool nativeGlowReady;
 std::string GetEntityDesignerName(uint32_t);
 extern bool orbEntityEventsAvailable;
@@ -138,11 +146,13 @@ extern ID3D11Device* pDevice; extern ID3D11DeviceContext* pContext; extern ID3D1
 template<typename T> T Read(uintptr_t address) { T value{}; if (!address) return value; __try { value=*reinterpret_cast<T*>(address); } __except(EXCEPTION_EXECUTE_HANDLER) { value=T{}; } return value; }
 template<typename T> void Write(uintptr_t address,const T& value) { if (!address) return; __try { *reinterpret_cast<T*>(address)=value; } __except(EXCEPTION_EXECUTE_HANDLER) {} }
  bool WorldToScreen(const Vector3&,Vector2&,const Matrix4x4&); void ArmGameDepthCapture(); void TrackGameDepthStencil(ID3D11DepthStencilView*); bool CaptureDepthSnapshot(); bool ReadDepthAt(float,float,float&); bool IsDepthBufferPopulated(); bool GetEntityBonePosition(uintptr_t,const char*,Vector3&); bool GetEntityBoneSkeleton(uintptr_t,std::vector<BoneSegment>&); bool GetAimPointScreen(const PlayerData&,float,Vector2&); bool GetAimAnglesFromScreen(float,float,Vector3&); bool IsAimPointVisible(const PlayerData&,float,float,float); bool IsWorldAimPointVisible(const Vector3&,uintptr_t=0); void ProcessAimVisibilityTraces(); void AimAtClosestEnemy(const std::vector<PlayerData>&); void FarmAimAssist(const std::vector<PlayerData>&); void AutoLastHitOrbs(); void AutoParry(const std::vector<PlayerData>&); void ReleaseAimResources();
+bool GetEntityPreviewSkeleton(uintptr_t, std::array<Vector3,18>&,
+                              std::array<bool,18>&);
 bool InstallMeleeStateMonitor(); void RemoveMeleeStateMonitor();
 bool InstallSoundEventHook(); void RemoveSoundEventHook();
 bool InstallModelGlowHook(); void RemoveModelGlowHook();
 void UpdateRemSizedHull(); void RestoreRemSizedHull();
-BOOL CALLBACK FindGameWindowCallback(HWND,LPARAM); bool HookGameWindow(); uintptr_t ResolveEntity(uint32_t); uintptr_t ResolveEntityIndex(uint32_t); uint32_t FindEntityHandle(uintptr_t); bool GetEntityPosition(uintptr_t,Vector3&); bool GetEntityRenderPosition(uintptr_t,Vector3&); void RefreshFarmTargets(); DWORD WINAPI FarmTargetWorker(LPVOID); bool GetEntityScreenBounds(uintptr_t,const Vector3&,const Matrix4x4&,float&,float&,float&,float&); std::string GetEntityClassName(uintptr_t); bool NotifyGlowTypeChanged(uintptr_t); void ApplyHeroGlow(uintptr_t); void DiscoverHeroVTables(); void RefreshHeroPawns(); DWORD WINAPI HeroDiscoveryWorker(LPVOID); DWORD WINAPI GlowApplyWorker(LPVOID); bool IsCombatEntity(uintptr_t);
+BOOL CALLBACK FindGameWindowCallback(HWND,LPARAM); bool HookGameWindow(); uintptr_t ResolveEntity(uint32_t); uintptr_t ResolveEntityIndex(uint32_t); uint32_t FindEntityHandle(uintptr_t); bool GetEntityPosition(uintptr_t,Vector3&); bool GetEntityRenderPosition(uintptr_t,Vector3&); bool GetEntityRenderTransformPosition(uintptr_t,Vector3&); void RefreshFarmTargets(); DWORD WINAPI FarmTargetWorker(LPVOID); bool GetEntityScreenBounds(uintptr_t,const Vector3&,const Matrix4x4&,float&,float&,float&,float&); std::string GetEntityClassName(uintptr_t); bool NotifyGlowTypeChanged(uintptr_t); void ApplyHeroGlow(uintptr_t); void DiscoverHeroVTables(); void RefreshHeroPawns(); DWORD WINAPI HeroDiscoveryWorker(LPVOID); DWORD WINAPI GlowApplyWorker(LPVOID); bool IsCombatEntity(uintptr_t);
 void DebugEntityHandle(uint32_t);
 void SetMenuOpen(bool); bool InstallInputLockHooks(); void RemoveInputLockHooks(); std::vector<PlayerData> GetPlayers(); void RenderESP(const std::vector<PlayerData>&); void RenderMenu(size_t); void RestorePresentHook(); void ShutdownOverlay(); DWORD WINAPI UnloadThread(LPVOID); void RequestUnload(); HRESULT __stdcall hkPresent(IDXGISwapChain*,UINT,UINT); LRESULT __stdcall hkWndProc(HWND,UINT,WPARAM,LPARAM); void* DetourFunc(BYTE*,const BYTE*,const int); void SetupHooks(); DWORD WINAPI InitializeThread(LPVOID);
 bool InstallOrbEntityHooks(); void RemoveOrbEntityHooks();

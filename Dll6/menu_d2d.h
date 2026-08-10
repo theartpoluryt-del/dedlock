@@ -6,4 +6,5 @@
 bool PrepareD2DMenu(IDXGISwapChain* swapChain);
 bool UsesSoftwareD2DMenu();
 void RenderD2DMenu(std::size_t playerCount);
+bool GetD2DPreviewCaptureRect(float& left, float& top, float& right, float& bottom);
 void ShutdownD2DMenu();

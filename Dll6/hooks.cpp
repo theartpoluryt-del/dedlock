@@ -265,6 +265,9 @@ FreeCameraUpdateFn originalFreeCameraUpdate = nullptr;
 void* freeCameraUpdateTarget = nullptr;
 GameplayCameraUpdateFn originalGameplayCameraUpdate = nullptr;
 void* gameplayCameraUpdateTarget = nullptr;
+using GetRenderFovFn = float(__fastcall*)(uintptr_t);
+GetRenderFovFn originalGetRenderFov = nullptr;
+void* getRenderFovTarget = nullptr;
 std::atomic<uintptr_t> freeCameraUserCmd{0};
 std::chrono::steady_clock::time_point lastFreeCameraUpdate{};
 std::mutex freeCameraLifecycleMutex;
@@ -275,6 +278,42 @@ Vector3 freeCameraStartAngles{};
 bool freeCameraStartAnglesReady = false;
 
 void FlushCurrentCameraAimInternal(uintptr_t camera = 0);
+
+float __fastcall hkGetRenderFov(uintptr_t camera) {
+    const float stockFov = originalGetRenderFov
+        ? originalGetRenderFov(camera) : 90.0f;
+    if (!std::isfinite(stockFov) ||
+        (!fovChangerEnabled && !overrideScopeFov)) return stockFov;
+
+    // Deadlock uses approximately 70 degrees for the stock scoped view.
+    const bool scoped = stockFov <= 70.5f;
+    if (scoped && overrideScopeFov)
+        return std::clamp(scopedCameraFov, 20.0f, 140.0f);
+    if (fovChangerEnabled)
+        return std::clamp(cameraFov, 20.0f, 140.0f);
+    return stockFov;
+}
+
+bool EnsureGetRenderFovHook() {
+    if (getRenderFovTarget && originalGetRenderFov) return true;
+    const uintptr_t address = FindUniqueClientPattern("F3 0F 10 41 50 C3");
+    if (!address) return false;
+
+    const MH_STATUS initStatus = MH_Initialize();
+    if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED)
+        return false;
+    void* target = reinterpret_cast<void*>(address);
+    const MH_STATUS createStatus = MH_CreateHook(
+        target, reinterpret_cast<void*>(&hkGetRenderFov),
+        reinterpret_cast<void**>(&originalGetRenderFov));
+    if (createStatus != MH_OK && createStatus != MH_ERROR_ALREADY_CREATED)
+        return false;
+    const MH_STATUS enableStatus = MH_EnableHook(target);
+    if (enableStatus != MH_OK && enableStatus != MH_ERROR_ENABLED)
+        return false;
+    getRenderFovTarget = target;
+    return true;
+}
 
 using GetAsyncKeyStateFn = SHORT(WINAPI*)(int);
 using GetKeyStateFn = SHORT(WINAPI*)(int);
@@ -1451,12 +1490,17 @@ void FlushCurrentCameraAimInternal(uintptr_t camera) {
     float pitchDelta = NormalizeCameraAngle(targetPitch - pitch);
     float yawDelta = NormalizeCameraAngle(targetYaw - yaw);
 
+    const bool instantPitch = aimPitchSmooth <= 1.001f;
+    const bool instantYaw = aimYawSmooth <= 1.001f;
+
     // Stop writing once the crosshair has converged. Reapplying tiny deltas
     // from consecutive camera states creates a feedback oscillation that also
     // makes every ESP projection shake.
     constexpr float angularDeadzone = 0.01f;
-    if (std::fabs(pitchDelta) < angularDeadzone) pitchDelta = 0.0f;
-    if (std::fabs(yawDelta) < angularDeadzone) yawDelta = 0.0f;
+    if (!instantPitch && std::fabs(pitchDelta) < angularDeadzone)
+        pitchDelta = 0.0f;
+    if (!instantYaw && std::fabs(yawDelta) < angularDeadzone)
+        yawDelta = 0.0f;
     if ((aimOnlyYaw || pitchDelta == 0.0f) && yawDelta == 0.0f)
         return;
 
@@ -1492,9 +1536,14 @@ void FlushCurrentCameraAimInternal(uintptr_t camera) {
     const float maxStepAt60Hz = 45.0f -
         (averageSmooth - 1.0f) * (33.0f / 19.0f);
     const float maxStep = maxStepAt60Hz * deltaSeconds * 60.0f;
-    if (!aimOnlyYaw)
-        pitch += (std::clamp)(pitchDelta * pitchAlpha, -maxStep, maxStep);
-    yaw += (std::clamp)(yawDelta * yawAlpha, -maxStep, maxStep);
+    if (!aimOnlyYaw) {
+        pitch = instantPitch
+            ? targetPitch
+            : pitch + (std::clamp)(pitchDelta * pitchAlpha, -maxStep, maxStep);
+    }
+    yaw = instantYaw
+        ? targetYaw
+        : yaw + (std::clamp)(yawDelta * yawAlpha, -maxStep, maxStep);
     pitch = (std::clamp)(pitch, -89.0f, 89.0f);
     yaw = NormalizeCameraAngle(yaw);
 
@@ -1509,6 +1558,8 @@ void FlushCurrentCameraAimInternal(uintptr_t camera) {
 
 void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3) {
     EnsureGameplayCameraUpdateHook();
+    if (fovChangerEnabled || overrideScopeFov)
+        EnsureGetRenderFovHook();
     if (!currentLocalPawn) {
         const uintptr_t resolvedPawn = FindLocalPawnFromController();
         if (resolvedPawn) currentLocalPawn = resolvedPawn;
@@ -2087,6 +2138,12 @@ void RemoveUserCmdHook() {
         MH_RemoveHook(gameplayCameraUpdateTarget);
         gameplayCameraUpdateTarget = nullptr;
         originalGameplayCameraUpdate = nullptr;
+    }
+    if (getRenderFovTarget) {
+        MH_DisableHook(getRenderFovTarget);
+        MH_RemoveHook(getRenderFovTarget);
+        getRenderFovTarget = nullptr;
+        originalGetRenderFov = nullptr;
     }
     if (applyInputCommandHookInstalled && applyInputCommandTarget) {
         MH_DisableHook(applyInputCommandTarget);

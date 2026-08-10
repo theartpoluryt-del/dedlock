@@ -12,6 +12,7 @@ using DrawModelFn = void**(__fastcall*)(
     __int64, __int64, __int64*, int, __int64, __int64, __int64);
 using PlayerOutlineFn = __int64(__fastcall*)(
     __int64, uint32_t*, float*);
+using OutlineHealthFractionFn = float(__fastcall*)(__int64);
 using PlayerHealthGlowRenderFn = void(__fastcall*)(
     void*, void*, void*, void*);
 using DrawIndexedFn = void(STDMETHODCALLTYPE*)(
@@ -26,9 +27,12 @@ using DrawIndexedInstancedIndirectFn = void(STDMETHODCALLTYPE*)(
     ID3D11DeviceContext*, ID3D11Buffer*, UINT);
 using DrawInstancedIndirectFn = void(STDMETHODCALLTYPE*)(
     ID3D11DeviceContext*, ID3D11Buffer*, UINT);
+using CreateDeferredContextFn = HRESULT(STDMETHODCALLTYPE*)(
+    ID3D11Device*, UINT, ID3D11DeviceContext**);
 
 DrawModelFn originalDrawModel = nullptr;
 PlayerOutlineFn originalPlayerOutline = nullptr;
+OutlineHealthFractionFn originalOutlineHealthFraction = nullptr;
 PlayerHealthGlowRenderFn originalPlayerHealthGlowRender = nullptr;
 DrawIndexedFn originalDrawIndexed = nullptr;
 DrawFn originalDraw = nullptr;
@@ -36,9 +40,11 @@ DrawIndexedInstancedFn originalDrawIndexedInstanced = nullptr;
 DrawInstancedFn originalDrawInstanced = nullptr;
 DrawIndexedInstancedIndirectFn originalDrawIndexedInstancedIndirect = nullptr;
 DrawInstancedIndirectFn originalDrawInstancedIndirect = nullptr;
+CreateDeferredContextFn originalCreateDeferredContext = nullptr;
 
 void* drawModelTarget = nullptr;
 void* playerOutlineTarget = nullptr;
+void* outlineHealthFractionTarget = nullptr;
 void* playerHealthGlowRenderTarget = nullptr;
 void* drawIndexedTarget = nullptr;
 void* drawTarget = nullptr;
@@ -46,6 +52,7 @@ void* drawIndexedInstancedTarget = nullptr;
 void* drawInstancedTarget = nullptr;
 void* drawIndexedInstancedIndirectTarget = nullptr;
 void* drawInstancedIndirectTarget = nullptr;
+void* createDeferredContextTarget = nullptr;
 
 ID3D11PixelShader* glowPixelShader = nullptr;
 ID3D11Buffer* glowColorBuffer = nullptr;
@@ -57,6 +64,7 @@ ID3D11RasterizerState* glowRasterizerState = nullptr;
 // executes it on another. A thread_local marker therefore made the second
 // pass lose its state before the actual Draw* call.
 std::atomic_bool renderGlowPass = false;
+std::atomic_int renderGlowTeam = -1;
 std::atomic_bool resourcesReady = false;
 std::atomic_bool firstEnemyPassLogged = false;
 std::atomic_bool drawModelLayoutLogged = false;
@@ -70,6 +78,8 @@ constexpr char DrawModelPattern[] =
 constexpr char PlayerOutlinePattern[] =
     "4C 89 44 24 ? 48 89 54 24 ? 55 53 56 57 41 56 41 57 "
     "48 8D AC 24";
+constexpr char OutlineHealthFractionPattern[] =
+    "40 53 48 83 EC ? 48 8B 01 48 8B D9 FF 90 ? ? ? ? 85 C0 75";
 constexpr char PlayerHealthGlowRenderPattern[] =
     "48 8B C4 4C 89 48 20 48 89 48 08 55 48 8D A8 ? ? ? ? "
     "48 81 EC 20 06 00 00";
@@ -80,7 +90,7 @@ constexpr size_t MeshMaterialDescriptor = 0x08;
 constexpr size_t MaterialDescriptorSize = 0x108;
 constexpr size_t MaterialTintOffset = 0x04;
 constexpr size_t MaterialAlphaOffset = 0x10;
-// The engine's CPlayerHealthGlowRenderer now handles both selectable modes.
+// The engine's CPlayerHealthGlowRenderer handles the existing HP-based path.
 // Keep the old experimental DrawModel duplicate pass out of the render path.
 constexpr bool EnableExperimentalModelGlowPass = false;
 
@@ -98,6 +108,22 @@ void LogGlowCounters() {
            << " glowDraw=" << glowDrawCallCount.load()
            << " glowPipeline=" << glowPipelineCount.load();
     LogGlowHook(stream.str().c_str());
+}
+
+bool InstallDrawHooksOnContext(ID3D11DeviceContext* context);
+
+HRESULT STDMETHODCALLTYPE HookCreateDeferredContext(
+    ID3D11Device* device, UINT flags, ID3D11DeviceContext** context) {
+    if (!originalCreateDeferredContext)
+        return E_FAIL;
+    const HRESULT result = originalCreateDeferredContext(device, flags, context);
+    if (SUCCEEDED(result) && context && *context) {
+        if (InstallDrawHooksOnContext(*context))
+            LogGlowHook("deferred D3D11 context draw hooks installed");
+        else
+            LogGlowHook("deferred D3D11 context draw hooks failed");
+    }
+    return result;
 }
 
 
@@ -164,8 +190,40 @@ uintptr_t GetEnemyHeroMeshPawn(uintptr_t entry) {
            Read<uint8_t>(pawn + Offsets::LifeState) == 0 ? pawn : 0;
 }
 
+uintptr_t GetGlowHeroMeshPawn(uintptr_t entry) {
+    const uintptr_t sceneObject = Read<uintptr_t>(entry + MeshSceneObject);
+    if (!sceneObject || !currentLocalPawn) return 0;
+
+    const uint32_t ownerHandle = Read<uint32_t>(sceneObject + SceneObjectOwner);
+    const uintptr_t pawn = ResolveEntity(ownerHandle);
+    if (!pawn || pawn == currentLocalPawn) return 0;
+
+    bool isHero = false;
+    {
+        std::lock_guard<std::mutex> lock(heroPawnsMutex);
+        isHero = std::find(heroPawns.begin(), heroPawns.end(), pawn) != heroPawns.end();
+    }
+    if (!isHero) return 0;
+
+    const uint8_t team = Read<uint8_t>(pawn + Offsets::Team);
+    const int health = Read<int>(pawn + Offsets::Health);
+    const uint8_t lifeState = Read<uint8_t>(pawn + Offsets::LifeState);
+    return (team == 2 || team == 3) && health > 0 && lifeState == 0 ? pawn : 0;
+}
+
+bool IsGlowEnabledForPawn(uintptr_t pawn) {
+    if (!pawn) return false;
+    const uint8_t localTeam = currentLocalPawn
+        ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
+    const uint8_t pawnTeam = Read<uint8_t>(pawn + Offsets::Team);
+    if (pawnTeam != 2 && pawnTeam != 3) return false;
+    const bool ally = localTeam >= 2 && localTeam <= 3 && pawnTeam == localTeam;
+    return ally ? allyGlowEnabled : enemyGlowEnabled;
+}
+
 bool IsEnemyHeroMesh(uintptr_t entry) {
-    return GetEnemyHeroMeshPawn(entry) != 0;
+    const uintptr_t pawn = GetGlowHeroMeshPawn(entry);
+    return pawn != 0 && IsGlowEnabledForPawn(pawn);
 }
 
 bool IsEnemyOutlinePawn(uintptr_t pawn) {
@@ -173,6 +231,17 @@ bool IsEnemyOutlinePawn(uintptr_t pawn) {
     // locks, entity scans, and transient health/team reads. Those operations
     // can stall the render worker and show up as visible outline jitter.
     return pawn != 0 && pawn != currentLocalPawn;
+}
+
+bool IsNormalFillPawn(uintptr_t pawn) {
+    if (!pawn || pawn == currentLocalPawn || !currentLocalPawn) return false;
+    const uint8_t localTeam = Read<uint8_t>(currentLocalPawn + Offsets::Team);
+    const uint8_t pawnTeam = Read<uint8_t>(pawn + Offsets::Team);
+    if ((localTeam != 2 && localTeam != 3) ||
+        (pawnTeam != 2 && pawnTeam != 3)) return false;
+    const bool ally = pawnTeam == localTeam;
+    return (ally ? allyGlowEnabled : enemyGlowEnabled) &&
+           (ally ? allyGlowMode : enemyGlowMode) == 1;
 }
 
 static uint32_t GlowPackedColor(const float color[4]) {
@@ -188,34 +257,43 @@ __int64 __fastcall HookPlayerOutline(
     const __int64 originalResult = originalPlayerOutline
         ? originalPlayerOutline(pawn, color, width) : 0;
 
-    if (glowEnabled && IsEnemyOutlinePawn(static_cast<uintptr_t>(pawn))) {
+    if (IsEnemyOutlinePawn(static_cast<uintptr_t>(pawn))) {
         const uint8_t localTeam = currentLocalPawn
             ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
         const uint8_t pawnTeam = Read<uint8_t>(static_cast<uintptr_t>(pawn) + Offsets::Team);
+        const bool validTeam = pawnTeam == 2 || pawnTeam == 3;
         const bool ally = localTeam >= 2 && localTeam <= 3 && pawnTeam == localTeam;
+        const bool teamGlowEnabled = ally ? allyGlowEnabled : enemyGlowEnabled;
+        if (!validTeam || !teamGlowEnabled)
+            return originalResult;
         const float* glowColor = ally ? teammateGlowColor : enemyGlowColor;
+
         float adjusted[4] = {
             glowColor[0], glowColor[1], glowColor[2], glowColor[3]};
         if (color) *color = GlowPackedColor(adjusted);
         if (width) *width = 4.0f;
 
-        // Mode 2 is the native HP-based fill. Mode 3 is the non-HP-clipped
-        // outline/fill mode. Mode 1 produces no fill in this client build.
-        return glowMode == 1 ? 3 : 2;
+        // Preserve the existing HP-based mode. Normal fill now follows the
+        // get_outline_mode hook contract supplied for the full outline: mode 2.
+        return 2;
     }
 
     return originalResult;
 }
 
-// PlayerHealthGlowRenderer is the game pass that converts current HP into
-// the vertical fill height.  In Normal fill we suppress only this HP pass;
-// the regular CGlow full-model pass remains enabled and entity health is never
-// written or spoofed.
+// The mode hook selects the outline pipeline, while this native helper
+// supplies its vertical health fraction.  Only Normal fill replaces that
+// fraction; HP-based continues through the original function unchanged.
+float __fastcall HookOutlineHealthFraction(__int64 pawn) {
+    const float fraction = originalOutlineHealthFraction
+        ? originalOutlineHealthFraction(pawn) : 0.0f;
+    return IsNormalFillPawn(static_cast<uintptr_t>(pawn)) ? 1.0f : fraction;
+}
+
+// Keep the native health renderer untouched; it owns the working HP fill.
 void __fastcall HookPlayerHealthGlowRender(
     void* renderer, void* arg1, void* arg2, void* arg3) {
-    // Normal fill must not use the renderer that derives the fill amount from
-    // current HP. Keep the original pass for the explicitly HP-based mode.
-    if (glowMode != 1 && originalPlayerHealthGlowRender)
+    if (originalPlayerHealthGlowRender)
         originalPlayerHealthGlowRender(renderer, arg1, arg2, arg3);
 }
 
@@ -251,8 +329,10 @@ bool BeginGlowPipeline(
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (SUCCEEDED(context->Map(glowColorBuffer, 0, D3D11_MAP_WRITE_DISCARD,
                                0, &mapped))) {
+        const float* glowColor = renderGlowTeam.load(std::memory_order_acquire) == 1
+            ? teammateGlowColor : enemyGlowColor;
         const float color[4] = {
-            enemyGlowColor[0], enemyGlowColor[1], enemyGlowColor[2], 1.0f};
+            glowColor[0], glowColor[1], glowColor[2], glowColor[3]};
         std::memcpy(mapped.pData, color, sizeof(color));
         context->Unmap(glowColorBuffer, 0);
     }
@@ -300,9 +380,11 @@ bool CopyReadableBytes(void* destination, const void* source, size_t size) {
     }
 }
 
-void SetGlowDescriptorTint(std::array<uint8_t, MaterialDescriptorSize>& descriptor) {
-    const Vector3 tint{enemyGlowColor[0], enemyGlowColor[1], enemyGlowColor[2]};
-    const float alpha = enemyGlowColor[3];
+void SetGlowDescriptorTint(
+    std::array<uint8_t, MaterialDescriptorSize>& descriptor,
+    const float glowColor[4]) {
+    const Vector3 tint{glowColor[0], glowColor[1], glowColor[2]};
+    const float alpha = glowColor[3];
     std::memcpy(descriptor.data() + MaterialTintOffset, &tint, sizeof(tint));
     std::memcpy(descriptor.data() + MaterialAlphaOffset, &alpha, sizeof(alpha));
 }
@@ -417,7 +499,7 @@ void** __fastcall HookDrawModel(
         sceneView, sceneLayer, a7);
 
     if (!EnableExperimentalModelGlowPass ||
-        !glowEnabled || glowMode != 1 || !meshDraws || meshCount <= 0 ||
+        enemyGlowMode != 1 && allyGlowMode != 1 || !meshDraws || meshCount <= 0 ||
         !resourcesReady.load(std::memory_order_acquire)) {
         return result;
     }
@@ -431,6 +513,7 @@ void** __fastcall HookDrawModel(
     };
     std::vector<MeshEntry> enemyMeshes;
     std::vector<MaterialDescriptor> glowDescriptors;
+    int batchTeam = -1;
     enemyMeshes.reserve(static_cast<size_t>(safeCount));
     glowDescriptors.reserve(static_cast<size_t>(safeCount));
 
@@ -438,7 +521,13 @@ void** __fastcall HookDrawModel(
     for (int i = 0; i < safeCount; ++i) {
         const uintptr_t entry =
             source + static_cast<uintptr_t>(i) * MeshEntryStride;
-        if (!IsEnemyHeroMesh(entry)) continue;
+        const uintptr_t pawn = GetGlowHeroMeshPawn(entry);
+        if (!pawn || !IsGlowEnabledForPawn(pawn)) continue;
+        const uint8_t localTeam = currentLocalPawn
+            ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
+        const uint8_t pawnTeam = Read<uint8_t>(pawn + Offsets::Team);
+        const bool ally = localTeam >= 2 && localTeam <= 3 && pawnTeam == localTeam;
+        if (batchTeam < 0) batchTeam = ally ? 1 : 0;
         MeshEntry copy{};
         if (!CopyReadableBytes(copy.bytes.data(),
                                reinterpret_cast<const void*>(entry), MeshEntryStride))
@@ -450,7 +539,9 @@ void** __fastcall HookDrawModel(
             if (!glowDescriptors.empty()) glowDescriptors.pop_back();
             continue;
         }
-        SetGlowDescriptorTint(glowDescriptors.back().bytes);
+        SetGlowDescriptorTint(
+            glowDescriptors.back().bytes,
+            ally ? teammateGlowColor : enemyGlowColor);
         const uintptr_t descriptorCopy = reinterpret_cast<uintptr_t>(
             glowDescriptors.back().bytes.data());
         std::memcpy(copy.bytes.data() + MeshMaterialDescriptor,
@@ -521,6 +612,7 @@ void** __fastcall HookDrawModel(
         const bool overridden = submittedContext &&
             BeginGlowPipeline(submittedContext, saved);
 
+        renderGlowTeam.store(batchTeam, std::memory_order_release);
         renderGlowPass.store(!submittedContext, std::memory_order_release);
         originalDrawModel(
             sceneObjectDesc, dx11,
@@ -528,6 +620,7 @@ void** __fastcall HookDrawModel(
             static_cast<int>(enemyMeshes.size()),
             sceneView, sceneLayer, a7);
         renderGlowPass.store(false, std::memory_order_release);
+        renderGlowTeam.store(-1, std::memory_order_release);
 
         if (overridden) EndGlowPipeline(submittedContext, saved);
     }
@@ -634,9 +727,9 @@ bool InstallContextHook(
     return true;
 }
 
-bool InstallDrawHooks() {
-    if (!pContext || !CreateGlowResources()) return false;
-    void** vtable = *reinterpret_cast<void***>(pContext);
+bool InstallDrawHooksOnContext(ID3D11DeviceContext* context) {
+    if (!context || !CreateGlowResources()) return false;
+    void** vtable = *reinterpret_cast<void***>(context);
     if (!vtable) return false;
 
     const bool indexed = InstallContextHook(
@@ -661,8 +754,22 @@ bool InstallDrawHooks() {
         drawInstancedIndirectTarget, vtable[40],
         reinterpret_cast<void*>(&HookDrawInstancedIndirect),
         originalDrawInstancedIndirect);
+    bool deviceHook = true;
+    if (pDevice && !createDeferredContextTarget) {
+        void** deviceVtable = *reinterpret_cast<void***>(pDevice);
+        if (deviceVtable) {
+            deviceHook = InstallContextHook(
+                createDeferredContextTarget, deviceVtable[27],
+                reinterpret_cast<void*>(&HookCreateDeferredContext),
+                originalCreateDeferredContext);
+        }
+    }
     return indexed && draw && indexedInstanced && instanced &&
-        indexedIndirect && indirect;
+        indexedIndirect && indirect && deviceHook;
+}
+
+bool InstallDrawHooks() {
+    return InstallDrawHooksOnContext(pContext);
 }
 
 void RemoveHookTarget(void*& target) {
@@ -701,6 +808,50 @@ bool InstallModelGlowHook() {
             LogGlowHook("client PlayerOutline pattern not found or hook failed");
         }
     }
+
+    if (!outlineHealthFractionTarget) {
+        HMODULE client = GetModuleHandleA("client.dll");
+        const uintptr_t candidate = client
+            ? FindPattern(client, OutlineHealthFractionPattern) : 0;
+        if (candidate && InstallContextHook(
+                outlineHealthFractionTarget,
+                reinterpret_cast<void*>(candidate),
+                reinterpret_cast<void*>(&HookOutlineHealthFraction),
+                originalOutlineHealthFraction)) {
+            LogGlowHook("client outline health fraction hook installed");
+        } else {
+            LogGlowHook("client outline health fraction pattern not found or hook failed");
+        }
+    }
+
+    if (!drawModelTarget) {
+        // The current model submission is emitted by scenesystem.dll. Keep
+        // engine2/client as compatibility fallbacks for older builds.
+        HMODULE scene = GetModuleHandleA("scenesystem.dll");
+        HMODULE sceneSystem = GetModuleHandleA("engine2.dll");
+        HMODULE client = GetModuleHandleA("client.dll");
+        uintptr_t drawCandidate = scene
+            ? FindPattern(scene, DrawModelPattern) : 0;
+        if (!drawCandidate && sceneSystem)
+            drawCandidate = FindPattern(sceneSystem, DrawModelPattern);
+        if (!drawCandidate && client)
+            drawCandidate = FindPattern(client, DrawModelPattern);
+        if (drawCandidate && InstallContextHook(
+                drawModelTarget,
+                reinterpret_cast<void*>(drawCandidate),
+                reinterpret_cast<void*>(&HookDrawModel),
+                originalDrawModel)) {
+            LogGlowHook("SceneSystem DrawModel hook installed");
+        } else {
+            LogGlowHook("SceneSystem DrawModel pattern not found or hook failed");
+        }
+    }
+
+    if (pContext && InstallDrawHooks())
+        LogGlowHook("D3D model glow draw hooks installed");
+    else
+        LogGlowHook("D3D model glow draw hooks unavailable");
+
     if (!playerHealthGlowRenderTarget) {
         HMODULE client = GetModuleHandleA("client.dll");
         const uintptr_t renderCandidate = client
@@ -727,7 +878,9 @@ void RemoveModelGlowHook() {
     RemoveHookTarget(drawTarget);
     RemoveHookTarget(drawIndexedTarget);
     RemoveHookTarget(drawModelTarget);
+    RemoveHookTarget(createDeferredContextTarget);
     RemoveHookTarget(playerOutlineTarget);
+    RemoveHookTarget(outlineHealthFractionTarget);
     RemoveHookTarget(playerHealthGlowRenderTarget);
 
     originalDrawInstanced = nullptr;
@@ -737,7 +890,9 @@ void RemoveModelGlowHook() {
     originalDraw = nullptr;
     originalDrawIndexed = nullptr;
     originalDrawModel = nullptr;
+    originalCreateDeferredContext = nullptr;
     originalPlayerOutline = nullptr;
+    originalOutlineHealthFraction = nullptr;
     originalPlayerHealthGlowRender = nullptr;
 
     if (glowRasterizerState) glowRasterizerState->Release();

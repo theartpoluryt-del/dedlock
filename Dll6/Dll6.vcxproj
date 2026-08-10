@@ -157,6 +157,7 @@
   <ItemGroup>
     <ClInclude Include="framework.h" />
     <ClInclude Include="menu_d2d.h" />
+    <ClInclude Include="preview_3d.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="shared.h" />
     <ClInclude Include="usercmd.hpp" />
@@ -190,6 +191,7 @@
     <ClCompile Include="sound_hook.cpp" />
     <ClCompile Include="model_glow.cpp" />
     <ClCompile Include="menu_d2d.cpp" />
+    <ClCompile Include="panorama_preview.cpp" />
     <ClCompile Include="runtime_offsets.cpp" />
     <ClCompile Include="C:\Users\artpo\source\repos\Dll6\Dll6\work\Andromeda-DeadLock-Base-1.2.0\Andromeda-DeadLock-Base\Andromeda-DeadLock\DeadLock\Protobuf\gameevents.pb.cc" />
     <ClCompile Include="usercmd_runtime.cpp" />

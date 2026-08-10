@@ -2,6 +2,7 @@
 #include <fstream>
 #include <MinHook.h>
 #include "menu_d2d.h"
+#include "panorama_preview.h"
 
 using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(
     ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*,
@@ -9,6 +10,7 @@ using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(
 
 static OMSetRenderTargetsFn originalOMSetRenderTargets = nullptr;
 static void* omSetRenderTargetsTarget = nullptr;
+static IDXGISwapChain* overlaySwapChain = nullptr;
 
 void STDMETHODCALLTYPE hkOMSetRenderTargets(
     ID3D11DeviceContext* context, UINT numViews,
@@ -77,6 +79,7 @@ void ShutdownOverlay() {
     RemoveOrbEntityHooks();
     RemoveMeleeStateMonitor();
     RemoveDepthCaptureHook();
+    ShutdownPanoramaPreview();
     ShutdownD2DMenu();
     // All project hooks have been disabled and removed above. Reset MinHook
     // itself so a later reinjection cannot retain trampolines into this DLL.
@@ -134,6 +137,7 @@ void ShutdownOverlay() {
         pDevice->Release();
         pDevice = nullptr;
     }
+    overlaySwapChain = nullptr;
 
     if (consoleAttached) {
         FreeConsole();
@@ -142,9 +146,14 @@ void ShutdownOverlay() {
 }
 
 DWORD WINAPI UnloadThread(LPVOID) {
-    // The VMT is restored before this thread starts; wait for the current Present call to return.
-    Sleep(250);
-    FreeLibraryAndExitThread(moduleHandle, 0);
+    // The graphics driver may still be unwinding Present on one or more
+    // render-worker threads after the VMT/WndProc were restored. Releasing the
+    // image here races those return addresses and was the source of the Del
+    // crash. The module is already fully inert after ShutdownOverlay(); leave
+    // its image resident for the current game session and retire this helper
+    // thread safely. A fresh game session then loads the next build normally.
+    Sleep(500);
+    ExitThread(0);
 }
 
 void RequestUnload() {
@@ -153,6 +162,13 @@ void RequestUnload() {
 
 HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
     if (!pSwapChain || !oPresent) return E_FAIL;
+
+    // The DXGI Present implementation is shared by every swap chain created
+    // by the process. Process only the swap chain that initialized the game
+    // overlay; running one ImGui context/RTV through auxiliary Presents gives
+    // two different render phases per game frame and visibly shakes ESP.
+    if (overlaySwapChain && pSwapChain != overlaySwapChain)
+        return oPresent(pSwapChain, SyncInterval, Flags);
 
     static bool presentMarkerWritten = false;
     if (!presentMarkerWritten) {
@@ -194,6 +210,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             pContext = nullptr;
             return oPresent(pSwapChain, SyncInterval, Flags);
         }
+        overlaySwapChain = pSwapChain;
         gameWindow = desc.OutputWindow;
         InstallDepthCaptureHook();
 
@@ -264,37 +281,29 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    // Keep a depth snapshot for visibility. The current physics filter can
-    // report a clear ray for world geometry, while the depth buffer still
-    // gives a reliable screen-space occlusion result.
-    // Entity discovery and assist logic are heavier than ImGui drawing. Keep
-    // one coherent snapshot and update it at a bounded cadence so high-refresh
-    // Present calls do not starve the render path.
-    static ULONGLONG lastAssistUpdate = 0;
-    static std::vector<PlayerData> visualSnapshot;
+    // Copy and map the game depth buffer before sampling camera/entity state.
+    // Besides visibility data, the blocking D3D11_MAP_READ is the frame fence
+    // that made the c3d7f8ff build perfectly stable: it prevents ESP from
+    // combining a completed backbuffer with transforms from the next update.
+    // This must run on every primary-swap-chain Present, including 144 Hz.
+    static ULONGLONG lastAuxiliaryUpdate = 0;
+    std::vector<PlayerData> visualSnapshot;
     const ULONGLONG now = GetTickCount64();
-    static ULONGLONG lastDepthSnapshot = 0;
-    if (lastDepthSnapshot == 0 || now - lastDepthSnapshot >= 16) {
-        CaptureDepthSnapshot();
-        ArmGameDepthCapture();
-        lastDepthSnapshot = now;
-    }
+    CaptureDepthSnapshot();
+    ArmGameDepthCapture();
     // Rebuild the visual snapshot on every Present so ESP positions are
     // refreshed once per rendered frame, including 144 Hz displays.
-    const std::vector<PlayerData> nextSnapshot = GetPlayers();
-    static ULONGLONG lastNonEmptySnapshot = 0;
-    if (!nextSnapshot.empty()) {
-        visualSnapshot = nextSnapshot;
-        lastNonEmptySnapshot = now;
-    } else if (lastNonEmptySnapshot == 0 || now - lastNonEmptySnapshot > 150) {
-        visualSnapshot.clear();
-    }
-    if (lastAssistUpdate == 0 || now - lastAssistUpdate >= 16) {
+    // Never retain a previous visual frame. At 144 Hz, the old 150 ms grace
+    // period could redraw the same moving position for more than 20 Presents.
+    visualSnapshot = GetPlayers();
+    // Human aim follows the same coherent visual sample every render frame.
+    // A fixed 16 ms acquisition gate visibly stair-steps on 120/144/240 Hz.
+    AimAtClosestEnemy(visualSnapshot);
+    if (lastAuxiliaryUpdate == 0 || now - lastAuxiliaryUpdate >= 16) {
         AutoParry(visualSnapshot);
-        AimAtClosestEnemy(visualSnapshot);
         FarmAimAssist(visualSnapshot);
         AutoLastHitOrbs();
-        lastAssistUpdate = now;
+        lastAuxiliaryUpdate = now;
     }
     RenderESP(visualSnapshot);
     // Target acquisition and visibility tracing are bounded above. Camera
@@ -302,6 +311,14 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     UpdateVisibleAimCamera();
     const bool d2dMenuReady = PrepareD2DMenu(pSwapChain);
     const bool softwareD2DMenu = d2dMenuReady && UsesSoftwareD2DMenu();
+    float previewLeft = 0.0f, previewTop = 0.0f;
+    float previewRight = 0.0f, previewBottom = 0.0f;
+    const bool previewVisible = d2dMenuReady &&
+        GetD2DPreviewCaptureRect(previewLeft, previewTop,
+                                 previewRight, previewBottom);
+    UpdatePanoramaPreview(pSwapChain, pContext,
+                          previewLeft, previewTop, previewRight, previewBottom,
+                          previewVisible);
     std::size_t sessionPlayerCount = 0;
     {
         std::lock_guard<std::mutex> lock(heroPawnsMutex);
@@ -335,6 +352,16 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 }
 
 LRESULT __stdcall hkWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == PanoramaPreviewUiMessage) {
+        ProcessPanoramaPreviewUiThread();
+        return 0;
+    }
+    if (uMsg == PanoramaPreviewGlowMessage) {
+        const bool applied = RegisterNativePreviewGlow(
+            static_cast<uintptr_t>(wParam));
+        ReportPanoramaPreviewGlowRegistration(applied);
+        return 0;
+    }
     if (uMsg == ApplyGlowMessage) {
         const uintptr_t glow = static_cast<uintptr_t>(wParam);
         const uintptr_t entity = glow - Offsets::Glow;
@@ -345,6 +372,13 @@ LRESULT __stdcall hkWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         std::lock_guard lock(glowMutex);
         queuedGlows.erase(entity);
         if (applied) registeredGlows.insert(entity);
+        return 0;
+    }
+
+    if (uMsg == WM_KEYUP && wParam == VK_DELETE) {
+        // Keep a keyboard-only unload path for hot-reload workflows.  It uses
+        // the same orderly shutdown path as the Misc page button.
+        RequestUnload();
         return 0;
     }
 

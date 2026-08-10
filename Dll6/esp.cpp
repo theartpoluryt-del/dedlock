@@ -639,6 +639,49 @@ bool ReadCurrentViewMatrix(Matrix4x4& matrix) {
     if (!clientBase) return false;
 
     const uintptr_t camera = clientBase + Offsets::ViewMatrix;
+    // The camera state publishes the matrix actually consumed by rendering
+    // immediately after the view and projection matrices. Reading view and
+    // projection separately and composing them here races the camera update:
+    // both inputs can be individually valid while belonging to different
+    // render publications. That phase mismatch moves the whole ESP whenever
+    // the camera follows a moving pawn.
+    const uintptr_t publishedMatrixAddress =
+        camera + Offsets::ViewMatrixProjection + sizeof(Matrix4x4);
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const Matrix4x4 first =
+            Read<Matrix4x4>(publishedMatrixAddress);
+        const Matrix4x4 published =
+            Read<Matrix4x4>(publishedMatrixAddress);
+        if (std::memcmp(&first, &published, sizeof(published)) != 0)
+            continue;
+
+        bool finite = true;
+        for (int row = 0; row < 4 && finite; ++row) {
+            for (int column = 0; column < 4; ++column) {
+                if (!std::isfinite(published.m[row][column])) {
+                    finite = false;
+                    break;
+                }
+            }
+        }
+        const float perspectiveLengthSquared =
+            published.m[3][0] * published.m[3][0] +
+            published.m[3][1] * published.m[3][1] +
+            published.m[3][2] * published.m[3][2];
+        if (finite && std::isfinite(perspectiveLengthSquared) &&
+            perspectiveLengthSquared > 0.0001f) {
+            matrix = published;
+            return true;
+        }
+    }
+
+    // The live client publishes a complete view-projection matrix at +0x80.
+    // Never switch ESP to a separately composed pair from another update
+    // phase; skip this frame if the complete publication was torn.
+    return false;
+
+    // Compatibility fallback for a camera layout that does not expose the
+    // published matrix at the expected adjacent slot.
     // The camera hook and Present may run on different threads. A view matrix
     // from one camera update combined with the projection from the next is
     // still finite, but shifts every ESP primitive for one frame. Require two
@@ -656,12 +699,10 @@ bool ReadCurrentViewMatrix(Matrix4x4& matrix) {
             std::memcmp(&firstView, &view, sizeof(view)) != 0 ||
             std::memcmp(&firstProjection, &projection,
                         sizeof(projection)) != 0;
-        // A moving camera can legitimately change between every sample. Retry
-        // to obtain an ideal stable pair, but on the final attempt prefer the
-        // newest finite pair over freezing ESP on an old matrix.
-        if (changedDuringRead && attempt < 5) {
-            continue;
-        }
+        // Never compose a view/projection pair that changed during the read.
+        // The previous code accepted the final torn pair after five retries,
+        // producing an occasional one-frame jump of the entire ESP.
+        if (changedDuringRead) continue;
 
         bool finite = true;
         for (int row = 0; row < 4 && finite; ++row) {
@@ -782,6 +823,156 @@ void RestoreStoredServerHull() {
     originalServerHull = {};
 }
 
+}
+
+namespace {
+bool IsUsableEspPosition(const Vector3& position) {
+    return std::isfinite(position.x) && std::isfinite(position.y) &&
+           std::isfinite(position.z) &&
+           std::fabs(position.x) < 100000.0f &&
+           std::fabs(position.y) < 100000.0f &&
+           std::fabs(position.z) < 100000.0f &&
+           (std::fabs(position.x) > 0.01f ||
+            std::fabs(position.y) > 0.01f ||
+            std::fabs(position.z) > 0.01f);
+}
+
+bool GetEspFramePosition(uintptr_t entity, Vector3& position) {
+    // ESP must follow exactly one coordinate source. m_nodeToWorld is the
+    // transform consumed by scene rendering; AbsOrigin and m_vRenderOrigin
+    // are published at different phases and mixing them produces a visible
+    // forward/back snap. If this render transform is temporarily unavailable,
+    // skip the entity for this frame instead of drawing it at another phase.
+    return GetEntityRenderTransformPosition(entity, position) &&
+           IsUsableEspPosition(position);
+}
+
+struct EspScreenTrack {
+    float centerX{};
+    float centerY{};
+    float velocityX{};
+    float velocityY{};
+    float rawCenterX{};
+    float rawCenterY{};
+    float width{};
+    float height{};
+    ULONGLONG rawChangedAt{};
+    ULONGLONG lastSeenAt{};
+    bool initialized{};
+};
+
+std::unordered_map<uintptr_t, EspScreenTrack> espScreenTracks;
+
+bool StabilizeEspScreenBox(uintptr_t entity, float rawLeft, float rawTop,
+                           float rawRight, float rawBottom,
+                           float& left, float& top,
+                           float& right, float& bottom) {
+    if (!entity || !std::isfinite(rawLeft) || !std::isfinite(rawTop) ||
+        !std::isfinite(rawRight) || !std::isfinite(rawBottom) ||
+        rawRight <= rawLeft || rawBottom <= rawTop)
+        return false;
+
+    const float rawCenterX = (rawLeft + rawRight) * 0.5f;
+    const float rawCenterY = (rawTop + rawBottom) * 0.5f;
+    const float rawWidth = rawRight - rawLeft;
+    const float rawHeight = rawBottom - rawTop;
+    const ULONGLONG now = GetTickCount64();
+    const float dt = std::clamp(ImGui::GetIO().DeltaTime, 0.001f, 0.050f);
+    auto& track = espScreenTracks[entity];
+
+    const float oldRawDx = rawCenterX - track.rawCenterX;
+    const float oldRawDy = rawCenterY - track.rawCenterY;
+    const float oldRawDistance =
+        std::sqrt(oldRawDx * oldRawDx + oldRawDy * oldRawDy);
+    const bool reset = !track.initialized ||
+        now - track.lastSeenAt > 150 || !std::isfinite(oldRawDistance) ||
+        oldRawDistance > 500.0f ||
+        std::fabs(rawWidth - track.width) > 300.0f ||
+        std::fabs(rawHeight - track.height) > 500.0f;
+    if (reset) {
+        track.centerX = track.rawCenterX = rawCenterX;
+        track.centerY = track.rawCenterY = rawCenterY;
+        track.velocityX = track.velocityY = 0.0f;
+        track.width = rawWidth;
+        track.height = rawHeight;
+        track.rawChangedAt = now;
+        track.lastSeenAt = now;
+        track.initialized = true;
+    } else {
+        // The camera matrix can remain unchanged for several Presents and
+        // then jump on a gameplay-camera publication. Estimate velocity only
+        // when a genuinely new screen sample arrives; duplicate Presents must
+        // not repeatedly pull the velocity estimate toward zero.
+        if (oldRawDistance > 0.05f) {
+            const ULONGLONG elapsedMs = now - track.rawChangedAt;
+            if (elapsedMs >= 2 && elapsedMs <= 100) {
+                const float inverseSeconds =
+                    1000.0f / static_cast<float>(elapsedMs);
+                const float measuredVelocityX = oldRawDx * inverseSeconds;
+                const float measuredVelocityY = oldRawDy * inverseSeconds;
+                const float measuredSpeed = std::hypot(
+                    measuredVelocityX, measuredVelocityY);
+                if (std::isfinite(measuredSpeed) && measuredSpeed < 50000.0f) {
+                    constexpr float velocityBlend = 0.65f;
+                    track.velocityX +=
+                        (measuredVelocityX - track.velocityX) * velocityBlend;
+                    track.velocityY +=
+                        (measuredVelocityY - track.velocityY) * velocityBlend;
+                }
+            }
+            track.rawCenterX = rawCenterX;
+            track.rawCenterY = rawCenterY;
+            track.rawChangedAt = now;
+        } else if (now - track.rawChangedAt > 80) {
+            const float velocityDecay = std::exp(-18.0f * dt);
+            track.velocityX *= velocityDecay;
+            track.velocityY *= velocityDecay;
+        }
+
+        // Correct directly toward the latest primary-swap-chain sample.
+        // Do not extrapolate screen velocity: camera rotation is part of the
+        // screen displacement, and treating it as pawn velocity caused the
+        // filter to overshoot and amplify a matrix jump.
+        const float residualX = rawCenterX - track.centerX;
+        const float residualY = rawCenterY - track.centerY;
+        const float residual = std::hypot(residualX, residualY);
+        const float responseRate = 90.0f +
+            (std::min)(residual * 4.0f, 130.0f);
+        const float centerAlpha = 1.0f - std::exp(-responseRate * dt);
+        track.centerX += residualX * centerAlpha;
+        track.centerY += residualY * centerAlpha;
+
+        // Width/height have no useful directional velocity. A fast
+        // frame-rate-independent response removes capsule publication noise
+        // without visibly changing the box size relative to the model.
+        const float sizeAlpha = 1.0f - std::exp(-90.0f * dt);
+        track.width += (rawWidth - track.width) * sizeAlpha;
+        track.height += (rawHeight - track.height) * sizeAlpha;
+
+        track.lastSeenAt = now;
+    }
+
+    const float halfWidth = track.width * 0.5f;
+    const float halfHeight = track.height * 0.5f;
+    left = track.centerX - halfWidth;
+    right = track.centerX + halfWidth;
+    top = track.centerY - halfHeight;
+    bottom = track.centerY + halfHeight;
+
+    static uint32_t cleanupCounter = 0;
+    if ((++cleanupCounter & 1023u) == 0u) {
+        for (auto it = espScreenTracks.begin();
+             it != espScreenTracks.end();) {
+            if (now - it->second.lastSeenAt > 2000)
+                it = espScreenTracks.erase(it);
+            else
+                ++it;
+        }
+    }
+    return std::isfinite(left) && std::isfinite(top) &&
+           std::isfinite(right) && std::isfinite(bottom) &&
+           right > left && bottom > top;
+}
 }
 
 void RestoreRemSizedHull() {
@@ -931,23 +1122,21 @@ std::vector<PlayerData> GetPlayers() {
 
     if (!clientBase) return players;
 
-    static ULONGLONG lastValidViewMatrixAt = 0;
-    const ULONGLONG matrixNow = GetTickCount64();
     Matrix4x4 viewMatrix{};
+    // Read the complete matrix published for the backbuffer at Present. The
+    // old path preferred a cached depth-bind matrix for up to 250 ms; during
+    // fast camera movement that matrix belonged to an older camera frame and
+    // made every ESP primitive freeze and then jump. Entity render transforms
+    // below are sampled in this same Present, so only the current publication
+    // is coherent with them.
     if (ReadCurrentViewMatrix(viewMatrix)) {
         currentViewMatrix = viewMatrix;
         currentViewMatrixReady = true;
-        lastValidViewMatrixAt = matrixNow;
-    } else if (currentViewMatrixReady && lastValidViewMatrixAt != 0 &&
-               matrixNow - lastValidViewMatrixAt <= 34) {
-        // Preserve at most one or two render frames. A longer hold makes ESP
-        // visibly stop and catch up whenever the local camera is moving.
-        viewMatrix = currentViewMatrix;
     } else {
         currentViewMatrixReady = false;
-        // Entity discovery is world-space and must not depend on whether the
-        // current camera matrix is publishable. Continue building the session
-        // snapshot; RenderESP alone decides which players are on screen.
+        // Never combine current entity positions with an older camera frame.
+        // Skipping one invalid Present is preferable to drawing stale data.
+        return players;
     }
     std::vector<uintptr_t> pawns;
     {
@@ -1017,46 +1206,6 @@ std::vector<PlayerData> GetPlayers() {
         (farmToggleMode ? farmToggleActive : farmKeyDown);
     const bool needPlayerBones = drawBones || enemyBonesEnabled || allyBonesEnabled ||
         aimNeedsBones || farmNeedsBones;
-    struct CachedPlayerPosition {
-        Vector3 position{};
-        ULONGLONG lastValid{};
-    };
-    struct InterpolatedPlayerPosition {
-        Vector3 visual{};
-        Vector3 velocity{};
-        ULONGLONG lastSeen{};
-        bool initialized{};
-    };
-    static std::unordered_map<uintptr_t, CachedPlayerPosition>
-        cachedPlayerPositions;
-    static std::unordered_map<uintptr_t, InterpolatedPlayerPosition>
-        interpolatedPlayerPositions;
-    const ULONGLONG positionNow = GetTickCount64();
-    const float visualDeltaTime = std::clamp(
-        ImGui::GetIO().DeltaTime, 0.001f, 0.050f);
-    const auto smoothDamp = [visualDeltaTime](
-        float current, float target, float& velocity) {
-        // Stable critically-damped spring (the rational term approximates
-        // exp(-omega * dt)). It removes tick corrections without applying any
-        // delay to camera projection, which is performed afterwards.
-        constexpr float smoothTime = 0.045f;
-        const float omega = 2.0f / smoothTime;
-        const float x = omega * visualDeltaTime;
-        const float decay = 1.0f /
-            (1.0f + x + 0.48f * x * x + 0.235f * x * x * x);
-        const float change = current - target;
-        const float temporary =
-            (velocity + omega * change) * visualDeltaTime;
-        velocity = (velocity - omega * temporary) * decay;
-        float output = target + (change + temporary) * decay;
-        // Numerical overshoot is never useful for an ESP anchor.
-        if ((target - current > 0.0f) == (output > target)) {
-            output = target;
-            velocity = 0.0f;
-        }
-        return output;
-    };
-
     for (const uintptr_t entity : pawns) {
         // World snapshots may contain the local third-person pawn. It must
         // never be treated as an ESP target: its render skeleton is updated
@@ -1080,53 +1229,34 @@ std::vector<PlayerData> GetPlayers() {
         if (team != 2 && team != 3) continue;
 
         Vector3 pos{};
-        // Visual ESP must follow the interpolated render transform. AbsOrigin
-        // advances at the network tick rate and makes boxes/text visibly step.
-        if (GetEntityRenderPosition(entity, pos)) {
-            cachedPlayerPositions[entity] = {pos, positionNow};
-        } else {
-            const auto cached = cachedPlayerPositions.find(entity);
-            if (cached == cachedPlayerPositions.end() ||
-                positionNow - cached->second.lastValid > 5000)
-                continue;
-            pos = cached->second.position;
-        }
+        if (!GetEntityPosition(entity, pos)) continue;
+        Vector3 framePosition{};
+        if (!GetEspFramePosition(entity, framePosition)) continue;
 
         PlayerData player;
         player.entity = entity;
         player.pos = pos;
-        auto& motion = interpolatedPlayerPositions[entity];
-        if (!motion.initialized) {
-            motion.visual = pos;
-            motion.velocity = {};
-            motion.initialized = true;
-        } else {
-            const float rawDx = pos.x - motion.visual.x;
-            const float rawDy = pos.y - motion.visual.y;
-            const float rawDz = pos.z - motion.visual.z;
-            const float correctionDistanceSquared =
-                rawDx * rawDx + rawDy * rawDy + rawDz * rawDz;
-            if (correctionDistanceSquared > 256.0f * 256.0f) {
-                motion.visual = pos;
-                motion.velocity = {};
-            } else {
-                motion.visual.x = smoothDamp(
-                    motion.visual.x, pos.x, motion.velocity.x);
-                motion.visual.y = smoothDamp(
-                    motion.visual.y, pos.y, motion.velocity.y);
-                motion.visual.z = smoothDamp(
-                    motion.visual.z, pos.z, motion.velocity.z);
-            }
+        // Prefer the engine's instantaneous velocity for aim prediction.
+        // Position deltas are delayed/interpolated and noticeably under-lead
+        // during the first frames after a target starts running.
+        player.velocity = Read<Vector3>(entity + Offsets::Velocity);
+        if (!std::isfinite(player.velocity.x) ||
+            !std::isfinite(player.velocity.y) ||
+            !std::isfinite(player.velocity.z) ||
+            player.velocity.x * player.velocity.x +
+                player.velocity.y * player.velocity.y +
+                player.velocity.z * player.velocity.z > 2500.0f * 2500.0f) {
+            player.velocity = {};
         }
-        motion.lastSeen = positionNow;
-        player.visualAnchor = motion.visual;
+        // Keep the rendered transform as the bone/aim anchor, but place the
+        // ESP capsule at AbsOrigin.  The latter is the source used by the
+        // jitter-free c3d7f8ff build and is published slightly ahead of
+        // m_nodeToWorld while a hero is running.  Using m_nodeToWorld for the
+        // box was stable after the Present fence, but left a constant visual
+        // delay behind the model.
+        player.visualAnchor = framePosition;
         player.hasVisualAnchor = true;
-        // Snaplines need a stable world coordinate. RenderOrigin is correct
-        // for boxes on visible animated models, but it is a render-cache
-        // value and can drift when the entity is behind the camera.
-        Vector3 stableWorldPosition{};
-        player.worldPos = GetEntityPosition(entity, stableWorldPosition)
-            ? stableWorldPosition : pos;
+        player.worldPos = pos;
         const uintptr_t collision = Read<uintptr_t>(entity + Offsets::CollisionProperty);
         const Vector3 collisionMins = Read<Vector3>(collision + Offsets::CollisionMins);
         const Vector3 collisionMaxs = Read<Vector3>(collision + Offsets::CollisionMaxs);
@@ -1165,25 +1295,15 @@ std::vector<PlayerData> GetPlayers() {
                               : 0.0f;
         if (!std::isfinite(player.distance)) continue;
 
-        // Keep world-space player state even when one camera projection is
-        // between updates. Screen bounds are calculated in RenderESP from the
-        // matrix of that exact Present frame.
-        players.push_back(player);
-    }
-
-    for (auto it = cachedPlayerPositions.begin();
-         it != cachedPlayerPositions.end();) {
-        if (positionNow - it->second.lastValid > 10000)
-            it = cachedPlayerPositions.erase(it);
-        else
-            ++it;
-    }
-    for (auto it = interpolatedPlayerPositions.begin();
-         it != interpolatedPlayerPositions.end();) {
-        if (positionNow - it->second.lastSeen > 10000)
-            it = interpolatedPlayerPositions.erase(it);
-        else
-            ++it;
+        // AbsOrigin and the camera matrix are sampled in this fenced Present.
+        // This matches the proven c3 ESP path without adding screen-space
+        // smoothing or prediction, so starts/stops remain exact and stable.
+        if (currentViewMatrixReady && GetEntityScreenBounds(
+                entity, pos, viewMatrix,
+                player.boxLeft, player.boxTop,
+                player.boxRight, player.boxBottom)) {
+            players.push_back(player);
+        }
     }
 
     return players;
@@ -1212,6 +1332,7 @@ void RenderESP(const std::vector<PlayerData>& players) {
 
     auto drawList = ImGui::GetBackgroundDrawList();
     const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
+
     const bool aimKeyDown = (GetAsyncKeyState(aimAssistKey) & 0x8000) != 0;
     const bool aimEnabled = aimAssist && (aimToggleMode ? aimToggleActive : aimKeyDown);
     const bool farmKeyDown = (GetAsyncKeyState(farmAssistKey) & 0x8000) != 0;
@@ -1586,7 +1707,7 @@ void RenderESP(const std::vector<PlayerData>& players) {
             // must be refreshed every frame so moving creeps do not leave stale
             // boxes behind.
             Vector3 livePosition{};
-            if (!GetEntityRenderPosition(creep.entity, livePosition)) continue;
+            if (!GetEntityPosition(creep.entity, livePosition)) continue;
             const uintptr_t sceneNode = Read<uintptr_t>(creep.entity + Offsets::GameSceneNode);
             if (!sceneNode || Read<uint8_t>(sceneNode + Offsets::SceneNodeDormant) != 0) continue;
             creep.pos = livePosition;
@@ -1686,6 +1807,8 @@ void RenderESP(const std::vector<PlayerData>& players) {
                                                    : (ally ? allyCreepHealthValuesEnabled : creepHealthValuesEnabled);
             const float* boxColor = ally ? allyCreepBoxColor : creepBoxColor;
             const float* healthColorValue = ally ? allyCreepHealthColor : creepHealthColor;
+            const float* healthValueColorValue = ally
+                ? allyCreepHealthValueColor : creepHealthValueColor;
             if (!drawThisCreep) continue;
             const ImColor color = neutral
                 ? ImColor(190, 190, 190, 150)
@@ -1695,7 +1818,7 @@ void RenderESP(const std::vector<PlayerData>& players) {
                     drawList->AddRect(ImVec2(left, top), ImVec2(right, bottom), color, 0.0f, 0,
                                       ally ? 1.0f : 1.25f);
                 } else {
-                    const float length = std::clamp((std::min)(right - left, bottom - top) * cornerBoxLength,
+                    const float length = std::clamp((std::min)(right - left, bottom - top) * std::clamp(cornerBoxLength, 0.10f, 0.35f),
                                                     4.0f, 32.0f);
                     const float thickness = std::clamp(boxThickness, 0.5f, 4.0f);
                     drawList->AddLine(ImVec2(left, top), ImVec2(left + length, top), color, thickness);
@@ -1748,7 +1871,11 @@ void RenderESP(const std::vector<PlayerData>& players) {
             if (drawHealthValues) {
                 char healthText[32]{};
                 std::snprintf(healthText, sizeof(healthText), "%d/%d", creep.health, creep.maxHealth);
-                drawList->AddText(ImVec2(left, top - 16.0f), ImColor(255, 255, 255, 220), healthText);
+                 const ImColor valueColor = neutral
+                     ? ImColor(190, 190, 190, 220)
+                     : ImColor(healthValueColorValue[0], healthValueColorValue[1],
+                               healthValueColorValue[2], healthValueColorValue[3]);
+                 drawList->AddText(ImVec2(left, top - 16.0f), valueColor, healthText);
             }
         }
         for (auto it = smoothedCreepBoxes.begin();
@@ -1764,31 +1891,22 @@ void RenderESP(const std::vector<PlayerData>& players) {
         }
     }
 
-    if ((!enemyEspEnabled && !allyEspEnabled && !localEspEnabled) ||
-        !currentViewMatrixReady)
+    if ((!enemyEspEnabled && !allyEspEnabled) || !currentViewMatrixReady)
         return;
 
-    Vector2 localScreen{};
-    const bool localOnScreen = currentLocalPositionReady &&
-                               WorldToScreen(currentLocalPosition, localScreen, currentViewMatrix);
+    const ImVec2 snaplineOrigin(displaySize.x * 0.5f, displaySize.y);
 
-    struct SmoothedEspBox {
-        float left{}, top{}, right{}, bottom{};
-        ULONGLONG lastSeen{};
-        bool initialized{};
-    };
-    static std::unordered_map<uintptr_t, SmoothedEspBox> smoothedBoxes;
-    const ULONGLONG smoothingNow = GetTickCount64();
     const auto makeColor = [](const float color[4]) {
         return ImColor(color[0], color[1], color[2], color[3]);
     };
     const auto addCornerBox = [&](ImDrawList* list, float left, float top,
-                                  float right, float bottom, ImU32 color) {
+                                  float right, float bottom, ImU32 color,
+                                  float cornerLength, float thicknessValue) {
         const float width = right - left;
         const float height = bottom - top;
-        const float length = std::clamp(cornerBoxLength, 0.05f, 0.50f) *
+        const float length = std::clamp(cornerLength, 0.05f, 0.35f) *
             (std::min)(width, height);
-        const float thickness = std::clamp(boxThickness, 0.5f, 4.0f);
+        const float thickness = std::clamp(thicknessValue, 0.5f, 4.0f);
         list->AddLine(ImVec2(left, top), ImVec2(left + length, top), color, thickness);
         list->AddLine(ImVec2(left, top), ImVec2(left, top + length), color, thickness);
         list->AddLine(ImVec2(right - length, top), ImVec2(right, top), color, thickness);
@@ -1798,54 +1916,6 @@ void RenderESP(const std::vector<PlayerData>& players) {
         list->AddLine(ImVec2(right - length, bottom), ImVec2(right, bottom), color, thickness);
         list->AddLine(ImVec2(right, bottom - length), ImVec2(right, bottom), color, thickness);
     };
-
-    if (localEspEnabled && currentLocalPawn && currentLocalPositionReady) {
-        float localLeft = 0.0f, localTop = 0.0f, localRight = 0.0f, localBottom = 0.0f;
-        if (GetEntityScreenBounds(currentLocalPawn, currentLocalPosition,
-                                  currentViewMatrix, localLeft, localTop,
-                                  localRight, localBottom)) {
-            const ImU32 localBox = makeColor(localBoxColor);
-            if (localBoxesEnabled) {
-                if (localCornerBoxesEnabled) addCornerBox(drawList, localLeft, localTop,
-                                                   localRight, localBottom, localBox);
-                else drawList->AddRect(ImVec2(localLeft, localTop),
-                                       ImVec2(localRight, localBottom), localBox,
-                                       0.0f, 0, boxThickness);
-            }
-            const int health = Read<int>(currentLocalPawn + Offsets::Health);
-            const int maxHealth = Read<int>(currentLocalPawn + Offsets::MaxHealth);
-            const float healthPercent = maxHealth > 0
-                ? std::clamp(static_cast<float>(health) / maxHealth, 0.0f, 1.0f) : 0.0f;
-            if (localHealthEnabled) {
-                const float barLeft = localLeft - 6.0f;
-                drawList->AddRectFilled(ImVec2(barLeft, localTop),
-                                        ImVec2(barLeft + 3.0f, localBottom),
-                                        ImColor(40, 40, 40, 130));
-                drawList->AddRectFilled(ImVec2(barLeft, localBottom - (localBottom - localTop) * healthPercent),
-                                        ImVec2(barLeft + 3.0f, localBottom),
-                                        makeColor(localHealthColor));
-            }
-            if (localHealthValuesEnabled) {
-                char localHealthText[32]{};
-                std::snprintf(localHealthText, sizeof(localHealthText), "%d/%d", health, maxHealth);
-                drawList->AddText(ImVec2(localLeft, localTop - 16.0f),
-                                  ImColor(255, 255, 255, 220), localHealthText);
-            }
-            if (localBonesEnabled) {
-                std::vector<BoneSegment> localBones;
-                if (GetEntityBoneSkeleton(currentLocalPawn, localBones)) {
-                    for (const auto& bone : localBones) {
-                        Vector2 start{}, end{};
-                        if (WorldToScreen(bone.start, start, currentViewMatrix) &&
-                            WorldToScreen(bone.end, end, currentViewMatrix)) {
-                            drawList->AddLine(ImVec2(start.x, start.y),
-                                              ImVec2(end.x, end.y), localBox, 1.0f);
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     const auto projectSnaplinePoint = [&](const Vector3& world,
                                           ImVec2& point) {
@@ -1863,8 +1933,8 @@ void RenderESP(const std::vector<PlayerData>& players) {
 
         const float centerX = displaySize.x * 0.5f;
         const float centerY = displaySize.y * 0.5f;
-        const float originX = localOnScreen ? localScreen.x : centerX;
-        const float originY = localOnScreen ? localScreen.y : centerY;
+        const float originX = snaplineOrigin.x;
+        const float originY = snaplineOrigin.y;
         constexpr float edgeMargin = 6.0f;
         // Derive only the horizontal camera yaw. The full clip-space W also
         // contains pitch and camera-height terms, which makes a stationary
@@ -1970,20 +2040,29 @@ void RenderESP(const std::vector<PlayerData>& players) {
         const uint8_t localTeam = currentLocalPawn
             ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
         const bool ally = localTeam != 0 && player.team == localTeam;
+        const float teamBoxThickness = ally ? allyBoxThickness : enemyBoxThickness;
+        const float teamCornerLength = ally ? allyCornerBoxLength : enemyCornerBoxLength;
+        const bool teamEsp = ally ? allyEspEnabled : enemyEspEnabled;
         const bool teamSnaplines = ally ? allySnaplinesEnabled : enemySnaplinesEnabled;
-        Vector3 visualOrigin = player.pos;
-        if (player.hasVisualAnchor) {
-            visualOrigin = player.visualAnchor;
-        }
+        // Snaplines belong to the same team ESP channel. Do this gate before
+        // both the off-screen and on-screen snapline paths below.
+        if (!teamEsp) continue;
+        // worldPos and box bounds use the fenced AbsOrigin sample. Bones are
+        // rebuilt from the same completed frame before they are projected.
+        const Vector3 visualOrigin = player.worldPos;
         const float targetClipW =
             currentViewMatrix.m[3][0] * visualOrigin.x +
             currentViewMatrix.m[3][1] * visualOrigin.y +
             currentViewMatrix.m[3][2] * visualOrigin.z +
             currentViewMatrix.m[3][3];
-        float frameLeft{}, frameTop{}, frameRight{}, frameBottom{};
-        const bool hasScreenBounds = GetEntityScreenBounds(
-            player.entity, visualOrigin, currentViewMatrix,
-            frameLeft, frameTop, frameRight, frameBottom);
+        const float rawFrameLeft = player.boxLeft;
+        const float rawFrameTop = player.boxTop;
+        const float rawFrameRight = player.boxRight;
+        const float rawFrameBottom = player.boxBottom;
+        const bool hasScreenBounds =
+            std::isfinite(rawFrameLeft) && std::isfinite(rawFrameTop) &&
+            std::isfinite(rawFrameRight) && std::isfinite(rawFrameBottom) &&
+            rawFrameRight > rawFrameLeft && rawFrameBottom > rawFrameTop;
         const bool targetOnScreen = std::isfinite(targetClipW) &&
             targetClipW > 0.01f && hasScreenBounds;
         // Off-screen snaplines still use the bearing projection. On-screen
@@ -1992,10 +2071,7 @@ void RenderESP(const std::vector<PlayerData>& players) {
         if (teamSnaplines && !targetOnScreen) {
             ImVec2 snaplinePoint{};
             if (projectSnaplinePoint(player.worldPos, snaplinePoint)) {
-                const ImVec2 lineStart = localOnScreen
-                    ? ImVec2(localScreen.x, localScreen.y)
-                    : ImVec2(displaySize.x * 0.5f,
-                             displaySize.y * 0.5f);
+                const ImVec2 lineStart = snaplineOrigin;
                 const int alpha = static_cast<int>(
                     std::clamp(snaplineAlpha, 0.0f, 255.0f));
                 drawList->AddLine(lineStart, snaplinePoint,
@@ -2010,39 +2086,32 @@ void RenderESP(const std::vector<PlayerData>& players) {
             continue;
         }
 
-        auto& smooth = smoothedBoxes[player.entity];
-        const float rawCenterX = (frameLeft + frameRight) * 0.5f;
-        const float rawCenterY = (frameTop + frameBottom) * 0.5f;
-        // visualOrigin is already interpolated in world space. Copy the exact
-        // current projection so camera motion cannot make the ESP trail the
-        // rendered model by one or two frames.
-        smooth.left = frameLeft;
-        smooth.top = frameTop;
-        smooth.right = frameRight;
-        smooth.bottom = frameBottom;
-        smooth.initialized = true;
-        smooth.lastSeen = smoothingNow;
-
-        const float screenX = (smooth.left + smooth.right) * 0.5f;
-        const float screenY = smooth.bottom;
-        const float boxTop = smooth.top;
-        const float boxHeight = smooth.bottom - smooth.top;
-        const float boxWidth = smooth.right - smooth.left;
+        // The visual snapshot is now fenced to the completed game frame.
+        // Draw its exact projection. The previous screen-space correction was
+        // compensating for mixed-frame samples and made the box trail behind
+        // the rendered model even after the source data became coherent.
+        const float frameLeft = rawFrameLeft;
+        const float frameTop = rawFrameTop;
+        const float frameRight = rawFrameRight;
+        const float frameBottom = rawFrameBottom;
+        const float rawCenterX =
+            (rawFrameLeft + rawFrameRight) * 0.5f;
+        const float screenX = (frameLeft + frameRight) * 0.5f;
+        const float rawCenterY =
+            (rawFrameTop + rawFrameBottom) * 0.5f;
+        const float filteredCenterY = (frameTop + frameBottom) * 0.5f;
         const float screenOffsetX = screenX - rawCenterX;
-        const float screenOffsetY =
-            (smooth.top + smooth.bottom) * 0.5f - rawCenterY;
+        const float screenOffsetY = filteredCenterY - rawCenterY;
+        const float screenY = frameBottom;
+        const float boxTop = frameTop;
+        const float boxHeight = frameBottom - frameTop;
         if (teamSnaplines) {
-            const ImVec2 lineStart = localOnScreen
-                ? ImVec2(localScreen.x, localScreen.y)
-                : ImVec2(displaySize.x * 0.5f,
-                         displaySize.y * 0.5f);
+            const ImVec2 lineStart = snaplineOrigin;
             const int alpha = static_cast<int>(
                 std::clamp(snaplineAlpha, 0.0f, 255.0f));
             drawList->AddLine(lineStart, ImVec2(screenX, screenY),
                               ImColor(255, 255, 255, alpha), 1.0f);
         }
-        const bool teamEsp = ally ? allyEspEnabled : enemyEspEnabled;
-        if (!teamEsp) continue;
         const bool teamBoxes = ally ? allyBoxesEnabled : enemyBoxesEnabled;
         const bool teamCornerBoxes = ally ? allyCornerBoxesEnabled : enemyCornerBoxesEnabled;
         const bool teamHealth = ally ? allyHealthEnabled : enemyHealthEnabled;
@@ -2053,6 +2122,8 @@ void RenderESP(const std::vector<PlayerData>& players) {
         const bool teamBones = ally ? allyBonesEnabled : enemyBonesEnabled;
         const ImColor boxColor = makeColor(ally ? teammateBoxColor : enemyBoxColor);
         const ImColor nameColor = makeColor(ally ? teammateNameColor : enemyNameColor);
+        const ImColor skeletonColor = makeColor(
+            ally ? teammateSkeletonColor : enemySkeletonColor);
         const ImColor playerNameColor = makeColor(ally ? teammatePlayerNameColor : enemyPlayerNameColor);
         const ImColor healthBarColor = makeColor(ally ? teammateHealthBarColor : enemyHealthBarColor);
         const ImColor healthValueColor = makeColor(ally ? teammateHealthValueColor : enemyHealthValueColor);
@@ -2067,7 +2138,7 @@ void RenderESP(const std::vector<PlayerData>& players) {
                                start.y + screenOffsetY),
                         ImVec2(end.x + screenOffsetX,
                                end.y + screenOffsetY),
-                        makeColor(ally ? teammateNameColor : enemyNameColor), 1.5f);
+                        skeletonColor, 1.5f);
                 }
             }
         }
@@ -2090,12 +2161,12 @@ void RenderESP(const std::vector<PlayerData>& players) {
 
         if (teamBoxes) {
             if (teamCornerBoxes) {
-                addCornerBox(drawList, smooth.left, boxTop, smooth.right,
-                             screenY, boxColor);
+                addCornerBox(drawList, frameLeft, boxTop, frameRight,
+                             screenY, boxColor, teamCornerLength, teamBoxThickness);
             } else {
-                drawList->AddRect(ImVec2(smooth.left, boxTop),
-                                  ImVec2(smooth.right, screenY), boxColor,
-                                  0.0f, 0, boxThickness);
+                drawList->AddRect(ImVec2(frameLeft, boxTop),
+                                  ImVec2(frameRight, screenY), boxColor,
+                                  0.0f, 0, teamBoxThickness);
             }
         }
 
@@ -2104,7 +2175,7 @@ void RenderESP(const std::vector<PlayerData>& players) {
                                             ? std::clamp(static_cast<float>(player.health) / player.maxHealth, 0.0f, 1.0f)
                                             : 0.0f;
             constexpr float barWidth = 4.0f;
-            const float barLeft = smooth.left - 7.0f;
+            const float barLeft = frameLeft - 7.0f;
 
             // A vertical bar stays readable at every distance and shows loss from the top.
             drawList->AddRectFilled(
@@ -2134,12 +2205,6 @@ void RenderESP(const std::vector<PlayerData>& players) {
             );
         }
     }
-    for (auto it = smoothedBoxes.begin(); it != smoothedBoxes.end();) {
-        if (smoothingNow - it->second.lastSeen > 1000)
-            it = smoothedBoxes.erase(it);
-        else
-            ++it;
-    }
 
 }
 
@@ -2158,7 +2223,7 @@ static void RenderMenuLegacy(size_t playerCount) {
             ImGui::Checkbox("Corner boxes", &cornerBoxes);
             ImGui::Checkbox("Show teammates", &drawTeammates);
             ImGui::SliderFloat("Box thickness", &boxThickness, 0.5f, 4.0f, "%.1f");
-            ImGui::SliderFloat("Corner length", &cornerBoxLength, 0.10f, 0.50f, "%.2f");
+            ImGui::SliderFloat("Corner length", &cornerBoxLength, 0.10f, 0.35f, "%.2f");
             if (ImGui::TreeNode("ESP colors")) {
                 ImGui::ColorEdit4("Enemy box", enemyBoxColor, ImGuiColorEditFlags_NoInputs);
                 ImGui::ColorEdit4("Teammate box", teammateBoxColor, ImGuiColorEditFlags_NoInputs);
@@ -2417,7 +2482,7 @@ static void RenderMenuV1(size_t playerCount) {
         Toggle("Glow", &glowEnabled);
         Toggle("FOV circle", &drawFovCircle);
         ImGui::SliderFloat("Box thickness", &boxThickness, 0.5f, 4.0f, "%.1f");
-        ImGui::SliderFloat("Corner length", &cornerBoxLength, 0.10f, 0.50f, "%.2f");
+        ImGui::SliderFloat("Corner length", &cornerBoxLength, 0.10f, 0.35f, "%.2f");
         ImGui::ColorEdit4("Enemy box color", enemyBoxColor, ImGuiColorEditFlags_NoInputs);
         ImGui::ColorEdit4("Teammate box color", teammateBoxColor, ImGuiColorEditFlags_NoInputs);
         EndCard();
@@ -2795,7 +2860,7 @@ static void RenderMenuV2(size_t playerCount) {
             Toggle("Model glow", nullptr, &glowEnabled);
             Toggle("FOV circle", nullptr, &drawFovCircle);
             Slider("Box thickness", &boxThickness, 0.5f, 4.0f, "%.1f px");
-            Slider("Corner length", &cornerBoxLength, 0.10f, 0.50f, "%.2f");
+            Slider("Corner length", &cornerBoxLength, 0.10f, 0.35f, "%.2f");
             ImGui::TextColored(secondary, "Colors");
             ImGui::ColorEdit4("Enemy##menu_v2", enemyBoxColor,
                               ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaPreviewHalf);
@@ -3318,7 +3383,7 @@ void RenderMenu(size_t playerCount) {
             Toggle("Bounding boxes", &drawBoxes, visualTeam == 0 ? enemyBoxColor : teammateBoxColor);
             Slider("Box thickness", &boxThickness, 0.5f, 4.0f, "%.2f px");
             Toggle("Corner boxes", &cornerBoxes, enemyHealthColor);
-            Slider("Corner length", &cornerBoxLength, 0.10f, 0.50f, "%.2f");
+            Slider("Corner length", &cornerBoxLength, 0.10f, 0.35f, "%.2f");
             Toggle("Health bar", &drawHealth, enemyHealthColor);
             Toggle("Health value", &drawHealthValues, teammateHealthColor);
             Toggle("Skeleton", &drawBones, enemyNameColor);

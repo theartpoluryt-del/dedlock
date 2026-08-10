@@ -1,5 +1,7 @@
 #include "shared.h"
 #include "menu_d2d.h"
+#include "preview_3d.h"
+#include "panorama_preview.h"
 #include "resource.h"
 
 #include <d2d1.h>
@@ -7,10 +9,13 @@
 #include <wincodec.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstring>
 #include <cwchar>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
@@ -21,6 +26,8 @@ namespace {
 
 constexpr float kDesignWidth = 1448.0f;
 constexpr float kDesignHeight = 840.0f;
+constexpr float kMainWindowWidth = 996.0f;
+constexpr float kContentPanelBottom = 840.0f;
 
 struct Renderer {
     ComPtr<ID2D1Factory> factory;
@@ -29,10 +36,29 @@ struct Renderer {
     ComPtr<IDXGISurface> surface;
     ComPtr<ID2D1RenderTarget> target;
     ComPtr<ID2D1Bitmap> logoBitmap;
+    ComPtr<ID2D1Bitmap> previewHeroBitmap;
+    ComPtr<ID2D1Bitmap> preview3dBitmap;
+    ComPtr<ID3D11Texture2D> preview3dTexture;
+    ComPtr<ID3D11Texture2D> previewReadbackTexture;
+    DXGI_FORMAT previewReadbackFormat = DXGI_FORMAT_UNKNOWN;
+    UINT previewReadbackWidth = 0;
+    UINT previewReadbackHeight = 0;
+    Preview3DFrame preview3dFrame{};
+    std::vector<uint8_t> preview3dPixels;
+    bool preview3dShared = false;
+    bool preview3dActive = false;
     ComPtr<ID2D1Bitmap> tabIcons[4];
     ComPtr<ID2D1Bitmap> sceneBitmap;
     ComPtr<ID2D1BitmapRenderTarget> blurTarget;
     ComPtr<ID2D1Bitmap> blurBitmap;
+    ComPtr<IDXGISwapChain> swapChain;
+    ComPtr<ID3D11DeviceContext> deviceContext;
+    ComPtr<ID3D11Texture2D> sceneReadbackTexture;
+    DXGI_FORMAT sceneReadbackFormat = DXGI_FORMAT_UNKNOWN;
+    UINT sceneReadbackWidth = 0;
+    UINT sceneReadbackHeight = 0;
+    std::vector<uint8_t> scenePixels;
+    std::vector<uint8_t> sceneBlurPixels;
     ComPtr<ID2D1Layer> menuLayer;
     D2D1_SIZE_U blurSourceSize{};
     ComPtr<IWICBitmap> softwareBitmap;
@@ -63,6 +89,7 @@ struct Renderer {
     bool positionInitialized = false;
     bool draggingWindow = false;
     bool wasOpen = false;
+    bool settingsOpen = false;
     float* colorPopup = nullptr;
     D2D1_RECT_F colorPopupAnchor{};
     D2D1_RECT_F comboPopupRect{};
@@ -88,9 +115,9 @@ struct Layout {
 
 struct Popup {
     int id = 0;
-    int* value = nullptr;
-    const wchar_t* const* items = nullptr;
+    const wchar_t* items[8]{};
     int count = 0;
+    int selected = 0;
     D2D1_RECT_F rect{};
 };
 
@@ -104,10 +131,45 @@ D2D1_COLOR_F Color(float r, float gg, float b, float a = 1.0f) {
     return D2D1::ColorF(r, gg, b, a);
 }
 
-D2D1_COLOR_F White(float a = 1.0f) { return Color(0.94f, 0.945f, 0.965f, a); }
-D2D1_COLOR_F Muted(float a = 1.0f) { return Color(0.58f, 0.59f, 0.66f, a); }
-D2D1_COLOR_F Red(float a = 1.0f) { return Color(0.94f, 0.025f, 0.12f, a); }
-D2D1_COLOR_F Border(float a = 1.0f) { return Color(0.145f, 0.16f, 0.205f, a); }
+D2D1_COLOR_F White(float a = 1.0f) { return Color(0.88f, 0.89f, 0.92f, a); }
+D2D1_COLOR_F Muted(float a = 1.0f) { return Color(0.47f, 0.49f, 0.54f, a); }
+D2D1_COLOR_F Red(float a = 1.0f) {
+    return Color(menuAccentColor[0], menuAccentColor[1], menuAccentColor[2], a);
+}
+D2D1_COLOR_F ThemeSurface(float base, float tint, float a = 1.0f) {
+    return Color(base + menuAccentColor[0] * tint,
+                 base + menuAccentColor[1] * tint,
+                 base + menuAccentColor[2] * tint, a);
+}
+D2D1_COLOR_F Border(float a = 1.0f) { return ThemeSurface(0.075f, 0.105f, a); }
+
+void HSVtoRGB(float h, float s, float v, float& r, float& g, float& b) {
+    h = h - std::floor(h);
+    const float c = v * s;
+    const float x = c * (1.0f - std::fabs(std::fmod(h * 6.0f, 2.0f) - 1.0f));
+    const float m = v - c;
+    if (h < 1.0f / 6.0f) { r = c; g = x; b = 0.0f; }
+    else if (h < 2.0f / 6.0f) { r = x; g = c; b = 0.0f; }
+    else if (h < 3.0f / 6.0f) { r = 0.0f; g = c; b = x; }
+    else if (h < 4.0f / 6.0f) { r = 0.0f; g = x; b = c; }
+    else if (h < 5.0f / 6.0f) { r = x; g = 0.0f; b = c; }
+    else { r = c; g = 0.0f; b = x; }
+    r += m; g += m; b += m;
+}
+
+void RGBtoHSV(float r, float g, float b, float& h, float& s, float& v) {
+    const float maximum = (std::max)(r, (std::max)(g, b));
+    const float minimum = (std::min)(r, (std::min)(g, b));
+    const float delta = maximum - minimum;
+    v = maximum;
+    s = maximum <= 0.0001f ? 0.0f : delta / maximum;
+    if (delta <= 0.0001f) { h = 0.0f; return; }
+    if (maximum == r) h = std::fmod((g - b) / delta, 6.0f);
+    else if (maximum == g) h = (b - r) / delta + 2.0f;
+    else h = (r - g) / delta + 4.0f;
+    h /= 6.0f;
+    if (h < 0.0f) h += 1.0f;
+}
 
 D2D1_RECT_F Rect(float left, float top, float right, float bottom) {
     return D2D1::RectF(left, top, right, bottom);
@@ -118,7 +180,7 @@ bool Contains(const D2D1_RECT_F& r, const D2D1_POINT_2F& p) {
 }
 
 float ColumnScroll(float x) {
-    return x < 870.0f ? g.leftColumnScroll : g.rightColumnScroll;
+    return x < 655.0f ? g.leftColumnScroll : g.rightColumnScroll;
 }
 
 float ScrolledY(float x, float y) {
@@ -126,12 +188,12 @@ float ScrolledY(float x, float y) {
 }
 
 void NoteContent(float x, float bottom) {
-    float& contentBottom = x < 870.0f ? g.leftContentBottom : g.rightContentBottom;
+    float& contentBottom = x < 655.0f ? g.leftContentBottom : g.rightContentBottom;
     contentBottom = (std::max)(contentBottom, bottom);
 }
 
 float ColumnMaxScroll(float contentBottom) {
-    return (std::max)(0.0f, contentBottom - 818.0f + 8.0f);
+    return (std::max)(0.0f, contentBottom - kContentPanelBottom);
 }
 
 float ColumnViewportTop() {
@@ -139,7 +201,7 @@ float ColumnViewportTop() {
 }
 
 bool ColumnVisible(float x, float y, float height) {
-    return y + height >= ColumnViewportTop() && y <= 818.0f;
+    return y + height >= ColumnViewportTop() && y <= kContentPanelBottom;
 }
 
 D2D1_RECT_F ActiveColorPopupRect() {
@@ -356,49 +418,32 @@ void DrawToggle(const Layout& l, float x, float y, float width,
     const float baseY = y;
     NoteContent(x, baseY + 66.0f);
     y = ScrolledY(x, y);
-    const D2D1_RECT_F hit = Rect(x, y, x + width, y + 66);
+    const D2D1_RECT_F hit = Rect(x, y, x + width, y + 44);
     const D2D1_RECT_F colorRect = colorValue
-        ? Rect(x + width - 22, y + 13, x + width, y + 37)
+        ? Rect(x + width - 22, y + 10, x + width, y + 32)
         : Rect(0, 0, 0, 0);
     const bool clickedColor = colorValue && Clicked(l, colorRect);
     if (ColumnVisible(x, y, 66.0f) && Clicked(l, hit) && !clickedColor)
         *value = !*value;
     if (!g.colorPopup && Contains(hit, l.mouse)) {
-        FillRounded(Rect(x + 4, y + 3, x + width - 4, y + 62), 5,
-                    Color(0.26f, 0.30f, 0.38f, 0.075f));
-        StrokeRounded(Rect(x + 4, y + 3, x + width - 4, y + 62), 5,
-                      Color(0.42f, 0.48f, 0.60f, 0.16f), 0.8f);
+        FillRounded(Rect(x + 3, y + 2, x + width - 3, y + 42), 3,
+                    Color(1, 1, 1, 0.025f));
     }
     const float targetAnimation = *value ? 1.0f : 0.0f;
     auto [toggleIt, inserted] = g.toggleAnimation.emplace(value, targetAnimation);
     float& animation = toggleIt->second;
     animation += ((*value ? 1.0f : 0.0f) - animation) * 0.18f;
 
-    Text(label, Rect(x, y + 5, x + width - 110, y + 30), g.medium.Get(), White());
-    if (description)
-        Text(description, Rect(x, y + 29, x + width - 110, y + 54),
-             g.regular.Get(), Muted());
+    Text(label, Rect(x + 10, y + 8, x + width - 110, y + 34), g.regular.Get(), White());
 
     const float colorOffset = colorValue ? 34.0f : 0.0f;
-    const D2D1_RECT_F track = Rect(x + width - 62 - colorOffset, y + 14,
-                                   x + width - 20 - colorOffset, y + 36);
-    const D2D1_COLOR_F off = Color(0.16f, 0.17f, 0.20f);
-    GradientRounded(track, 11,
-                    Color(off.r + (1.0f - off.r) * animation,
-                          off.g + (0.12f - off.g) * animation,
-                          off.b + (0.19f - off.b) * animation),
-                    Color(off.r + (0.78f - off.r) * animation,
-                          off.g + (0.01f - off.g) * animation,
-                          off.b + (0.08f - off.b) * animation), true);
-    if (animation > 0.05f) {
-        GlowRounded(track, 11, Red(animation * 0.42f), 3, 1.2f);
-        FillRounded(Rect(track.left + 3, track.top + 3, track.right - 3,
-                         track.top + 8), 4,
-                    Color(1.0f, 0.42f, 0.50f, animation * 0.10f));
-    }
-    const float knob = track.left + 11 + animation * 20.0f;
+    const D2D1_RECT_F track = Rect(x + width - 48 - colorOffset, y + 8,
+                                   x + width - 2 - colorOffset, y + 32);
+    const D2D1_COLOR_F off = Color(0.17f, 0.19f, 0.22f);
+    FillRounded(track, 12, animation > 0.02f ? Red(0.90f) : off);
+    const float knob = track.left + 12 + animation * 22.0f;
     SetBrush(White());
-    g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knob, track.top + 11), 8, 8),
+    g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knob, track.top + 12), 10, 10),
                           g.brush.Get());
 
     if (colorValue) {
@@ -413,24 +458,19 @@ void DrawToggle(const Layout& l, float x, float y, float width,
             g.openCombo = 0;
         }
     }
-    Line(D2D1::Point2F(x, y + 65), D2D1::Point2F(x + width, y + 65),
-         Color(0.16f, 0.17f, 0.20f, 0.75f));
 }
 
 void DrawSlider(const Layout& l, float x, float y, float width,
                 const wchar_t* label, float* value, float minimum, float maximum,
                 const wchar_t* format) {
     const float baseY = y;
-    NoteContent(x, baseY + 48.0f);
+    NoteContent(x, baseY + 66.0f);
     y = ScrolledY(x, y);
-    const D2D1_RECT_F row = Rect(x, y, x + width, y + 48);
-    FillRounded(row, 6, Color(0.047f, 0.050f, 0.061f, 0.78f));
-    StrokeRounded(row, 6, Border(0.8f));
-    Text(label, Rect(x + 17, y + 12, x + 150, y + 38), g.regular.Get(), White());
-    const float trackStart = x + 150;
-    const float trackEnd = x + width - 108;
-    const D2D1_RECT_F sliderHit = Rect(trackStart - 8, y, trackEnd + 8, y + 48);
-    if (ColumnVisible(x, y, 48.0f) && l.clicked && Contains(sliderHit, l.mouse))
+    Text(label, Rect(x + 10, y + 2, x + width - 82, y + 27), g.regular.Get(), White());
+    const float trackStart = x + 2;
+    const float trackEnd = x + width - 2;
+    const D2D1_RECT_F sliderHit = Rect(trackStart - 4, y + 31, trackEnd + 4, y + 64);
+    if (ColumnVisible(x, y, 66.0f) && l.clicked && Contains(sliderHit, l.mouse))
         g.activeSlider = value;
     if (!l.down && g.activeSlider == value) g.activeSlider = nullptr;
     if (l.down && g.activeSlider == value) {
@@ -441,32 +481,35 @@ void DrawSlider(const Layout& l, float x, float y, float width,
     auto [sliderIt, inserted] = g.sliderAnimation.emplace(value, fraction);
     float& animated = sliderIt->second;
     animated += (fraction - animated) * 0.20f;
-    FillRounded(Rect(trackStart, y + 22, trackEnd, y + 26), 2, Color(0.17f, 0.18f, 0.22f));
-    FillRounded(Rect(trackStart, y + 22, trackStart + (trackEnd - trackStart) * animated, y + 26),
-                2, Red());
+    FillRounded(Rect(trackStart, y + 46, trackEnd, y + 48), 1, Color(0.16f, 0.17f, 0.20f));
+    FillRounded(Rect(trackStart, y + 46, trackStart + (trackEnd - trackStart) * animated, y + 48),
+                1, Red());
     const float knob = trackStart + (trackEnd - trackStart) * animated;
-    SetBrush(Color(0.035f, 0.037f, 0.045f));
-    g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knob, y + 24), 8, 8), g.brush.Get());
     SetBrush(Red());
-    g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(knob, y + 24), 8, 8), g.brush.Get(), 1.8f);
-    SetBrush(White());
-    g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knob, y + 24), 3, 3), g.brush.Get());
+    g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knob, y + 47), 8, 8), g.brush.Get());
 
     wchar_t output[48]{};
     std::swprintf(output, 48, format, *value);
-    const D2D1_RECT_F valueRect = Rect(x + width - 92, y, x + width, y + 48);
-    StrokeRounded(valueRect, 6, Border());
+    const D2D1_RECT_F valueRect = Rect(x + width - 74, y, x + width, y + 27);
     Text(output, valueRect, g.centered.Get(), Muted());
 }
 
 void DrawCombo(const Layout& l, int id, float x, float y, float width,
                const wchar_t* label, int* value,
                const wchar_t* const* items, int count) {
+    if (!value || !items || count <= 0 || count > 8) {
+        if (g.openCombo == id) g.openCombo = 0;
+        return;
+    }
+    *value = std::clamp(*value, 0, count - 1);
     const float baseY = y;
-    NoteContent(x, baseY + 42.0f);
+    const bool compact = width <= 320.0f;
+    NoteContent(x, baseY + (compact ? 64.0f : 42.0f));
     y = ScrolledY(x, y);
-    Text(label, Rect(x, y + 8, x + width - 150, y + 38), g.regular.Get(), White());
-    const D2D1_RECT_F button = Rect(x + width - 150, y, x + width, y + 42);
+    Text(label, Rect(x + 10, y + 2, compact ? x + width : x + width - 150, y + 24),
+         g.regular.Get(), White());
+    const D2D1_RECT_F button = compact ? Rect(x, y + 31, x + width, y + 61)
+                                      : Rect(x + width - 150, y, x + width, y + 42);
     GradientRounded(button, 6, Color(0.075f, 0.078f, 0.094f),
                     Color(0.050f, 0.052f, 0.064f), true);
     StrokeRounded(button, 6, Border());
@@ -476,14 +519,353 @@ void DrawCombo(const Layout& l, int id, float x, float y, float width,
          D2D1::Point2F(button.right - 13, button.top + 23), Muted(), 1.4f);
     Line(D2D1::Point2F(button.right - 13, button.top + 23),
          D2D1::Point2F(button.right - 7, button.top + 17), Muted(), 1.4f);
-    if (ColumnVisible(x, y, 42.0f) && Clicked(l, button))
+    if (ColumnVisible(x, y, compact ? 64.0f : 42.0f) && Clicked(l, button))
         g.openCombo = g.openCombo == id ? 0 : id;
     if (g.openCombo == id) {
-        pendingPopup = {id, value, items, count,
-                        Rect(button.left, button.bottom + 5, button.right,
-                             button.bottom + 5 + count * 38.0f)};
+        pendingPopup = {};
+        pendingPopup.id = id;
+        pendingPopup.count = count;
+        pendingPopup.selected = *value;
+        for (int i = 0; i < count; ++i)
+            pendingPopup.items[i] = items[i];
+        // Keep a visible lower inset after the last item instead of letting
+        // its background touch the popup border.
+        const float popupHeight = count * 38.0f + 3.0f;
+        const float popupTop = button.bottom + 5.0f + popupHeight > kContentPanelBottom
+            ? button.top - 5.0f - popupHeight
+            : button.bottom + 5.0f;
+        pendingPopup.rect = Rect(button.left, popupTop, button.right,
+                                 popupTop + popupHeight);
         g.comboPopupRect = pendingPopup.rect;
     }
+}
+
+void DrawEspChip(const Layout& l, float x, float y, float width,
+                 const wchar_t* label, bool* value,
+                 const float* colorValue = nullptr) {
+    const D2D1_RECT_F hit = Rect(x, y, x + width, y + 42);
+    const D2D1_RECT_F swatch = colorValue
+        ? Rect(x + width - 34, y + 10, x + width - 14, y + 32)
+        : Rect(0, 0, 0, 0);
+    const bool clickedSwatch = colorValue && Clicked(l, swatch);
+    if (Clicked(l, hit) && !clickedSwatch)
+        *value = !*value;
+    const bool hovered = Contains(hit, l.mouse);
+    if (hovered) FillRounded(Rect(x + 2, y + 1, x + width - 2, y + 40), 3,
+                             Color(1, 1, 1, 0.025f));
+    Text(label, Rect(x + 13, y, x + width - 48, y + 42),
+         g.regular.Get(), *value ? White() : Muted());
+    if (colorValue) {
+        FillRounded(swatch, 4,
+                    Color(colorValue[0], colorValue[1], colorValue[2]));
+        StrokeRounded(swatch, 4, Border(), 0.8f);
+        if (clickedSwatch) {
+            g.colorPopup = g.colorPopup == colorValue
+                ? nullptr : const_cast<float*>(colorValue);
+            g.colorPopupAnchor = swatch;
+            g.openCombo = 0;
+        }
+    } else {
+        const D2D1_RECT_F track = Rect(x + width - 40, y + 13, x + width - 10, y + 29);
+        FillRounded(track, 8, *value ? Red(0.84f) : Color(0.17f, 0.19f, 0.22f));
+        SetBrush(White());
+        g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(*value ? track.right - 8 : track.left + 8,
+                                                           track.top + 8), 6, 6), g.brush.Get());
+    }
+}
+
+void DrawNavigationIcon(int variant, float x, float y, bool selected) {
+    const D2D1_COLOR_F c = selected ? White() : Muted();
+    if (variant == 0) { DrawEye(x, y, c); return; }                 // Enemy
+    SetBrush(c);
+    if (variant == 1) {                                             // Ally
+        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x - 5, y - 3), 5, 5), g.brush.Get(), 1.4f);
+        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x + 5, y - 3), 5, 5), g.brush.Get(), 1.4f);
+        Line(D2D1::Point2F(x - 12, y + 10), D2D1::Point2F(x + 12, y + 10), c, 1.6f); return;
+    }
+    if (variant == 2) {                                             // Creep
+        g.target->DrawRectangle(Rect(x - 8, y - 8, x + 8, y + 8), g.brush.Get(), 1.5f);
+        Line(D2D1::Point2F(x - 12, y), D2D1::Point2F(x - 8, y), c, 1.4f);
+        Line(D2D1::Point2F(x + 8, y), D2D1::Point2F(x + 12, y), c, 1.4f); return;
+    }
+    if (variant == 3) {                                             // Player aim
+        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 8, 8), g.brush.Get(), 1.5f);
+        Line(D2D1::Point2F(x - 13, y), D2D1::Point2F(x + 13, y), c, 1.4f);
+        Line(D2D1::Point2F(x, y - 13), D2D1::Point2F(x, y + 13), c, 1.4f); return;
+    }
+    if (variant == 4) {                                             // Creep aim
+        Line(D2D1::Point2F(x - 9, y + 8), D2D1::Point2F(x, y - 9), c, 1.6f);
+        Line(D2D1::Point2F(x, y - 9), D2D1::Point2F(x + 9, y + 8), c, 1.6f);
+        Line(D2D1::Point2F(x - 6, y + 2), D2D1::Point2F(x + 6, y + 2), c, 1.4f); return;
+    }
+    DrawTabIcon(2, x, y, selected);                                 // Misc
+}
+
+void DrawSectionHeading(float x, float y, float width, const wchar_t* title) {
+    Text(title, Rect(x, y, x + width, y + 27), g.semibold.Get(), White());
+    Line(D2D1::Point2F(x, y + 31), D2D1::Point2F(x + width, y + 31), Border(0.92f));
+}
+
+float PreviewTileWidth(const wchar_t* label) {
+    constexpr float kHorizontalPadding = 9.0f;
+    if (!label || !g.writeFactory || !g.regular)
+        return 18.0f;
+
+    ComPtr<IDWriteTextLayout> layout;
+    const UINT32 length = static_cast<UINT32>(std::wcslen(label));
+    if (FAILED(g.writeFactory->CreateTextLayout(label, length, g.regular.Get(),
+                                                512.0f, 36.0f, &layout))) {
+        return 18.0f + length * 8.0f;
+    }
+    DWRITE_TEXT_METRICS metrics{};
+    if (FAILED(layout->GetMetrics(&metrics)))
+        return 18.0f + length * 8.0f;
+    return std::ceil(metrics.widthIncludingTrailingWhitespace) + kHorizontalPadding * 2.0f;
+}
+
+float DrawPreviewTile(const Layout& l, float x, float y,
+                      const wchar_t* label, bool* value) {
+    const float width = PreviewTileWidth(label);
+    const D2D1_RECT_F r = Rect(x, y, x + width, y + 36);
+    if (Clicked(l, r)) *value = !*value;
+    const bool hover = Contains(r, l.mouse);
+    // Off state intentionally mirrors the reference: compact matte-grey tags
+    // with no outline, indicator dot, or coloured glow.
+    FillRounded(r, 4, *value ? Color(Red().r, Red().g, Red().b, 0.22f)
+                             : Color(0.18f, 0.19f, 0.21f, hover ? 1.0f : 0.92f));
+    if (*value) StrokeRounded(r, 4, Red(0.70f), 0.8f);
+    Text(label, Rect(x + 9, y, x + width - 9, y + 36), g.regular.Get(),
+         *value ? White() : Muted());
+    return width;
+}
+
+void DrawHeroEspPreview(float x, float y, float width, float height,
+                        const wchar_t* presetLabel, bool enabled,
+                        bool boxes, bool cornerBoxes,
+                        bool skeleton, bool health, bool healthValue,
+                        bool heroName, bool playerName, bool distance,
+                        bool snaplines, const float* boxColor,
+                        const float* skeletonColor, const float* healthColor,
+                        const float* nameColor, const float* playerColor,
+                        const float* healthValueColor, float previewBoxThickness,
+                        float previewCornerLength, const Layout& l,
+                        bool* enabledToggle, bool* boxesToggle, bool* cornerToggle,
+                        bool* skeletonToggle, bool* healthToggle, bool* healthValueToggle,
+                        bool* heroNameToggle, bool* playerNameToggle, bool* distanceToggle,
+                        bool* snaplineToggle, bool* glowToggle) {
+    GlowRounded(Rect(x, y, x + width, y + height), 16,
+                Color(0, 0, 0, 0.65f), 5, 2.0f);
+    FillRounded(Rect(x, y, x + width, y + height), 8,
+                Color(0.0f, 0.0f, 0.0f, 1.0f));
+    StrokeRounded(Rect(x, y, x + width, y + height), 16,
+                  Color(0.24f, 0.27f, 0.34f, 0.92f), 1.1f);
+    Text(L"ESP Preview", Rect(x + 16, y + 10, x + width - 16, y + 42),
+         g.semibold.Get(), White());
+    Text(enabled ? presetLabel : L"ESP disabled",
+         Rect(x + 16, y + 40, x + width - 16, y + 65),
+         g.regular.Get(), enabled ? Muted() : Red());
+
+    // The tag flow occupies three 36px rows. Anchor it to the panel bottom
+    // and donate the reclaimed space to the model preview above it.
+    constexpr float kTileHeight = 36.0f;
+    constexpr float kTileRows = 3.0f;
+    constexpr float kTileGapY = 8.0f;
+    constexpr float kPreviewBottomPadding = 16.0f;
+    const float tileY = y + height -
+        (kTileRows * kTileHeight + (kTileRows - 1.0f) * kTileGapY + kPreviewBottomPadding);
+    const D2D1_RECT_F captureRect = Rect(
+        x + 15, y + 74, x + width - 15, tileY - 16.0f);
+    const D2D1_RECT_F stage = captureRect;
+    // Single, uninterrupted preview surface — no nested grey viewport.
+    FillRect(stage, Color(0.0f, 0.0f, 0.0f, 1.0f));
+    // Compact left-aligned tag flow: exactly the visual rhythm of the
+    // supplied preview rather than a two-column settings grid.
+    constexpr float kTileGapX = 8.0f;
+    const float tileLeft = x + 16.0f;
+    const float tileRight = x + width - 16.0f;
+    float tileCursorX = tileLeft;
+    float tileCursorY = tileY;
+    const auto drawFlowTile = [&](const wchar_t* label, bool* value) {
+        const float tileWidth = PreviewTileWidth(label);
+        // Wrap only when the next measured tile does not fit. This avoids
+        // the large unused right edge caused by the old hand-made rows.
+        if (tileCursorX > tileLeft && tileCursorX + tileWidth > tileRight) {
+            tileCursorX = tileLeft;
+            tileCursorY += 36.0f + kTileGapY;
+        }
+        DrawPreviewTile(l, tileCursorX, tileCursorY, label, value);
+        tileCursorX += tileWidth + kTileGapX;
+    };
+    drawFlowTile(L"Skeleton", skeletonToggle);
+    drawFlowTile(L"Box", boxesToggle);
+    drawFlowTile(L"Distance", distanceToggle);
+    drawFlowTile(L"Hero name", heroNameToggle);
+    drawFlowTile(L"Player name", playerNameToggle);
+    drawFlowTile(L"Corner box", cornerToggle);
+    drawFlowTile(L"Health", healthToggle);
+    drawFlowTile(L"Health bar", healthValueToggle);
+    drawFlowTile(L"Model glow", glowToggle);
+    drawFlowTile(L"Snapline", snaplineToggle);
+    // Keep the character aspect ratio from the source sheet. The previous
+    // crop used coordinates for a 2048px image, while the embedded reference
+    // is 2515px wide; that selected half of two poses and pushed the hero out
+    // of the preview window.
+    // Reserve visible padding for labels above the head, distance below the
+    // feet, and the box/health bar on both sides. The preview itself is scaled
+    // down with the menu, so small design-space margins were disappearing at
+    // common 1080p resolutions.
+    const float previewCenterX = x + width * 0.5f;
+    D2D1_RECT_F modelRect{};
+    const D2D1_RECT_F renderRect = captureRect;
+    if (g.preview3dActive && g.preview3dBitmap) {
+        // The capture texture is created in physical backbuffer pixels. Draw
+        // it in the same coordinate space so the D2D menu scale does not add
+        // a second blur-producing resample.
+        D2D1_MATRIX_3X2_F menuTransform{};
+        g.target->GetTransform(&menuTransform);
+        const D2D1_RECT_F physicalRect = Rect(
+            std::floor(renderRect.left * menuTransform._11 + menuTransform._31),
+            std::floor(renderRect.top * menuTransform._22 + menuTransform._32),
+            std::floor(renderRect.right * menuTransform._11 + menuTransform._31),
+            std::floor(renderRect.bottom * menuTransform._22 + menuTransform._32));
+        // Preserve the 3D target's aspect ratio while filling the preview.
+        // A tiny centred crop is preferable to stretching the hero vertically.
+        const D2D1_SIZE_F sourceSize = g.preview3dBitmap->GetSize();
+        const float destinationAspect = (physicalRect.right - physicalRect.left) /
+                                        (physicalRect.bottom - physicalRect.top);
+        const float sourceAspect = sourceSize.width / sourceSize.height;
+        D2D1_RECT_F sourceRect = Rect(0.0f, 0.0f, sourceSize.width, sourceSize.height);
+        if (destinationAspect < sourceAspect) {
+            const float croppedWidth = sourceSize.height * destinationAspect;
+            sourceRect.left = (sourceSize.width - croppedWidth) * 0.5f;
+            sourceRect.right = sourceRect.left + croppedWidth;
+        } else if (destinationAspect > sourceAspect) {
+            const float croppedHeight = sourceSize.width / destinationAspect;
+            sourceRect.top = (sourceSize.height - croppedHeight) * 0.5f;
+            sourceRect.bottom = sourceRect.top + croppedHeight;
+        }
+        g.target->SetTransform(D2D1::Matrix3x2F::Identity());
+        g.target->DrawBitmap(g.preview3dBitmap.Get(), physicalRect, 1.0f,
+                             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, sourceRect);
+        g.target->SetTransform(menuTransform);
+        const float renderWidth = renderRect.right - renderRect.left;
+        const float renderHeight = renderRect.bottom - renderRect.top;
+        modelRect = Rect(
+            renderRect.left + g.preview3dFrame.left * renderWidth,
+            renderRect.top + g.preview3dFrame.top * renderHeight,
+            renderRect.left + g.preview3dFrame.right * renderWidth,
+            renderRect.top + g.preview3dFrame.bottom * renderHeight);
+    } else {
+        const float modelTop = renderRect.top;
+        const float modelBottom = renderRect.bottom;
+        const float modelHeight = modelBottom - modelTop;
+        constexpr float sourceAspect = 515.0f / 1140.0f;
+        const float modelHalfWidth = modelHeight * sourceAspect * 0.5f;
+        modelRect = Rect(previewCenterX - modelHalfWidth, modelTop,
+                         previewCenterX + modelHalfWidth, modelBottom);
+    }
+    if (!g.preview3dActive) {
+        Text(L"Panorama preview unavailable",
+             Rect(stage.left + 12, stage.top, stage.right - 12, stage.bottom),
+             g.centered.Get(), Red(0.82f));
+        return;
+    }
+    if (!enabled) return;
+
+    const float left = (std::max)(stage.left + 2.0f, modelRect.left - 3.0f);
+    const float right = (std::min)(stage.right - 2.0f, modelRect.right + 3.0f);
+    const float top = (std::max)(stage.top + 2.0f, modelRect.top - 9.0f);
+    const float bottom = (std::min)(stage.bottom - 2.0f, modelRect.bottom + 5.0f);
+    const float cx = (left + right) * 0.5f;
+    const D2D1_COLOR_F box = Color(boxColor[0], boxColor[1], boxColor[2]);
+    const D2D1_COLOR_F bones = Color(skeletonColor[0], skeletonColor[1], skeletonColor[2]);
+    const D2D1_COLOR_F hp = Color(healthColor[0], healthColor[1], healthColor[2]);
+    if (boxes) {
+        const float lineThickness = std::clamp(previewBoxThickness, 0.5f, 4.0f);
+        if (cornerBoxes) {
+            // Match the in-game player ESP exactly: the slider is a fraction
+            // of the smaller box dimension, with no preview-only pixel clamp.
+            const float c = std::clamp(previewCornerLength, 0.05f, 0.35f) *
+                            (std::min)(right - left, bottom - top);
+            Line(D2D1::Point2F(left, top), D2D1::Point2F(left + c, top), box, lineThickness);
+            Line(D2D1::Point2F(left, top), D2D1::Point2F(left, top + c), box, lineThickness);
+            Line(D2D1::Point2F(right - c, top), D2D1::Point2F(right, top), box, lineThickness);
+            Line(D2D1::Point2F(right, top), D2D1::Point2F(right, top + c), box, lineThickness);
+            Line(D2D1::Point2F(left, bottom - c), D2D1::Point2F(left, bottom), box, lineThickness);
+            Line(D2D1::Point2F(left, bottom), D2D1::Point2F(left + c, bottom), box, lineThickness);
+            Line(D2D1::Point2F(right - c, bottom), D2D1::Point2F(right, bottom), box, lineThickness);
+            Line(D2D1::Point2F(right, bottom - c), D2D1::Point2F(right, bottom), box, lineThickness);
+        } else {
+            SetBrush(box);
+            g.target->DrawRectangle(Rect(left, top, right, bottom), g.brush.Get(),
+                                    lineThickness);
+        }
+    }
+    if (health) {
+        FillRounded(Rect(left - 10, top, left - 5, bottom), 2, Color(0.10f, 0.11f, 0.14f));
+        FillRounded(Rect(left - 10, top + 54, left - 5, bottom), 2, hp);
+    }
+    if (skeleton && g.preview3dActive) {
+        const float renderWidth = renderRect.right - renderRect.left;
+        const float renderHeight = renderRect.bottom - renderRect.top;
+        std::array<D2D1_POINT_2F, 18> points{};
+        for (size_t i = 0; i < points.size(); ++i) {
+            points[i] = D2D1::Point2F(
+                renderRect.left + g.preview3dFrame.skeleton[i].x * renderWidth,
+                renderRect.top + g.preview3dFrame.skeleton[i].y * renderHeight);
+        }
+        static constexpr int segments[][2]{
+            {0, 1}, {1, 2}, {2, 11},
+            {2, 3}, {3, 4}, {4, 5}, {5, 6},
+            {2, 7}, {7, 8}, {8, 9}, {9, 10},
+            {11, 12}, {12, 13}, {13, 14},
+            {11, 15}, {15, 16}, {16, 17},
+        };
+        for (const auto& segment : segments) {
+            if (g.preview3dFrame.skeleton[segment[0]].visible &&
+                g.preview3dFrame.skeleton[segment[1]].visible) {
+                Line(points[segment[0]], points[segment[1]], bones, 1.4f);
+            }
+        }
+    } else if (skeleton) {
+        const float bodyHeight = bottom - top;
+        const float head = top + bodyHeight * 0.055f;
+        const float neck = top + bodyHeight * 0.12f;
+        const float shoulders = top + bodyHeight * 0.21f;
+        const float hips = top + bodyHeight * 0.52f;
+        const float knees = top + bodyHeight * 0.76f;
+        Line(D2D1::Point2F(cx, head + 13), D2D1::Point2F(cx, neck), bones, 1.4f);
+        Line(D2D1::Point2F(cx, neck), D2D1::Point2F(cx, hips), bones, 1.4f);
+        Line(D2D1::Point2F(cx, shoulders),
+             D2D1::Point2F(left + 10, top + bodyHeight * 0.42f), bones, 1.4f);
+        Line(D2D1::Point2F(cx, shoulders),
+             D2D1::Point2F(right - 10, top + bodyHeight * 0.42f), bones, 1.4f);
+        const float legSpread = (right - left) * 0.23f;
+        Line(D2D1::Point2F(cx, hips), D2D1::Point2F(cx - legSpread, knees), bones, 1.4f);
+        Line(D2D1::Point2F(cx - legSpread, knees),
+             D2D1::Point2F(cx - legSpread, bottom), bones, 1.4f);
+        Line(D2D1::Point2F(cx, hips), D2D1::Point2F(cx + legSpread, knees), bones, 1.4f);
+        Line(D2D1::Point2F(cx + legSpread, knees),
+             D2D1::Point2F(cx + legSpread, bottom), bones, 1.4f);
+    }
+    float labelY = y + 86.0f;
+    if (heroName) {
+        Text(L"Infernus", Rect(left - 20, labelY, right + 20, labelY + 24),
+             g.centered.Get(), Color(nameColor[0], nameColor[1], nameColor[2]));
+        labelY += 23.0f;
+    }
+    if (playerName)
+        Text(L"Player", Rect(left - 20, labelY, right + 20, labelY + 24),
+             g.centered.Get(), Color(playerColor[0], playerColor[1], playerColor[2]));
+    if (healthValue)
+        Text(L"658 / 830", Rect(cx - 55, y + 134, cx + 55, y + 157),
+             g.centered.Get(), Color(healthValueColor[0], healthValueColor[1], healthValueColor[2]));
+    if (distance)
+        Text(L"12m", Rect(cx - 35, bottom + 2, cx + 35, bottom + 26),
+             g.centered.Get(), Muted());
+    if (snaplines)
+        Line(D2D1::Point2F(x + width * 0.5f, stage.bottom - 8),
+             D2D1::Point2F(cx, bottom), Color(1, 1, 1, 0.70f), 1.0f);
 }
 
 void DrawKeyBind(const Layout& l, float x, float y, float width,
@@ -502,6 +884,13 @@ void DrawKeyBind(const Layout& l, float x, float y, float width,
 
 void DrawPopup(const Layout& l) {
     if (pendingPopup.id && g.openCombo == pendingPopup.id) {
+        if (pendingPopup.count <= 0 || pendingPopup.count > 8) {
+            g.openCombo = 0;
+            pendingPopup = {};
+            return;
+        }
+        pendingPopup.selected = std::clamp(pendingPopup.selected, 0,
+                                            pendingPopup.count - 1);
         const D2D1_RECT_F r = pendingPopup.rect;
         GlowRounded(r, 7, Color(0, 0, 0, 0.55f), 4, 2.0f);
         FillRounded(r, 7, Color(0.045f, 0.047f, 0.058f, 0.995f));
@@ -509,14 +898,14 @@ void DrawPopup(const Layout& l) {
         for (int i = 0; i < pendingPopup.count; ++i) {
             const D2D1_RECT_F item = Rect(r.left + 4, r.top + 4 + i * 38.0f,
                                          r.right - 4, r.top + 4 + (i + 1) * 38.0f - 4);
-            if (i == *pendingPopup.value)
+            if (i == pendingPopup.selected)
                 FillRounded(item, 5, Color(0.94f, 0.025f, 0.12f, 0.16f));
             else if (Contains(item, l.mouse))
                 FillRounded(item, 5, Color(1, 1, 1, 0.04f));
-            Text(pendingPopup.items[i], Rect(item.left + 10, item.top, item.right, item.bottom),
-                 g.regular.Get(), i == *pendingPopup.value ? Red() : White());
+            const wchar_t* itemLabel = pendingPopup.items[i] ? pendingPopup.items[i] : L"";
+            Text(itemLabel, Rect(item.left + 10, item.top, item.right, item.bottom),
+                 g.regular.Get(), i == pendingPopup.selected ? Red() : White());
         if (l.clicked && Contains(item, l.mouse)) {
-            *pendingPopup.value = i;
             popupSelectionId = pendingPopup.id;
             popupSelectionValue = i;
             g.openCombo = 0;
@@ -552,7 +941,7 @@ void DrawPopup(const Layout& l) {
 
 void DrawColumnScrollbar(const Layout& l, float x, float viewportTop,
                          float contentBottom, float& scroll) {
-    const float viewportBottom = 818.0f;
+    const float viewportBottom = kContentPanelBottom;
     const float viewportHeight = viewportBottom - viewportTop;
     const float maxScroll = ColumnMaxScroll(contentBottom);
     if (maxScroll <= 0.0f) {
@@ -572,10 +961,10 @@ void DrawColumnScrollbar(const Layout& l, float x, float viewportTop,
                              ? Color(0.82f, 0.10f, 0.18f, 0.90f)
                              : Color(0.50f, 0.52f, 0.58f, 0.75f));
     if (l.clicked && Contains(thumb, l.mouse)) {
-        g.activeScrollColumn = x < 870.0f ? 1 : 2;
+        g.activeScrollColumn = x < 655.0f ? 1 : 2;
         g.scrollGrabOffset = l.mouse.y - thumbTop;
     }
-    if (g.activeScrollColumn == (x < 870.0f ? 1 : 2) && l.down) {
+    if (g.activeScrollColumn == (x < 655.0f ? 1 : 2) && l.down) {
         const float newTop = std::clamp(l.mouse.y - g.scrollGrabOffset,
                                         trackTop, trackBottom - thumbHeight);
         scroll = -((newTop - trackTop) / travel) * maxScroll;
@@ -670,10 +1059,115 @@ void LoadEmbeddedAssets() {
         LoadEmbeddedBitmap(iconIds[i], g.tabIcons[i]);
 }
 
-bool PrepareBackgroundBlur(UINT width, UINT height) {
+bool BindPreview3DFrame(const Preview3DFrame& frame,
+                        ID3D11DeviceContext* context) {
+    if (!frame.texture || !g.target || !context) return false;
+    const auto readFramePixels = [&](std::vector<uint8_t>& pixels,
+                                     uint32_t& width, uint32_t& height,
+                                     uint32_t& stride) -> bool {
+        D3D11_TEXTURE2D_DESC sourceDescription{};
+        frame.texture->GetDesc(&sourceDescription);
+        const bool bgra = sourceDescription.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                          sourceDescription.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        const bool rgba = sourceDescription.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                          sourceDescription.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        if ((!bgra && !rgba) || sourceDescription.SampleDesc.Count != 1)
+            return false;
+        if (!g.previewReadbackTexture ||
+            g.previewReadbackWidth != sourceDescription.Width ||
+            g.previewReadbackHeight != sourceDescription.Height ||
+            g.previewReadbackFormat != sourceDescription.Format) {
+            g.previewReadbackTexture.Reset();
+            ComPtr<ID3D11Device> sourceDevice;
+            frame.texture->GetDevice(sourceDevice.GetAddressOf());
+            if (!sourceDevice) return false;
+            D3D11_TEXTURE2D_DESC staging = sourceDescription;
+            staging.Usage = D3D11_USAGE_STAGING;
+            staging.BindFlags = 0;
+            staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            staging.MiscFlags = 0;
+            if (FAILED(sourceDevice->CreateTexture2D(
+                    &staging, nullptr, g.previewReadbackTexture.GetAddressOf())))
+                return false;
+            g.previewReadbackWidth = sourceDescription.Width;
+            g.previewReadbackHeight = sourceDescription.Height;
+            g.previewReadbackFormat = sourceDescription.Format;
+        }
+        context->CopyResource(g.previewReadbackTexture.Get(), frame.texture);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(context->Map(g.previewReadbackTexture.Get(), 0,
+                                D3D11_MAP_READ, 0, &mapped))) return false;
+        width = sourceDescription.Width;
+        height = sourceDescription.Height;
+        stride = width * 4;
+        pixels.resize(static_cast<size_t>(stride) * height);
+        for (uint32_t row = 0; row < height; ++row) {
+            const auto* source = static_cast<const uint8_t*>(mapped.pData) +
+                static_cast<size_t>(row) * mapped.RowPitch;
+            auto* destination = pixels.data() + static_cast<size_t>(row) * stride;
+            if (bgra) {
+                std::memcpy(destination, source, stride);
+            } else {
+                for (uint32_t column = 0; column < width; ++column) {
+                    destination[column * 4 + 0] = source[column * 4 + 2];
+                    destination[column * 4 + 1] = source[column * 4 + 1];
+                    destination[column * 4 + 2] = source[column * 4 + 0];
+                    destination[column * 4 + 3] = source[column * 4 + 3];
+                }
+            }
+        }
+        context->Unmap(g.previewReadbackTexture.Get(), 0);
+        return true;
+    };
+    if (g.preview3dTexture.Get() != frame.texture || !g.preview3dBitmap) {
+        g.preview3dBitmap.Reset();
+        g.preview3dTexture.Reset();
+        g.preview3dShared = false;
+        ComPtr<IDXGISurface> surface;
+        const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                              D2D1_ALPHA_MODE_IGNORE),
+            96.0f, 96.0f);
+        // WIC software targets cannot share a DXGI surface. Use the staging
+        // texture readback below for those targets.
+        if (!g.softwareTarget &&
+            SUCCEEDED(frame.texture->QueryInterface(
+                IID_PPV_ARGS(surface.GetAddressOf()))) &&
+            SUCCEEDED(g.target->CreateSharedBitmap(
+                __uuidof(IDXGISurface), surface.Get(), &properties,
+                g.preview3dBitmap.GetAddressOf()))) {
+            g.preview3dShared = true;
+        } else {
+            uint32_t width = 0, height = 0, stride = 0;
+            if (!readFramePixels(g.preview3dPixels, width, height, stride) ||
+                FAILED(g.target->CreateBitmap(
+                    D2D1::SizeU(width, height), g.preview3dPixels.data(),
+                    stride, properties, g.preview3dBitmap.GetAddressOf()))) {
+                g.preview3dBitmap.Reset();
+                return false;
+            }
+        }
+        g.preview3dTexture = frame.texture;
+    } else if (!g.preview3dShared) {
+        uint32_t width = 0, height = 0, stride = 0;
+        if (!readFramePixels(g.preview3dPixels, width, height, stride) ||
+            FAILED(g.preview3dBitmap->CopyFromMemory(
+                nullptr, g.preview3dPixels.data(), stride))) {
+            return false;
+        }
+    }
+    g.preview3dFrame = frame;
+    return true;
+}
+
+bool PrepareBackgroundBlur(UINT width, UINT height, UINT captureX = 0,
+                           UINT captureY = 0, UINT captureWidth = 0,
+                           UINT captureHeight = 0) {
     if (!width || !height || !g.target) return false;
-    if (!g.sceneBitmap || g.blurSourceSize.width != width ||
-        g.blurSourceSize.height != height) {
+    if (!captureWidth) captureWidth = width;
+    if (!captureHeight) captureHeight = height;
+    if (!g.sceneBitmap || g.blurSourceSize.width != captureWidth ||
+        g.blurSourceSize.height != captureHeight) {
         g.sceneBitmap.Reset();
         g.blurBitmap.Reset();
         g.blurTarget.Reset();
@@ -681,13 +1175,15 @@ bool PrepareBackgroundBlur(UINT width, UINT height) {
 
         const D2D1_PIXEL_FORMAT pixelFormat = g.target->GetPixelFormat();
         if (FAILED(g.target->CreateBitmap(
-                D2D1::SizeU(width, height), nullptr, 0,
+                D2D1::SizeU(captureWidth, captureHeight), nullptr, 0,
                 D2D1::BitmapProperties(pixelFormat, 96.0f, 96.0f),
                 g.sceneBitmap.GetAddressOf()))) {
             return false;
         }
-        const UINT blurWidth = (std::max)(1u, width / 4u);
-        const UINT blurHeight = (std::max)(1u, height / 4u);
+        // Render at half resolution: the filter below keeps the same visual
+        // radius, while the enlarged result no longer exposes low-res blocks.
+        const UINT blurWidth = (std::max)(1u, captureWidth / 2u);
+        const UINT blurHeight = (std::max)(1u, captureHeight / 2u);
         if (FAILED(g.target->CreateCompatibleRenderTarget(
                 D2D1::SizeF(static_cast<float>(blurWidth),
                             static_cast<float>(blurHeight)),
@@ -700,27 +1196,184 @@ bool PrepareBackgroundBlur(UINT width, UINT height) {
             g.blurBitmap.Reset();
             return false;
         }
-        g.blurSourceSize = D2D1::SizeU(width, height);
+        g.blurSourceSize = D2D1::SizeU(captureWidth, captureHeight);
     }
 
-    if (FAILED(g.sceneBitmap->CopyFromRenderTarget(nullptr, g.target.Get(), nullptr)))
+    if (g.softwareTarget) {
+        // The WIC target holds only our transparent menu layer.  Read the game
+        // backbuffer instead, before this layer is uploaded, so the blur never
+        // contains labels, icons or a previous menu frame.
+        ComPtr<ID3D11Texture2D> backBuffer;
+        if (!g.swapChain || !g.deviceContext ||
+            FAILED(g.swapChain->GetBuffer(0, IID_PPV_ARGS(backBuffer.GetAddressOf()))))
+            return false;
+        D3D11_TEXTURE2D_DESC source{};
+        backBuffer->GetDesc(&source);
+        const bool bgra = source.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                          source.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        const bool rgba = source.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                          source.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        if ((!bgra && !rgba) || source.SampleDesc.Count != 1 ||
+            captureX + captureWidth > source.Width ||
+            captureY + captureHeight > source.Height)
+            return false;
+        if (!g.sceneReadbackTexture || g.sceneReadbackWidth != captureWidth ||
+            g.sceneReadbackHeight != captureHeight || g.sceneReadbackFormat != source.Format) {
+            g.sceneReadbackTexture.Reset();
+            D3D11_TEXTURE2D_DESC staging = source;
+            staging.Width = captureWidth;
+            staging.Height = captureHeight;
+            staging.Usage = D3D11_USAGE_STAGING;
+            staging.BindFlags = 0;
+            staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            staging.MiscFlags = 0;
+            ComPtr<ID3D11Device> device;
+            backBuffer->GetDevice(device.GetAddressOf());
+            if (!device || FAILED(device->CreateTexture2D(
+                    &staging, nullptr, g.sceneReadbackTexture.GetAddressOf())))
+                return false;
+            g.sceneReadbackWidth = captureWidth;
+            g.sceneReadbackHeight = captureHeight;
+            g.sceneReadbackFormat = source.Format;
+        }
+        const D3D11_BOX captureBox{captureX, captureY, 0,
+                                   captureX + captureWidth,
+                                   captureY + captureHeight, 1};
+        g.deviceContext->CopySubresourceRegion(g.sceneReadbackTexture.Get(), 0,
+                                                0, 0, 0, backBuffer.Get(), 0,
+                                                &captureBox);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(g.deviceContext->Map(g.sceneReadbackTexture.Get(), 0,
+                                        D3D11_MAP_READ, 0, &mapped)))
+            return false;
+        const UINT stride = captureWidth * 4;
+        g.scenePixels.resize(static_cast<size_t>(stride) * captureHeight);
+        for (UINT row = 0; row < captureHeight; ++row) {
+            const uint8_t* input = static_cast<const uint8_t*>(mapped.pData) +
+                                   static_cast<size_t>(row) * mapped.RowPitch;
+            uint8_t* output = g.scenePixels.data() + static_cast<size_t>(row) * stride;
+            if (bgra) {
+                std::memcpy(output, input, stride);
+            } else {
+                for (UINT column = 0; column < captureWidth; ++column) {
+                    output[column * 4 + 0] = input[column * 4 + 2];
+                    output[column * 4 + 1] = input[column * 4 + 1];
+                    output[column * 4 + 2] = input[column * 4 + 0];
+                    output[column * 4 + 3] = input[column * 4 + 3];
+                }
+            }
+        }
+        g.deviceContext->Unmap(g.sceneReadbackTexture.Get(), 0);
+        // Blur the full-resolution backbuffer.  Downscaling a small bitmap and
+        // expanding it again creates the blocks visible through the glass.
+        // A separable box filter keeps the result smooth at native resolution.
+        g.sceneBlurPixels.resize(g.scenePixels.size());
+        constexpr int kBlurRadius = 10;
+        const auto blurHorizontal = [&](const std::vector<uint8_t>& source,
+                                        std::vector<uint8_t>& destination) {
+            for (UINT y = 0; y < captureHeight; ++y) {
+                for (int channel = 0; channel < 4; ++channel) {
+                    int sum = 0;
+                    for (int sample = -kBlurRadius; sample <= kBlurRadius; ++sample) {
+                        const UINT x = static_cast<UINT>(std::clamp(sample, 0,
+                            static_cast<int>(captureWidth) - 1));
+                        sum += source[(static_cast<size_t>(y) * captureWidth + x) * 4 + channel];
+                    }
+                    for (UINT x = 0; x < captureWidth; ++x) {
+                        destination[(static_cast<size_t>(y) * captureWidth + x) * 4 + channel] =
+                            static_cast<uint8_t>(sum / (kBlurRadius * 2 + 1));
+                        const UINT removeX = static_cast<UINT>(std::clamp(
+                            static_cast<int>(x) - kBlurRadius, 0,
+                            static_cast<int>(captureWidth) - 1));
+                        const UINT addX = static_cast<UINT>(std::clamp(
+                            static_cast<int>(x) + kBlurRadius + 1, 0,
+                            static_cast<int>(captureWidth) - 1));
+                        sum -= source[(static_cast<size_t>(y) * captureWidth + removeX) * 4 + channel];
+                        sum += source[(static_cast<size_t>(y) * captureWidth + addX) * 4 + channel];
+                    }
+                }
+            }
+        };
+        const auto blurVertical = [&](const std::vector<uint8_t>& source,
+                                      std::vector<uint8_t>& destination) {
+            for (UINT x = 0; x < captureWidth; ++x) {
+                for (int channel = 0; channel < 4; ++channel) {
+                    int sum = 0;
+                    for (int sample = -kBlurRadius; sample <= kBlurRadius; ++sample) {
+                        const UINT y = static_cast<UINT>(std::clamp(sample, 0,
+                            static_cast<int>(captureHeight) - 1));
+                        sum += source[(static_cast<size_t>(y) * captureWidth + x) * 4 + channel];
+                    }
+                    for (UINT y = 0; y < captureHeight; ++y) {
+                        destination[(static_cast<size_t>(y) * captureWidth + x) * 4 + channel] =
+                            static_cast<uint8_t>(sum / (kBlurRadius * 2 + 1));
+                        const UINT removeY = static_cast<UINT>(std::clamp(
+                            static_cast<int>(y) - kBlurRadius, 0,
+                            static_cast<int>(captureHeight) - 1));
+                        const UINT addY = static_cast<UINT>(std::clamp(
+                            static_cast<int>(y) + kBlurRadius + 1, 0,
+                            static_cast<int>(captureHeight) - 1));
+                        sum -= source[(static_cast<size_t>(removeY) * captureWidth + x) * 4 + channel];
+                        sum += source[(static_cast<size_t>(addY) * captureWidth + x) * 4 + channel];
+                    }
+                }
+            }
+        };
+        blurHorizontal(g.scenePixels, g.sceneBlurPixels);
+        blurVertical(g.sceneBlurPixels, g.scenePixels);
+        if (FAILED(g.sceneBitmap->CopyFromMemory(nullptr, g.scenePixels.data(), stride)))
+            return false;
+        return true;
+    } else if (FAILED(g.sceneBitmap->CopyFromRenderTarget(nullptr, g.target.Get(), nullptr))) {
         return false;
+    }
     g.blurTarget->BeginDraw();
     g.blurTarget->Clear(Color(0, 0, 0, 0));
     const D2D1_SIZE_F blurSize = g.blurTarget->GetSize();
-    g.blurTarget->DrawBitmap(
-        g.sceneBitmap.Get(), Rect(0, 0, blurSize.width, blurSize.height), 1.0f,
-        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    // A 3x3 tent filter produces the original strong glass blur while the
+    // 1/4-resolution target keeps its edges smooth rather than blocky.
+    // Doubled offsets preserve the previous on-screen blur radius after the
+    // target resolution was raised from one quarter to one half.
+    constexpr float kOffsets[] = {-4.0f, 0.0f, 4.0f};
+    for (const float offsetY : kOffsets) {
+        for (const float offsetX : kOffsets) {
+            const float weight = (offsetX == 0.0f && offsetY == 0.0f) ? 0.22f : 0.17f;
+            g.blurTarget->DrawBitmap(
+                g.sceneBitmap.Get(),
+                Rect(offsetX, offsetY, blurSize.width + offsetX,
+                     blurSize.height + offsetY),
+                weight, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        }
+    }
     return SUCCEEDED(g.blurTarget->EndDraw());
 }
 
 void ResetTarget() {
     g.menuLayer.Reset();
     g.logoBitmap.Reset();
+    g.previewHeroBitmap.Reset();
+    g.preview3dBitmap.Reset();
+    g.preview3dTexture.Reset();
+    g.previewReadbackTexture.Reset();
+    g.previewReadbackFormat = DXGI_FORMAT_UNKNOWN;
+    g.previewReadbackWidth = 0;
+    g.previewReadbackHeight = 0;
+    g.preview3dFrame = {};
+    g.preview3dPixels.clear();
+    g.preview3dShared = false;
+    g.preview3dActive = false;
     for (auto& icon : g.tabIcons) icon.Reset();
     g.blurBitmap.Reset();
     g.blurTarget.Reset();
     g.sceneBitmap.Reset();
+    g.sceneReadbackTexture.Reset();
+    g.sceneReadbackFormat = DXGI_FORMAT_UNKNOWN;
+    g.sceneReadbackWidth = 0;
+    g.sceneReadbackHeight = 0;
+    g.scenePixels.clear();
+    g.sceneBlurPixels.clear();
+    g.deviceContext.Reset();
+    g.swapChain.Reset();
     g.blurSourceSize = {};
     g.softwareSrv.Reset();
     g.softwareTexture.Reset();
@@ -762,6 +1415,12 @@ bool CreateSoftwareMenuTarget(IDXGISwapChain* swapChain, UINT width, UINT height
         ResetTarget();
         return false;
     }
+    device->GetImmediateContext(g.deviceContext.GetAddressOf());
+    if (!g.deviceContext) {
+        ResetTarget();
+        return false;
+    }
+    g.swapChain = swapChain;
     D3D11_TEXTURE2D_DESC textureDescription{};
     textureDescription.Width = width;
     textureDescription.Height = height;
@@ -827,6 +1486,8 @@ bool UploadSoftwareMenuTexture() {
 }
 
 } // namespace
+
+void DrawMenuSettingsPanel(const Layout& l);
 
 bool PrepareD2DMenu(IDXGISwapChain* swapChain) {
     if (!swapChain || !EnsureFactories()) return false;
@@ -947,9 +1608,69 @@ void RenderD2DMenu(std::size_t playerCount) {
     g.pageAlpha += (1.0f - g.pageAlpha) * 0.18f;
     g.pageShift += (0.0f - g.pageShift) * 0.18f;
 
-    const bool blurReady = !g.softwareTarget && PrepareBackgroundBlur(
-        static_cast<UINT>(io.DisplaySize.x),
-        static_cast<UINT>(io.DisplaySize.y));
+    // Software mode captures the swap-chain backbuffer in
+    // PrepareBackgroundBlur; hardware mode reads its D2D surface directly.
+    const UINT displayWidth = static_cast<UINT>(io.DisplaySize.x);
+    const UINT displayHeight = static_cast<UINT>(io.DisplaySize.y);
+    const UINT blurLeft = static_cast<UINT>(std::clamp(
+        static_cast<int>(std::floor(l.x)), 0, static_cast<int>(displayWidth)));
+    const UINT blurTop = static_cast<UINT>(std::clamp(
+        static_cast<int>(std::floor(l.y)), 0, static_cast<int>(displayHeight)));
+    const UINT blurWidth = (std::min)(
+        static_cast<UINT>(std::ceil(298.0f * safeScale)), displayWidth - blurLeft);
+    const UINT blurHeight = (std::min)(
+        static_cast<UINT>(std::ceil(kDesignHeight * safeScale)), displayHeight - blurTop);
+    const bool blurReady = g.softwareTarget
+        ? PrepareBackgroundBlur(displayWidth, displayHeight,
+                                blurLeft, blurTop, blurWidth, blurHeight)
+        : PrepareBackgroundBlur(displayWidth, displayHeight);
+    ID2D1Bitmap* backdropBlur = g.softwareTarget ? g.sceneBitmap.Get()
+                                                  : g.blurBitmap.Get();
+    // While the native Panorama source is deliberately hidden during a drag,
+    // keep its whole D2D presentation frozen: texture, bounds and skeleton.
+    // Updating only the texture would make ESP lines drift independently.
+    const bool freezePreview = g.draggingWindow && g.preview3dActive &&
+                               g.preview3dBitmap;
+    if (!freezePreview) {
+        g.preview3dActive = false;
+    }
+    if (!freezePreview && g.tab == 0 && pDevice && pContext) {
+        Preview3DFrame previewFrame{};
+        SetPanoramaPreviewRole(g.visualTeam);
+        ID3D11Texture2D* panoramaTexture = GetPanoramaPreviewTexture();
+        if (panoramaTexture) {
+            previewFrame.texture = panoramaTexture;
+            previewFrame.left = 0.0f;
+            previewFrame.top = 0.0f;
+            previewFrame.right = 1.0f;
+            previewFrame.bottom = 1.0f;
+            std::array<Preview3DPoint, 18> skeleton{};
+            if (GetPanoramaPreviewSkeleton(skeleton.data(), skeleton.size())) {
+                previewFrame.skeleton = skeleton;
+                float left = 1.0f, top = 1.0f, right = 0.0f, bottom = 0.0f;
+                size_t visibleJoints = 0;
+                for (const Preview3DPoint& point : skeleton) {
+                    if (!point.visible) continue;
+                    left = (std::min)(left, point.x);
+                    top = (std::min)(top, point.y);
+                    right = (std::max)(right, point.x);
+                    bottom = (std::max)(bottom, point.y);
+                    ++visibleJoints;
+                }
+                if (visibleJoints >= 6 && right > left && bottom > top) {
+                    const float padX = (std::max)(0.035f, (right - left) * 0.16f);
+                    const float padTop = (std::max)(0.035f, (bottom - top) * 0.08f);
+                    const float padBottom = (std::max)(0.030f, (bottom - top) * 0.05f);
+                    previewFrame.left = std::clamp(left - padX, 0.0f, 1.0f);
+                    previewFrame.top = std::clamp(top - padTop, 0.0f, 1.0f);
+                    previewFrame.right = std::clamp(right + padX, 0.0f, 1.0f);
+                    previewFrame.bottom = std::clamp(bottom + padBottom, 0.0f, 1.0f);
+                }
+            }
+            g.preview3dActive = BindPreview3DFrame(previewFrame, pContext);
+            ReportPanoramaPreviewBinding(g.preview3dActive);
+        }
+    }
     g.target->BeginDraw();
     g.target->SetTransform(D2D1::Matrix3x2F::Identity());
     if (g.softwareTarget)
@@ -965,163 +1686,176 @@ void RenderD2DMenu(std::size_t playerCount) {
         g.target->PushLayer(layerParams, g.menuLayer.Get());
         pushedMenuLayer = true;
     }
-    if (blurReady && g.blurBitmap) {
+    if (!g.softwareTarget && blurReady && backdropBlur) {
         g.target->PushAxisAlignedClip(
             Rect(l.x, l.y, l.x + kDesignWidth * safeScale,
                  l.y + kDesignHeight * safeScale),
             D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         g.target->DrawBitmap(
-            g.blurBitmap.Get(), Rect(0, 0, io.DisplaySize.x, io.DisplaySize.y),
+            backdropBlur, Rect(0, 0, io.DisplaySize.x, io.DisplaySize.y),
             1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         g.target->PopAxisAlignedClip();
     }
+    // Keep the scene visible beneath the menu.  This is intentionally only a
+    // light global dimmer; the glass layer below supplies the sidebar tint.
     FillRect(Rect(0, 0, io.DisplaySize.x, io.DisplaySize.y),
-             Color(0.008f, 0.010f, 0.016f, 0.18f));
+             Color(0.008f, 0.010f, 0.016f, 0.10f));
     g.target->SetTransform(D2D1::Matrix3x2F(safeScale, 0, 0, safeScale, l.x, l.y));
 
-    const D2D1_RECT_F window = Rect(0, 0, kDesignWidth, kDesignHeight);
-    GlowRounded(window, 14, Color(0, 0, 0, 0.78f), 8, 3.0f);
-    GradientRounded(window, 14, Color(0.068f, 0.074f, 0.105f, 0.56f),
-                    Color(0.063f, 0.069f, 0.100f, 0.59f), true);
+    // The preview is deliberately not part of this rectangle: it is a
+    // companion window attached to the right edge, like the reference UI.
+    const D2D1_RECT_F window = Rect(0, 0, kMainWindowWidth, kDesignHeight);
+    GlowRounded(window, 12, Color(0, 0, 0, 0.78f), 10, 3.0f);
+    // The opaque base starts after the sidebar.  Leaving the left area clear
+    // lets its dedicated blur/tint layer behave like real glass.
+    GradientRounded(Rect(298, 0, kMainWindowWidth, kDesignHeight), 0,
+                    ThemeSurface(0.010f, 0.050f, 0.985f),
+                    ThemeSurface(0.006f, 0.022f, 0.99f), true);
     // A subtle cool sheen keeps the panel translucent without turning it black.
-    GradientRounded(Rect(1, 1, kDesignWidth - 1, 170), 13,
+    GradientRounded(Rect(1, 1, kMainWindowWidth - 1, 170), 13,
                     Color(0.20f, 0.24f, 0.31f, 0.055f),
                     Color(0.05f, 0.07f, 0.11f, 0.0f), true);
-    StrokeRounded(window, 14, Color(0.39f, 0.13f, 0.20f, 0.58f), 1.0f);
+    StrokeRounded(window, 4, Color(1, 1, 1, 0.08f), 1.0f);
 
-    GradientRounded(Rect(0, 0, kDesignWidth, 62), 14,
-                    Color(0.050f, 0.068f, 0.094f, 0.52f),
-                    Color(0.092f, 0.052f, 0.076f, 0.52f));
-    FillRect(Rect(0, 52, kDesignWidth, 62), Color(0.060f, 0.063f, 0.086f, 0.52f));
-    Line(D2D1::Point2F(0, 62), D2D1::Point2F(kDesignWidth, 62), Border());
-    Line(D2D1::Point2F(313, 62), D2D1::Point2F(313, kDesignHeight), Border());
+    // Sidebar glass: replay the blurred scene only under the left panel, then
+    // tint it lightly instead of covering it with an opaque navigation block.
+    if (blurReady && backdropBlur) {
+        g.target->SetTransform(D2D1::Matrix3x2F::Identity());
+        g.target->PushAxisAlignedClip(
+            Rect(l.x, l.y, l.x + 298.0f * safeScale,
+                 l.y + kDesignHeight * safeScale),
+            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        const D2D1_RECT_F blurDestination = g.softwareTarget
+            ? Rect(static_cast<float>(blurLeft), static_cast<float>(blurTop),
+                   static_cast<float>(blurLeft + blurWidth),
+                   static_cast<float>(blurTop + blurHeight))
+            : Rect(0, 0, io.DisplaySize.x, io.DisplaySize.y);
+        g.target->DrawBitmap(backdropBlur, blurDestination,
+                             0.92f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        g.target->PopAxisAlignedClip();
+        g.target->SetTransform(D2D1::Matrix3x2F(safeScale, 0, 0, safeScale, l.x, l.y));
+    }
+    // In the software renderer there is no clean scene texture to blur.  A
+    // low-alpha tint is preferable to blurring a previous UI frame (ghosted
+    // labels/icons) and still gives the sidebar a genuine glass appearance.
+    FillRect(Rect(0, 0, 298, kDesignHeight), ThemeSurface(0.003f, 0.042f, 0.84f));
+    GradientRounded(Rect(1, 1, 297, kDesignHeight - 1), 4,
+                    ThemeSurface(0.035f, 0.070f, 0.30f),
+                    ThemeSurface(0.002f, 0.018f, 0.17f), true);
+    FillRect(Rect(298, 0, kMainWindowWidth, 70), ThemeSurface(0.005f, 0.026f, 0.99f));
+    Line(D2D1::Point2F(0, 70), D2D1::Point2F(kMainWindowWidth, 70), Border());
+    Line(D2D1::Point2F(298, 0), D2D1::Point2F(298, kDesignHeight), Border());
 
     DrawLogo();
-    Text(L"Axiom", Rect(104, 6, 300, 56), g.title.Get(), White());
-    Line(D2D1::Point2F(1402, 21), D2D1::Point2F(1418, 37), Muted(), 1.6f);
-    Line(D2D1::Point2F(1418, 21), D2D1::Point2F(1402, 37), Muted(), 1.6f);
-    if (Clicked(l, Rect(1388, 8, 1433, 53))) {
+    Text(L"AXIOM", Rect(104, 9, 285, 57), g.title.Get(), White());
+    const D2D1_RECT_F save = Rect(326, 16, 438, 54);
+    FillRounded(save, 3, Color(1, 1, 1, 0.025f));
+    StrokeRounded(save, 3, Border(), 0.9f);
+    Text(L"Save", save, g.centered.Get(), Muted());
+    const D2D1_RECT_F profile = Rect(458, 16, 675, 54);
+    FillRounded(profile, 3, Color(1, 1, 1, 0.025f));
+    StrokeRounded(profile, 3, Border(), 0.9f);
+    Text(L"Global", Rect(475, 16, 620, 54), g.regular.Get(), White());
+    Line(D2D1::Point2F(648, 31), D2D1::Point2F(654, 37), Muted(), 1.3f);
+    Line(D2D1::Point2F(654, 37), D2D1::Point2F(660, 31), Muted(), 1.3f);
+    if (Clicked(l, save)) SaveConfig();
+    const D2D1_RECT_F gear = Rect(874, 12, 916, 54);
+    if (Clicked(l, gear)) g.settingsOpen = !g.settingsOpen;
+    const D2D1_COLOR_F gearColor = g.settingsOpen ? Red() : Muted();
+    SetBrush(gearColor);
+    g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(895, 31), 8, 8), g.brush.Get(), 2.0f);
+    for (int i = 0; i < 8; ++i) {
+        const float a = i * 0.78539816f;
+        Line(D2D1::Point2F(895 + std::cos(a) * 11, 31 + std::sin(a) * 11),
+             D2D1::Point2F(895 + std::cos(a) * 15, 31 + std::sin(a) * 15), gearColor, 2.0f);
+    }
+    // Search icon beside the settings button, matching the compact toolbar.
+    SetBrush(Muted());
+    g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(947, 29), 6, 6), g.brush.Get(), 1.5f);
+    Line(D2D1::Point2F(952, 34), D2D1::Point2F(959, 41), Muted(), 1.5f);
+    Line(D2D1::Point2F(964, 24), D2D1::Point2F(976, 36), Muted(), 1.4f);
+    Line(D2D1::Point2F(976, 24), D2D1::Point2F(964, 36), Muted(), 1.4f);
+    if (Clicked(l, Rect(958, 8, 990, 53))) {
         SaveConfig();
         SetMenuOpen(false);
     }
 
-    FillRect(Rect(0, 62, 313, kDesignHeight), Color(0.065f, 0.080f, 0.115f, 0.56f));
-    const wchar_t* tabs[] = {L"Visuals", L"Aim assist", L"Misc"};
-    for (int i = 0; i < 3; ++i) {
-        const float top = 88.0f + i * 74.0f;
-        const D2D1_RECT_F tab = Rect(18, top, 292, top + 68);
-        const bool selected = g.tab == i;
-        if (Clicked(l, tab)) {
-            g.tab = i;
-            g.pageAlpha = 0.0f;
-            g.pageShift = 14.0f;
-            g.openCombo = 0;
-        }
-        if (selected) {
-            g.tabHighlightY += (top - g.tabHighlightY) * 0.20f;
-            const D2D1_RECT_F highlight = Rect(18, g.tabHighlightY, 292,
-                                               g.tabHighlightY + 68);
-            GlowRounded(highlight, 9, Red(0.40f), 7, 1.8f);
-            GradientRounded(highlight, 9, Color(0.205f, 0.085f, 0.110f, 0.80f),
-                            Color(0.125f, 0.100f, 0.125f, 0.91f));
-            InnerGlow(highlight, 9);
-            StrokeRounded(highlight, 9, Red(0.92f), 1.2f);
-            SetBrush(Red());
-            g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(270, top + 34), 5, 5),
-                                  g.brush.Get());
-        } else if (Contains(tab, l.mouse)) {
-            FillRounded(tab, 9, Color(1, 1, 1, 0.035f));
-        }
-        DrawTabIcon(i, 46, top + 34, selected);
-        Text(tabs[i], Rect(78, top + 20, 245, top + 52),
-             g.medium.Get(), selected ? Red() : Muted());
+    Layout settingsLayout = l;
+    if (g.settingsOpen) {
+        // The settings popup owns the pointer while it is visible; the
+        // underlying navigation and controls must not receive this input.
+        l.clicked = false;
+        l.down = false;
     }
+
+    auto section = [&](const wchar_t* label, float y) {
+        Text(label, Rect(28, y, 260, y + 18), g.regular.Get(), Muted(0.52f));
+    };
+    auto nav = [&](const wchar_t* label, float y, int icon, bool selected,
+                   auto activate) {
+        const D2D1_RECT_F row = Rect(14, y, 284, y + 42);
+        if (Clicked(l, row)) { activate(); g.pageAlpha = 0.0f; g.pageShift = 12.0f; g.openCombo = 0; }
+        if (selected) {
+            FillRounded(row, 3, Color(1, 1, 1, 0.105f));
+            SetBrush(Red());
+            g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(263, y + 21), 3.6f, 3.6f), g.brush.Get());
+        } else if (Contains(row, l.mouse)) FillRounded(row, 3, Color(1, 1, 1, 0.028f));
+        DrawNavigationIcon(icon, 43, y + 21, selected);
+        Text(label, Rect(74, y + 5, 242, y + 36), g.medium.Get(), selected ? White() : Muted());
+    };
+    section(L"VISUALS", 100);
+    nav(L"Enemy", 124, 0, g.tab == 0 && g.visualTeam == 0, [&] { g.tab = 0; g.visualTeam = 0; });
+    nav(L"Ally", 168, 1, g.tab == 0 && g.visualTeam == 1, [&] { g.tab = 0; g.visualTeam = 1; });
+    nav(L"Creep", 212, 2, g.tab == 0 && g.visualTeam == 2, [&] { g.tab = 0; g.visualTeam = 2; });
+    section(L"AIM ASSIST", 278);
+    nav(L"Player aim", 302, 3, g.tab == 1 && g.aimSubtab == 0, [&] { g.tab = 1; g.aimSubtab = 0; });
+    nav(L"Creep aim", 346, 4, g.tab == 1 && g.aimSubtab != 0, [&] { g.tab = 1; g.aimSubtab = 1; });
+    section(L"MISCELLANEOUS", 412);
+    nav(L"Misc", 436, 5, g.tab == 2, [&] { g.tab = 2; });
 
     const float contentX = 349.0f + g.pageShift;
-    Text(tabs[g.tab], Rect(contentX, 73, 700, 113), g.title.Get(),
+    const wchar_t* pageTitle = g.tab == 0 ? (g.visualTeam == 0 ? L"Enemy" :
+                                             g.visualTeam == 1 ? L"Ally" : L"Creep") :
+                                g.tab == 1 ? (g.aimSubtab == 0 ? L"Player aim" : L"Creep aim") :
+                                             L"Misc";
+    Text(pageTitle, Rect(contentX, 83, 700, 113), g.title.Get(),
          Color(White().r, White().g, White().b, g.pageAlpha));
 
-    float cardTop = 130.0f;
-    if (g.tab == 0) {
-        const D2D1_RECT_F enemy = Rect(contentX, 124, contentX + 140, 164);
-        const D2D1_RECT_F ally = Rect(contentX + 146, 124, contentX + 286, 164);
-        const D2D1_RECT_F creep = Rect(contentX + 292, 124, contentX + 432, 164);
-        const D2D1_RECT_F player = Rect(contentX + 438, 124, contentX + 578, 164);
-        auto segment = [&](const D2D1_RECT_F& r, int value, const wchar_t* label) {
-            if (Clicked(l, r)) g.visualTeam = value;
-            const bool selected = g.visualTeam == value;
-            if (selected) {
-                GlowRounded(r, 7, Red(0.40f), 5, 1.4f);
-                GradientRounded(r, 7, Color(0.45f, 0.035f, 0.085f),
-                                Color(0.19f, 0.030f, 0.060f), true);
-                InnerGlow(r, 7);
-                StrokeRounded(r, 7, Red(), 1.0f);
-            } else {
-                GradientRounded(r, 7, Color(0.085f, 0.092f, 0.11f),
-                                Color(0.060f, 0.063f, 0.075f), true);
-                StrokeRounded(r, 7, Border());
-            }
-            Text(label, r, g.centered.Get(), selected ? White() : Muted());
-        };
-        segment(enemy, 0, L"Enemy");
-        segment(ally, 1, L"Ally");
-        segment(creep, 2, L"Creep");
-        segment(player, 3, L"Player");
-        cardTop = 190.0f;
-    }
-    if (g.tab == 1) {
-        const D2D1_RECT_F human = Rect(contentX, 124, contentX + 180, 164);
-        const D2D1_RECT_F farm = Rect(contentX + 186, 124, contentX + 366, 164);
-        auto aimSegment = [&](const D2D1_RECT_F& r, int value, const wchar_t* label) {
-            if (Clicked(l, r)) g.aimSubtab = value;
-            const bool selected = g.aimSubtab == value;
-            if (selected) {
-                GlowRounded(r, 7, Red(0.40f), 5, 1.4f);
-                GradientRounded(r, 7, Color(0.45f, 0.035f, 0.085f),
-                                Color(0.19f, 0.030f, 0.060f), true);
-                InnerGlow(r, 7);
-                StrokeRounded(r, 7, Red(), 1.0f);
-            } else {
-                GradientRounded(r, 7, Color(0.085f, 0.092f, 0.11f),
-                                Color(0.060f, 0.063f, 0.075f), true);
-                StrokeRounded(r, 7, Border());
-            }
-            Text(label, r, g.centered.Get(), selected ? White() : Muted());
-        };
-        aimSegment(human, 0, L"Human");
-        aimSegment(farm, 1, L"Farm");
-        cardTop = 190.0f;
-    }
+    const float cardTop = 120.0f;
 
-    const D2D1_RECT_F cardRect = Rect(334, cardTop, 1414, 818);
-    GlowRounded(cardRect, 10, Color(0, 0, 0, 0.64f), 5, 2.0f);
-    GradientRounded(cardRect, 10, Color(0.098f, 0.112f, 0.148f, 0.68f),
-                    Color(0.105f, 0.116f, 0.154f, 0.71f), true);
-    StrokeRounded(cardRect, 10, Border(), 1.0f);
+    const bool visualEditor = g.tab == 0;
+    // All tabs share one bottom edge. Their top can differ (Aim has subtabs),
+    // but the content cards must terminate at the same design-space Y.
+    constexpr float contentPanelBottom = kContentPanelBottom;
+    const float visualPanelBottom = contentPanelBottom;
+    const float visualPanelHeight = visualPanelBottom - cardTop;
+    const D2D1_RECT_F cardRect = Rect(334, cardTop,
+                                      996.0f,
+                                      contentPanelBottom);
+    // The main window already supplies the page surface.  Do not add a second
+    // dark card behind every settings area: it reads as a large black block.
 
-    const wchar_t* cardTitles[] = {L"Overlay", L"Aim configuration",
-                                    L"Farm configuration", L"Miscellaneous"};
-    StrokeRounded(Rect(348, cardTop + 10, 380, cardTop + 42), 6, Red(), 1.4f);
-    Line(D2D1::Point2F(356, cardTop + 18), D2D1::Point2F(362, cardTop + 18), Red(), 1.4f);
-    Line(D2D1::Point2F(356, cardTop + 18), D2D1::Point2F(356, cardTop + 24), Red(), 1.4f);
-    Line(D2D1::Point2F(372, cardTop + 34), D2D1::Point2F(366, cardTop + 34), Red(), 1.4f);
-    Line(D2D1::Point2F(372, cardTop + 34), D2D1::Point2F(372, cardTop + 28), Red(), 1.4f);
-    Text(cardTitles[g.tab], Rect(391, cardTop + 3, 700, cardTop + 43),
+    const wchar_t* cardTitles[] = {L"Overlay", L"Aim configuration", L"Miscellaneous"};
+    Text(cardTitles[g.tab], Rect(350, cardTop + 10, 700, cardTop + 42),
          g.semibold.Get(), White());
-    Line(D2D1::Point2F(875, cardTop + 58), D2D1::Point2F(875, 772), Border());
+    Line(D2D1::Point2F(350, cardTop + 50), D2D1::Point2F(992, cardTop + 50), Border());
+    if (!visualEditor) Line(D2D1::Point2F(655, cardTop + 66),
+                            D2D1::Point2F(655, contentPanelBottom - 28), Border());
 
-    const float leftX = 392;
-    const float rightX = 908;
-    const float leftColumnWidth = 449;
-    const float rightColumnWidth = 462;
+    const float leftX = visualEditor ? 350.0f : 330.0f;
+    const float rightX = visualEditor ? 660.0f : 675.0f;
+    const float leftColumnWidth = visualEditor ? 288.0f : 300.0f;
+    const float rightColumnWidth = visualEditor ? 308.0f : 300.0f;
     const float leftColorWidth = leftColumnWidth;
     const float rightColorWidth = rightColumnWidth;
     const float columnWidth = leftColumnWidth;
-    const float firstY = cardTop + 44;
+    // The card title divider is at cardTop + 50.  Start controls below it so
+    // the divider never cuts through the first row's label.
+    const float firstY = cardTop + 56;
 
     const float viewportTop = cardTop + 44.0f;
     const bool mouseInColumnViewport =
-        l.mouse.y >= viewportTop && l.mouse.y <= 818.0f;
+        l.mouse.y >= viewportTop && l.mouse.y <= contentPanelBottom;
     const float previousLeftMax = ColumnMaxScroll(g.leftContentBottom);
     const float previousRightMax = ColumnMaxScroll(g.rightContentBottom);
     if (mouseInColumnViewport && io.MouseWheel != 0.0f) {
@@ -1129,7 +1863,7 @@ void RenderD2DMenu(std::size_t playerCount) {
         if (l.mouse.x >= leftX && l.mouse.x < rightX)
             g.leftColumnScroll = std::clamp(g.leftColumnScroll + scrollStep,
                                             -previousLeftMax, 0.0f);
-        else if (l.mouse.x >= rightX && l.mouse.x <= 1414.0f)
+        else if (l.mouse.x >= rightX && l.mouse.x <= 996.0f)
             g.rightColumnScroll = std::clamp(g.rightColumnScroll + scrollStep,
                                              -previousRightMax, 0.0f);
     }
@@ -1138,7 +1872,12 @@ void RenderD2DMenu(std::size_t playerCount) {
     g.rightContentBottom = viewportTop;
 
     g.target->PushAxisAlignedClip(
-        Rect(334.0f, viewportTop, 1414.0f, 818.0f),
+        // Aim/Misc controls begin at leftX (330), while the card starts at
+        // 334.  Clipping from the card edge cropped the first pixels of their
+        // labels and combo boxes.
+        Rect(visualEditor ? 334.0f : leftX, visualEditor ? 0.0f : viewportTop,
+             visualEditor ? 1436.0f : 996.0f,
+             visualEditor ? kDesignHeight : contentPanelBottom),
         D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
     if (g.tab == 0) {
@@ -1163,121 +1902,132 @@ void RenderD2DMenu(std::size_t playerCount) {
         float* teamHealthColor = g.visualTeam == 0 ? enemyHealthBarColor :
                                  g.visualTeam == 1 ? teammateHealthBarColor : creepHealthColor;
         float* teamNameColor = g.visualTeam == 0 ? enemyNameColor : teammateNameColor;
+        float* teamSkeletonColor = g.visualTeam == 0 ? enemySkeletonColor : teammateSkeletonColor;
         float* teamPlayerColor = g.visualTeam == 0 ? enemyPlayerNameColor : teammatePlayerNameColor;
         float* teamHealthValueColor = g.visualTeam == 0 ? enemyHealthValueColor : teammateHealthValueColor;
         float* teamGlowColor = g.visualTeam == 0 ? enemyGlowColor : teammateGlowColor;
+        bool* teamGlowEnabled = g.visualTeam == 0 ? &enemyGlowEnabled : &allyGlowEnabled;
+        float* teamBoxThickness = g.visualTeam == 0 ? &enemyBoxThickness :
+                                  g.visualTeam == 1 ? &allyBoxThickness : &boxThickness;
+        float* teamCornerLength = g.visualTeam == 0 ? &enemyCornerBoxLength :
+                                  g.visualTeam == 1 ? &allyCornerBoxLength : &cornerBoxLength;
+        DrawHeroEspPreview(1020.0f, 0.0f, 410.0f, kDesignHeight,
+                           g.visualTeam == 0 ? L"Enemy preset" :
+                           g.visualTeam == 1 ? L"Ally preset" : L"Creep preset",
+                           *teamEsp,
+                           *teamBoxes, *teamCornerBoxes, *teamBones,
+                           *teamHealth, *teamHealthValues, *teamNames,
+                           *teamPlayerNames, *teamDistance, *teamSnaplines,
+                           teamBoxColor, teamSkeletonColor, teamHealthColor,
+                           teamNameColor, teamPlayerColor, teamHealthValueColor,
+                           *teamBoxThickness, *teamCornerLength, l,
+                           teamEsp, teamBoxes, teamCornerBoxes, teamBones,
+                           teamHealth, teamHealthValues, teamNames, teamPlayerNames,
+                           teamDistance, teamSnaplines, teamGlowEnabled);
 
-        if (g.visualTeam == 3) {
-            DrawToggle(l, leftX, firstY, leftColorWidth, L"Local ESP",
-                       L"Visuals for your own player", &localEspEnabled);
-            if (localEspEnabled) {
-                float localY = firstY + 72;
-                DrawToggle(l, leftX, localY, leftColorWidth, L"Bounding boxes",
-                           L"Draw a box around the local player", &localBoxesEnabled, localBoxColor);
-                localY += 72;
-                if (localBoxesEnabled) {
-                    DrawToggle(l, leftX, localY, leftColorWidth, L"Corner boxes",
-                               L"Use corner-only box style", &localCornerBoxesEnabled);
-                    localY += 72;
-                }
-                DrawToggle(l, leftX, localY, leftColorWidth, L"Health bar",
-                           L"Show local health", &localHealthEnabled, localHealthColor);
-                DrawToggle(l, leftX, localY + 66, leftColorWidth, L"Health value",
-                           L"Show local health value", &localHealthValuesEnabled);
-                DrawToggle(l, leftX, localY + 132, leftColorWidth, L"Skeleton",
-                           L"Render local skeleton", &localBonesEnabled);
-            }
-        } else if (g.visualTeam == 2) {
-            DrawToggle(l, leftX, firstY, leftColorWidth, L"Creep ESP",
-                       L"Highlight valid creeps", teamEsp);
-            float orbY = firstY + 72;
-            if (*teamEsp) {
-                DrawToggle(l, leftX, firstY + 72, leftColorWidth, L"Bounding boxes",
-                           L"Draw boxes around creeps", teamBoxes, teamBoxColor);
-                if (*teamBoxes) {
-                    DrawToggle(l, leftX, firstY + 144, leftColorWidth, L"Corner boxes",
-                               L"Use corner-only box style", teamCornerBoxes, nullptr);
-                }
-                DrawToggle(l, leftX, firstY + 216, leftColorWidth, L"Health bar",
-                           L"Show creep health", teamHealth, teamHealthColor);
-                DrawToggle(l, leftX, firstY + 282, leftColorWidth, L"Health value",
-                           L"Show creep health value", teamHealthValues, teamHealthColor);
-                DrawToggle(l, leftX, firstY + 348, leftColorWidth, L"Distance",
-                           L"Show distance to creep", teamDistance, nullptr);
-                orbY = firstY + 414;
-            }
-            DrawToggle(l, leftX, orbY, leftColorWidth, L"Orb ESP",
-                       L"Highlight active soul orbs", &drawOrbEsp);
-            DrawToggle(l, rightX, firstY, rightColorWidth, L"Ally creep ESP",
-                       L"Highlight allied creeps", &allyCreepEspEnabled);
-            if (allyCreepEspEnabled) {
-                DrawToggle(l, rightX, firstY + 72, rightColorWidth, L"Bounding boxes",
-                           L"Draw boxes around allied creeps", &allyCreepBoxesEnabled, allyCreepBoxColor);
-                DrawToggle(l, rightX, firstY + 144, rightColorWidth, L"Corner boxes",
-                           L"Use corner-only box style", &allyCreepCornerBoxesEnabled);
-                DrawToggle(l, rightX, firstY + 216, rightColorWidth, L"Health bar",
-                           L"Show allied creep health", &allyCreepHealthEnabled, allyCreepHealthColor);
-                DrawToggle(l, rightX, firstY + 282, rightColorWidth, L"Health value",
-                           L"Show allied creep health value", &allyCreepHealthValuesEnabled);
-                DrawToggle(l, rightX, firstY + 348, rightColorWidth, L"Distance",
-                           L"Show distance to allied creep", &allyCreepDistanceEnabled);
-            }
+        // Boolean ESP controls live in the preview companion window. Keep the
+        // old in-card layout disabled so controls cannot be duplicated.
+        if (false) { if (g.visualTeam == 2) {
+            DrawEspChip(l, leftX, firstY + 48, leftColumnWidth, L"Creep ESP", teamEsp);
+            DrawEspChip(l, rightX, firstY + 48, rightColumnWidth, L"Ally creep ESP",
+                        &allyCreepEspEnabled);
+            DrawEspChip(l, leftX, firstY + 100, leftColumnWidth, L"Box",
+                        teamBoxes, teamBoxColor);
+            DrawEspChip(l, rightX, firstY + 100, rightColumnWidth, L"Ally box",
+                        &allyCreepBoxesEnabled, allyCreepBoxColor);
+            DrawEspChip(l, leftX, firstY + 152, leftColumnWidth, L"Corner box",
+                        teamCornerBoxes);
+            DrawEspChip(l, rightX, firstY + 152, rightColumnWidth, L"Ally corner box",
+                        &allyCreepCornerBoxesEnabled);
+            DrawEspChip(l, leftX, firstY + 204, leftColumnWidth, L"Health bar",
+                        teamHealth, teamHealthColor);
+            DrawEspChip(l, rightX, firstY + 204, rightColumnWidth, L"Ally health bar",
+                        &allyCreepHealthEnabled, allyCreepHealthColor);
+            DrawEspChip(l, leftX, firstY + 256, leftColumnWidth, L"Health value",
+                        teamHealthValues, creepHealthValueColor);
+            DrawEspChip(l, rightX, firstY + 256, rightColumnWidth, L"Ally health value",
+                        &allyCreepHealthValuesEnabled, allyCreepHealthValueColor);
+            DrawEspChip(l, leftX, firstY + 308, leftColumnWidth, L"Distance",
+                        teamDistance);
+            DrawEspChip(l, rightX, firstY + 308, rightColumnWidth, L"Ally distance",
+                        &allyCreepDistanceEnabled);
+            DrawEspChip(l, leftX, firstY + 360, leftColumnWidth, L"Soul orbs",
+                        &drawOrbEsp);
         } else {
-        if (*teamEsp) {
-
-        DrawToggle(l, leftX, firstY, leftColumnWidth, L"Enable ESP",
-                   L"Master overlay switch", teamEsp);
-        DrawToggle(l, leftX, firstY + 72, leftColorWidth, L"Bounding boxes",
-                   L"Draw boxes around enemies", teamBoxes, teamBoxColor);
-        if (*teamBoxes) {
-            DrawSlider(l, leftX, firstY + 138, leftColumnWidth, L"Box thickness",
-                       &boxThickness, 0.5f, 4.0f, L"%.2f px");
-            DrawToggle(l, leftX, firstY + 198, leftColorWidth, L"Corner boxes",
-                       L"Use corner-only box style", teamCornerBoxes, nullptr);
-            DrawSlider(l, leftX, firstY + 264, leftColumnWidth, L"Corner length",
-                       &cornerBoxLength, 0.10f, 0.50f, L"%.2f");
+            DrawSectionHeading(leftX, firstY + 10, leftColumnWidth, L"Main");
+            DrawSectionHeading(rightX, firstY + 10, rightColumnWidth, L"Details");
+            DrawEspChip(l, leftX, firstY + 50, leftColumnWidth, L"Enable ESP", teamEsp);
+            DrawEspChip(l, rightX, firstY + 50, rightColumnWidth, L"Model glow",
+                        teamGlowEnabled, teamGlowColor);
+            DrawEspChip(l, leftX, firstY + 102, leftColumnWidth, L"Box",
+                        teamBoxes, teamBoxColor);
+            DrawEspChip(l, rightX, firstY + 102, rightColumnWidth, L"Corner box",
+                        teamCornerBoxes);
+            DrawEspChip(l, leftX, firstY + 154, leftColumnWidth, L"Health bar",
+                        teamHealth, teamHealthColor);
+            DrawEspChip(l, rightX, firstY + 154, rightColumnWidth, L"Health value",
+                        teamHealthValues, teamHealthValueColor);
+            DrawEspChip(l, leftX, firstY + 206, leftColumnWidth, L"Skeleton",
+                        teamBones, teamSkeletonColor);
+            DrawEspChip(l, rightX, firstY + 206, rightColumnWidth, L"Hero name",
+                        teamNames, teamNameColor);
+            DrawEspChip(l, leftX, firstY + 258, leftColumnWidth, L"Player name",
+                        teamPlayerNames, teamPlayerColor);
+            DrawEspChip(l, rightX, firstY + 258, rightColumnWidth, L"Distance",
+                        teamDistance);
+            DrawEspChip(l, leftX, firstY + 310, leftColumnWidth, L"Snapline",
+                        teamSnaplines);
+            DrawSectionHeading(leftX, firstY + 372,
+                               rightX + rightColumnWidth - leftX, L"Appearance");
+            DrawSlider(l, leftX, firstY + 418,
+                       rightX + rightColumnWidth - leftX, L"Box thickness",
+                       teamBoxThickness, 0.5f, 4.0f, L"%.2f px");
+            DrawSlider(l, leftX, firstY + 470,
+                       rightX + rightColumnWidth - leftX, L"Corner length",
+                       teamCornerLength, 0.10f, 0.35f, L"%.2f");
+            const wchar_t* glowModes[] = {L"HP-based fill", L"Normal fill"};
+            int* teamGlowMode = g.visualTeam == 0 ? &enemyGlowMode : &allyGlowMode;
+            DrawCombo(l, 401, leftX, firstY + 530,
+                      rightX + rightColumnWidth - leftX, L"Glow mode",
+                      teamGlowMode, glowModes, 2);
         }
-        const float featureY = *teamBoxes ? firstY + 324 : firstY + 138;
-        DrawToggle(l, leftX, featureY, leftColorWidth, L"Health bar",
-                   L"Show health bar", teamHealth, teamHealthColor);
-        DrawToggle(l, leftX, featureY + 66, leftColorWidth, L"Health value",
-                   L"Show health value", teamHealthValues, teamHealthValueColor);
-        DrawToggle(l, leftX, featureY + 132, leftColorWidth, L"Skeleton",
-                   L"Render enemy skeleton", teamBones, teamNameColor);
-
-        DrawToggle(l, rightX, firstY, rightColorWidth, L"Hero names",
-                   L"Show hero names", teamNames, teamNameColor);
-        DrawToggle(l, rightX, firstY + 72, rightColorWidth, L"Player names",
-                   L"Show player names", teamPlayerNames, teamPlayerColor);
-        DrawToggle(l, rightX, firstY + 144, rightColorWidth, L"Distance",
-                   L"Show distance to enemy", teamDistance, nullptr);
-        DrawToggle(l, rightX, firstY + 216, rightColumnWidth, L"Snaplines",
-                   L"Draw lines to enemy", teamSnaplines, nullptr);
-        DrawToggle(l, rightX, firstY + 288, rightColorWidth, L"Model glow",
-                   L"Glow on enemy model", &glowEnabled, teamGlowColor);
-        const wchar_t* glowModes[] = {L"HP-based fill", L"Normal fill"};
-        DrawCombo(l, 401, rightX, firstY + 354, rightColorWidth, L"Glow mode",
-                  &glowMode, glowModes, 2);
-        }
+        } else {
+            DrawSectionHeading(leftX, firstY + 18,
+                               rightX + rightColumnWidth - leftX, L"Appearance");
+            DrawToggle(l, leftX, firstY + 58,
+                       rightX + rightColumnWidth - leftX, L"Enable ESP", L"", teamEsp);
+            DrawSlider(l, leftX, firstY + 128,
+                       rightX + rightColumnWidth - leftX, L"Box thickness",
+                       teamBoxThickness, 0.5f, 4.0f, L"%.2f px");
+            DrawSlider(l, leftX, firstY + 198,
+                       rightX + rightColumnWidth - leftX, L"Corner length",
+                       teamCornerLength, 0.10f, 0.35f, L"%.2f");
+            const wchar_t* glowModes[] = {L"HP-based fill", L"Normal fill"};
+            int* teamGlowMode = g.visualTeam == 0 ? &enemyGlowMode : &allyGlowMode;
+            DrawCombo(l, 401, leftX, firstY + 268,
+                      rightX + rightColumnWidth - leftX, L"Glow mode",
+                      teamGlowMode, glowModes, 2);
         }
     } else if (g.tab == 1) {
         if (g.aimSubtab == 0) {
-        DrawToggle(l, leftX, firstY, 280, L"Aim assist",
+        DrawToggle(l, leftX, firstY, columnWidth, L"Aim assist",
                    L"Enable player targeting", &aimAssist);
         if (aimAssist) {
-        DrawKeyBind(l, leftX + 290, firstY, 159,
+        // Keep the key capture in the left column.  The old inline placement
+        // crossed the column divider and overpainted the Target point combo.
+        DrawKeyBind(l, leftX, firstY + 54, columnWidth,
                     aimKeyCapture, aimAssistKey, &aimKeyCapture);
-        DrawToggle(l, leftX, firstY + 72, columnWidth, L"Visibility check",
+        DrawToggle(l, leftX, firstY + 106, columnWidth, L"Visibility check",
                    L"Ignore occluded targets", &aimVisibilityCheck);
         int aimMode = aimMixedMode ? 2 : (aimSilentMode ? 1 : 0);
         const wchar_t* aimModes[] = {L"Normal", L"pSilent", L"Mixed"};
-        DrawCombo(l, 101, leftX, firstY + 154, columnWidth, L"Aim mode",
+        DrawCombo(l, 101, leftX, firstY + 160, columnWidth, L"Aim mode",
                   &aimMode, aimModes, 3);
         aimSilentMode = aimMode == 1;
         aimMixedMode = aimMode == 2;
         int bindMode = aimToggleMode ? 1 : 0;
         const wchar_t* bindModes[] = {L"Hold", L"Toggle"};
-        DrawCombo(l, 102, leftX, firstY + 214, columnWidth, L"Activation",
+        DrawCombo(l, 102, leftX, firstY + 231, columnWidth, L"Activation",
                   &bindMode, bindModes, 2);
         aimToggleMode = bindMode == 1;
         int targetMode = static_cast<int>(aimTargetMode);
@@ -1287,17 +2037,17 @@ void RenderD2DMenu(std::size_t playerCount) {
         aimTargetMode = static_cast<AimTargetMode>(std::clamp(targetMode, 0, 2));
         int selectionMode = static_cast<int>(aimSelectionMode);
         const wchar_t* selections[] = {L"Crosshair", L"Distance", L"Health"};
-        DrawCombo(l, 104, rightX, firstY + 60, columnWidth, L"Target selection",
+        DrawCombo(l, 104, rightX, firstY + 71, columnWidth, L"Target selection",
                   &selectionMode, selections, 3);
         aimSelectionMode = static_cast<AimSelectionMode>(std::clamp(selectionMode, 0, 2));
         const float previousAimFov = aimFov;
         const float previousPitchSmooth = aimPitchSmooth;
         const float previousYawSmooth = aimYawSmooth;
-        DrawSlider(l, rightX, firstY + 130, columnWidth, L"Aim FOV",
+        DrawSlider(l, rightX, firstY + 142, columnWidth, L"Aim FOV",
                    &aimFov, 40.0f, 600.0f, L"%.0f px");
-        DrawSlider(l, rightX, firstY + 192, columnWidth, L"Pitch smoothing",
+        DrawSlider(l, rightX, firstY + 213, columnWidth, L"Pitch smoothing",
                    &aimPitchSmooth, 1.0f, 20.0f, L"%.1f");
-        DrawSlider(l, rightX, firstY + 254, columnWidth, L"Yaw smoothing",
+        DrawSlider(l, rightX, firstY + 284, columnWidth, L"Yaw smoothing",
                    &aimYawSmooth, 1.0f, 20.0f, L"%.1f");
         static bool aimSliderConfigDirty = false;
         if (aimFov != previousAimFov ||
@@ -1308,20 +2058,22 @@ void RenderD2DMenu(std::size_t playerCount) {
             SaveConfig();
             aimSliderConfigDirty = false;
         }
-        DrawToggle(l, rightX, firstY + 316, columnWidth, L"Only Yaw",
-                   L"Adjust horizontal aim only", &aimOnlyYaw);
-        DrawToggle(l, rightX, firstY + 388, columnWidth, L"Lock Target",
-                   L"Keep the current target while valid", &aimLockTarget);
-        DrawSlider(l, leftX, firstY + 280, columnWidth, L"Hitchance",
+        DrawSectionHeading(leftX, firstY + 302, columnWidth, L"Accuracy");
+        DrawSlider(l, leftX, firstY + 343, columnWidth, L"Hitchance",
                    &aimHitchance, 0.0f, 100.0f, L"%.0f%%");
-        DrawToggle(l, leftX, firstY + 342, columnWidth, L"Backtrack",
+        DrawToggle(l, leftX, firstY + 414, columnWidth, L"Backtrack",
                    L"Aim at a recent target position", &aimBacktrack);
         if (aimBacktrack)
-            DrawSlider(l, leftX, firstY + 404, columnWidth, L"Backtrack time",
+            DrawSlider(l, leftX, firstY + 468, columnWidth, L"Backtrack time",
                        &aimBacktrackMs, 1.0f, 1000.0f, L"%.0f ms");
-        DrawToggle(l, rightX, firstY + 460, columnWidth, L"Draw FOV circle",
+        DrawSectionHeading(rightX, firstY + 355, columnWidth, L"Behavior");
+        DrawToggle(l, rightX, firstY + 396, columnWidth, L"Only Yaw",
+                   L"Adjust horizontal aim only", &aimOnlyYaw);
+        DrawToggle(l, rightX, firstY + 450, columnWidth, L"Lock Target",
+                   L"Keep the current target while valid", &aimLockTarget);
+        DrawToggle(l, rightX, firstY + 504, columnWidth, L"Draw FOV circle",
                    L"Show active target radius", &drawFovCircle);
-        DrawSlider(l, rightX, firstY + 532, columnWidth, L"FOV opacity",
+        DrawSlider(l, rightX, firstY + 558, columnWidth, L"FOV opacity",
                    &fovCircleAlpha, 0.0f, 255.0f, L"%.0f");
         }
         } else if (g.aimSubtab == 99) {
@@ -1329,60 +2081,74 @@ void RenderD2DMenu(std::size_t playerCount) {
                        L"Enable creep targeting", &farmAssist);
             if (farmAssist) {
             int farmMode = farmMixedMode ? 2 : (farmSilentMode ? 1 : 0);
-            DrawCombo(l, 301, leftX, firstY + 72, columnWidth, L"Farm mode",
+            DrawCombo(l, 301, leftX, firstY + 70, columnWidth, L"Farm mode",
                       &farmMode, kFarmModes, 3);
             farmSilentMode = farmMode == 1;
             farmMixedMode = farmMode == 2;
             int farmBind = farmToggleMode ? 1 : 0;
-            DrawCombo(l, 302, leftX, firstY + 132, 280, L"Activation",
+            DrawCombo(l, 302, leftX, firstY + 140, columnWidth, L"Activation",
                       &farmBind, kFarmActivationModes, 2);
             farmToggleMode = farmBind == 1;
-            DrawKeyBind(l, leftX + 290, firstY + 132, 159,
+            DrawKeyBind(l, leftX, firstY + 210, columnWidth,
                         farmKeyCapture, farmAssistKey, &farmKeyCapture);
-            if (!farmSilentMode || farmMixedMode) {
-                DrawSlider(l, leftX, firstY + 194, columnWidth, L"Farm FOV",
-                           &farmFov, 40.0f, 600.0f, L"%.0f px");
-                DrawSlider(l, leftX, firstY + 256, columnWidth, L"Smoothing",
-                           &farmAimSmooth, 1.0f, 20.0f, L"%.1f");
-            }
+             if (!farmSilentMode || farmMixedMode) {
+                 DrawSlider(l, leftX, firstY + 280, columnWidth, L"Farm FOV",
+                            &farmFov, 40.0f, 600.0f, L"%.0f px");
+                 DrawSlider(l, leftX, firstY + 350, columnWidth, L"Smoothing",
+                            &farmAimSmooth, 1.0f, 20.0f, L"%.1f");
+             }
+             const float farmCircleY = (!farmSilentMode || farmMixedMode)
+                ? firstY + 420.0f : firstY + 280.0f;
+             DrawToggle(l, leftX, farmCircleY, columnWidth, L"Farm FOV circle",
+                        L"Show the creep aim radius", &drawFarmFovCircle);
+             if (drawFarmFovCircle)
+                 DrawSlider(l, leftX, farmCircleY + 72, columnWidth, L"FOV opacity",
+                            &farmFovAlpha, 0.0f, 255.0f, L"%.0f");
             }
         } else {
             DrawToggle(l, leftX, firstY, columnWidth, L"Creep aim",
                        L"Enable creep targeting", &farmAssist);
             if (farmAssist) {
                 int farmMode = farmMixedMode ? 2 : (farmSilentMode ? 1 : 0);
-                DrawCombo(l, 301, leftX, firstY + 72, columnWidth, L"Farm mode",
+                DrawCombo(l, 301, leftX, firstY + 70, columnWidth, L"Farm mode",
                           &farmMode, kFarmModes, 3);
                 farmSilentMode = farmMode == 1;
                 farmMixedMode = farmMode == 2;
                 int farmBind = farmToggleMode ? 1 : 0;
-                DrawCombo(l, 302, leftX, firstY + 132, 280, L"Activation",
+                DrawCombo(l, 302, leftX, firstY + 140, columnWidth, L"Activation",
                           &farmBind, kFarmActivationModes, 2);
                 farmToggleMode = farmBind == 1;
-                DrawKeyBind(l, leftX + 290, firstY + 132, 159,
+                DrawKeyBind(l, leftX, firstY + 210, columnWidth,
                             farmKeyCapture, farmAssistKey, &farmKeyCapture);
-                if (!farmSilentMode || farmMixedMode) {
-                    DrawSlider(l, leftX, firstY + 194, columnWidth, L"Farm FOV",
-                               &farmFov, 40.0f, 600.0f, L"%.0f px");
-                    DrawSlider(l, leftX, firstY + 256, columnWidth, L"Smoothing",
-                               &farmAimSmooth, 1.0f, 20.0f, L"%.1f");
-                }
-            }
+                 if (!farmSilentMode || farmMixedMode) {
+                     DrawSlider(l, leftX, firstY + 280, columnWidth, L"Farm FOV",
+                                &farmFov, 40.0f, 600.0f, L"%.0f px");
+                     DrawSlider(l, leftX, firstY + 350, columnWidth, L"Smoothing",
+                                &farmAimSmooth, 1.0f, 20.0f, L"%.1f");
+                 }
+                 const float farmCircleY = (!farmSilentMode || farmMixedMode)
+                     ? firstY + 420.0f : firstY + 280.0f;
+                 DrawToggle(l, leftX, farmCircleY, columnWidth, L"Farm FOV circle",
+                            L"Show the creep aim radius", &drawFarmFovCircle);
+                 if (drawFarmFovCircle)
+                     DrawSlider(l, leftX, farmCircleY + 72, columnWidth, L"FOV opacity",
+                                &farmFovAlpha, 0.0f, 255.0f, L"%.0f");
+             }
 
             DrawToggle(l, rightX, firstY, columnWidth, L"Orb aim",
                        L"Aim at valid soul orbs", &autoLastHitOrbs);
             if (autoLastHitOrbs) {
                 int fireMode = autoLastHitOrbsAutoFire ? 0 : 1;
                 const wchar_t* fireModes[] = {L"Auto fire", L"Player fire"};
-                DrawCombo(l, 203, rightX, firstY + 72, columnWidth, L"Fire mode",
+                DrawCombo(l, 203, rightX, firstY + 70, columnWidth, L"Fire mode",
                           &fireMode, fireModes, 2);
                 autoLastHitOrbsAutoFire = fireMode == 0;
                 int orbBind = autoLastHitOrbsToggleMode ? 1 : 0;
                 const wchar_t* binds[] = {L"Hold", L"Toggle"};
-                DrawCombo(l, 204, rightX, firstY + 132, 280, L"Activation",
+                DrawCombo(l, 204, rightX, firstY + 140, columnWidth, L"Activation",
                           &orbBind, binds, 2);
                 autoLastHitOrbsToggleMode = orbBind == 1;
-                DrawKeyBind(l, rightX + 290, firstY + 132, 159,
+                DrawKeyBind(l, rightX, firstY + 210, columnWidth,
                             autoLastHitOrbsKeyCapture, autoLastHitOrbsKey,
                             &autoLastHitOrbsKeyCapture);
             }
@@ -1398,16 +2164,16 @@ void RenderD2DMenu(std::size_t playerCount) {
         farmSilentMode = farmMode == 1;
         farmMixedMode = farmMode == 2;
         int farmBind = farmToggleMode ? 1 : 0;
-        DrawCombo(l, 302, leftX, firstY + 214, columnWidth, L"Activation",
+        DrawCombo(l, 302, leftX, firstY + 230, columnWidth, L"Activation",
                   &farmBind, kFarmActivationModes, 2);
         farmToggleMode = farmBind == 1;
-        DrawSlider(l, leftX, firstY + 280, columnWidth, L"Farm FOV",
+        DrawSlider(l, leftX, firstY + 304, columnWidth, L"Farm FOV",
                    &farmFov, 40.0f, 600.0f, L"%.0f px");
-        DrawSlider(l, leftX, firstY + 342, columnWidth, L"Smoothing",
+        DrawSlider(l, leftX, firstY + 378, columnWidth, L"Smoothing",
                    &farmAimSmooth, 1.0f, 20.0f, L"%.1f");
-        Text(L"Farm key", Rect(leftX, firstY + 408, leftX + columnWidth, firstY + 436),
+        Text(L"Farm key", Rect(leftX, firstY + 452, leftX + columnWidth, firstY + 480),
              g.regular.Get(), Muted());
-        DrawKeyBind(l, leftX, firstY + 442, columnWidth,
+        DrawKeyBind(l, leftX, firstY + 486, columnWidth,
                     farmKeyCapture, farmAssistKey, &farmKeyCapture);
 
         DrawToggle(l, rightX, firstY, columnWidth, L"Orb ESP",
@@ -1422,39 +2188,48 @@ void RenderD2DMenu(std::size_t playerCount) {
                   &fireMode, fireModes, 2);
         autoLastHitOrbsAutoFire = fireMode == 0;
         int orbBind = autoLastHitOrbsToggleMode ? 1 : 0;
-        DrawCombo(l, 204, rightX, firstY + 286, columnWidth, L"Activation",
+        DrawCombo(l, 204, rightX, firstY + 302, columnWidth, L"Activation",
                   &orbBind, kFarmActivationModes, 2);
         autoLastHitOrbsToggleMode = orbBind == 1;
-        Text(L"Orb key", Rect(rightX, firstY + 350, rightX + columnWidth, firstY + 378),
+        Text(L"Orb key", Rect(rightX, firstY + 376, rightX + columnWidth, firstY + 404),
              g.regular.Get(), Muted());
-        DrawKeyBind(l, rightX, firstY + 384, columnWidth,
+        DrawKeyBind(l, rightX, firstY + 410, columnWidth,
                     autoLastHitOrbsKeyCapture, autoLastHitOrbsKey,
                     &autoLastHitOrbsKeyCapture);
     } else {
         DrawToggle(l, leftX, firstY, columnWidth, L"Auto parry",
                    L"Automatically use parry", &autoParry);
-        DrawToggle(l, leftX, firstY + 72, columnWidth, L"Spectator list",
+        DrawToggle(l, leftX, firstY + 54, columnWidth, L"Spectator list",
                    L"Show current observers", &drawSpectatorList);
-        DrawToggle(l, leftX, firstY + 144, 280, L"Free camera",
+        DrawToggle(l, leftX, firstY + 108, columnWidth, L"Free camera",
                    L"Detach camera from player", &freeCam);
         if (freeCam) {
-            DrawKeyBind(l, leftX + 290, firstY + 144, 159,
+            DrawKeyBind(l, leftX, firstY + 162, columnWidth,
                         freeCamKeyCapture, freeCamKey, &freeCamKeyCapture);
-            DrawSlider(l, leftX, firstY + 226, columnWidth, L"Freecam speed",
+            DrawSlider(l, leftX, firstY + 214, columnWidth, L"Freecam speed",
                        &freeCamSpeed, 50.0f, 5000.0f, L"%.0f u/s");
         }
 
-        Text(L"Session", Rect(rightX, firstY, rightX + columnWidth, firstY + 38),
-             g.semibold.Get(), White());
+        DrawToggle(l, rightX, firstY, columnWidth, L"FOV Changer",
+                   L"Override the normal camera field of view", &fovChangerEnabled);
+        DrawSlider(l, rightX, firstY + 54, columnWidth, L"Camera FOV",
+                   &cameraFov, 60.0f, 140.0f, L"%.0f deg");
+        DrawToggle(l, rightX, firstY + 118, columnWidth, L"Override Scope FOV",
+                   L"Use a separate field of view while scoped", &overrideScopeFov);
+        DrawSlider(l, rightX, firstY + 172, columnWidth, L"Scoped FOV",
+                   &scopedCameraFov, 20.0f, 140.0f, L"%.0f deg");
+
+        DrawSectionHeading(rightX, firstY + 246, columnWidth, L"Session");
         wchar_t status[80]{};
         std::swprintf(status, 80, L"%.0f FPS    %zu players", io.Framerate, playerCount);
-        Text(status, Rect(rightX, firstY + 45, rightX + columnWidth, firstY + 80),
+        Text(status, Rect(rightX + 10, firstY + 286,
+             rightX + columnWidth, firstY + 321),
              g.regular.Get(), Muted());
         Text(L"Unload the module and restore all hooks safely.",
-             Rect(rightX, firstY + 112, rightX + columnWidth, firstY + 152),
+             Rect(rightX + 10, firstY + 334, rightX + columnWidth, firstY + 374),
              g.regular.Get(), Muted());
-        const D2D1_RECT_F unload = Rect(rightX, firstY + 170,
-                                       rightX + columnWidth, firstY + 214);
+        const D2D1_RECT_F unload = Rect(rightX, firstY + 392,
+                                       rightX + columnWidth, firstY + 436);
         GradientRounded(unload, 7, Color(1.0f, 0.10f, 0.19f), Color(0.60f, 0.01f, 0.06f), true);
         InnerGlow(unload, 7);
         Text(L"Unload DLL", unload, g.centered.Get(), White());
@@ -1465,12 +2240,14 @@ void RenderD2DMenu(std::size_t playerCount) {
     const float rightMax = ColumnMaxScroll(g.rightContentBottom);
     g.leftColumnScroll = std::clamp(g.leftColumnScroll, -leftMax, 0.0f);
     g.rightColumnScroll = std::clamp(g.rightColumnScroll, -rightMax, 0.0f);
-    DrawColumnScrollbar(l, 866.0f, viewportTop, g.leftContentBottom,
+    DrawColumnScrollbar(l, 642.0f, viewportTop, g.leftContentBottom,
                         g.leftColumnScroll);
-    DrawColumnScrollbar(l, 1402.0f, viewportTop, g.rightContentBottom,
+    DrawColumnScrollbar(l, visualEditor ? 1422.0f : 984.0f,
+                        viewportTop, g.rightContentBottom,
                         g.rightColumnScroll);
     g.target->PopAxisAlignedClip();
     DrawPopup(l);
+    DrawMenuSettingsPanel(settingsLayout);
     if (popupSelectionId == 101) {
         aimSilentMode = popupSelectionValue == 1;
         aimMixedMode = popupSelectionValue == 2;
@@ -1489,6 +2266,9 @@ void RenderD2DMenu(std::size_t playerCount) {
         autoLastHitOrbsAutoFire = popupSelectionValue == 0;
     } else if (popupSelectionId == 204) {
         autoLastHitOrbsToggleMode = popupSelectionValue == 1;
+    } else if (popupSelectionId == 401) {
+        if (g.visualTeam == 0) enemyGlowMode = popupSelectionValue;
+        else if (g.visualTeam == 1) allyGlowMode = popupSelectionValue;
     }
     if (pushedMenuLayer)
         g.target->PopLayer();
@@ -1499,6 +2279,122 @@ void RenderD2DMenu(std::size_t playerCount) {
     else if (result == D2DERR_RECREATE_TARGET)
         ResetTarget();
     g.wasOpen = menuOpen;
+}
+
+bool GetD2DPreviewCaptureRect(float& left, float& top,
+                              float& right, float& bottom) {
+    if (!menuOpen || !g.ready || g.tab != 0 || g.visualTeam >= 2 ||
+        !g.positionInitialized || g.menuAlpha <= 0.01f ||
+        g.draggingWindow) return false;
+    ImGuiIO& io = ImGui::GetIO();
+    const float scale = (std::min)(io.DisplaySize.x * 0.925f / kDesignWidth,
+                                   io.DisplaySize.y * 0.958f / kDesignHeight) * 0.54f;
+    const float safeScale = (std::max)(0.32f, scale);
+    constexpr float cardTop = 0.0f;
+    constexpr float x = 1020.0f;
+    // Keep Panorama's physical capture exactly aligned with DrawHeroEspPreview.
+    // The old height - 260 value was from the pre-flow tile layout and made
+    // the captured animation stretch vertically into the larger stage.
+    constexpr float tileRows = 3.0f;
+    constexpr float tileHeight = 36.0f;
+    constexpr float tileGap = 8.0f;
+    constexpr float bottomPadding = 16.0f;
+    constexpr float captureBottom = kDesignHeight -
+        (tileRows * tileHeight + (tileRows - 1.0f) * tileGap + bottomPadding) - 16.0f;
+    // This function is called before RenderD2DMenu. Predict the active drag
+    // position here so Panorama never receives the previous frame's window
+    // coordinates while the user moves the menu.
+    float windowX = g.windowX;
+    float windowY = g.windowY;
+    if (g.draggingWindow && io.MouseDown[0]) {
+        const float windowWidth = kDesignWidth * safeScale;
+        const float visibleEdge = 70.0f * safeScale;
+        windowX = std::clamp(io.MousePos.x - g.dragGrabX,
+                             -windowWidth + visibleEdge,
+                             io.DisplaySize.x - visibleEdge);
+        windowY = std::clamp(io.MousePos.y - g.dragGrabY, 0.0f,
+                             (std::max)(0.0f, io.DisplaySize.y - visibleEdge));
+    }
+    left = std::floor(windowX + (x + 15.0f) * safeScale);
+    top = std::floor(windowY + (cardTop + 74.0f) * safeScale);
+    right = std::floor(windowX + (x + 410.0f - 15.0f) * safeScale);
+    bottom = std::floor(windowY + captureBottom * safeScale);
+    return right > left && bottom > top;
+}
+
+void DrawMenuSettingsPanel(const Layout& l) {
+    if (!g.settingsOpen) return;
+    const D2D1_RECT_F settings = Rect(620, 68, 950, 412);
+    GlowRounded(settings, 9, Color(0, 0, 0, 0.82f), 8, 2.0f);
+    FillRounded(settings, 9, ThemeSurface(0.010f, 0.040f, 1.0f));
+    StrokeRounded(settings, 9, Border(), 1.0f);
+    Text(L"Menu settings", Rect(640, 83, 900, 113), g.semibold.Get(), White());
+    Text(L"Theme palette", Rect(640, 116, 790, 140), g.regular.Get(), Muted());
+
+    float hue{}, saturation{}, value{};
+    RGBtoHSV(menuAccentColor[0], menuAccentColor[1], menuAccentColor[2],
+             hue, saturation, value);
+    const D2D1_RECT_F palette = Rect(640, 146, 840, 346);
+    const D2D1_RECT_F saturationBar = Rect(854, 146, 878, 346);
+    constexpr int paletteSteps = 64;
+    for (int py = 0; py < paletteSteps; ++py) {
+        const float brightness = 1.0f - static_cast<float>(py) / (paletteSteps - 1);
+        for (int px = 0; px < paletteSteps; ++px) {
+            const float colorHue = static_cast<float>(px) / (paletteSteps - 1);
+            float r{}, g{}, b{};
+            HSVtoRGB(colorHue, saturation, brightness, r, g, b);
+            const float x0 = palette.left + px * (palette.right - palette.left) / paletteSteps;
+            const float y0 = palette.top + py * (palette.bottom - palette.top) / paletteSteps;
+            const float x1 = palette.left + (px + 1) * (palette.right - palette.left) / paletteSteps;
+            const float y1 = palette.top + (py + 1) * (palette.bottom - palette.top) / paletteSteps;
+            // Overlap cells slightly to prevent dark antialiasing seams.
+            FillRect(Rect(x0 - 0.25f, y0 - 0.25f, x1 + 0.75f, y1 + 0.75f),
+                     Color(r, g, b));
+        }
+    }
+    for (int i = 0; i < paletteSteps; ++i) {
+        float r{}, g{}, b{};
+        const float sat = 1.0f - static_cast<float>(i) / (paletteSteps - 1);
+        HSVtoRGB(hue, sat, value, r, g, b);
+        const float y0 = saturationBar.top + i * (saturationBar.bottom - saturationBar.top) / paletteSteps;
+        const float y1 = saturationBar.top + (i + 1) * (saturationBar.bottom - saturationBar.top) / paletteSteps;
+        FillRect(Rect(saturationBar.left - 0.25f, y0 - 0.25f,
+                      saturationBar.right + 0.25f, y1 + 0.75f), Color(r, g, b));
+    }
+    StrokeRounded(palette, 4, Border(), 1.0f);
+    StrokeRounded(saturationBar, 4, Border(), 1.0f);
+    const float markerX = palette.left + hue * (palette.right - palette.left);
+    const float markerY = palette.top + (1.0f - value) * (palette.bottom - palette.top);
+    SetBrush(White());
+    g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(markerX, markerY), 6, 6),
+                          g.brush.Get(), 1.5f);
+    const float saturationY = saturationBar.top + (1.0f - saturation) *
+                              (saturationBar.bottom - saturationBar.top);
+    Line(D2D1::Point2F(saturationBar.left - 3, saturationY),
+         D2D1::Point2F(saturationBar.right + 3, saturationY), White(), 2.0f);
+    bool changed = false;
+    if (l.down && Contains(palette, l.mouse)) {
+        hue = std::clamp((l.mouse.x - palette.left) / (palette.right - palette.left), 0.0f, 1.0f);
+        value = std::clamp(1.0f - (l.mouse.y - palette.top) / (palette.bottom - palette.top), 0.0f, 1.0f);
+        changed = true;
+    } else if (l.down && Contains(saturationBar, l.mouse)) {
+        saturation = std::clamp(1.0f - (l.mouse.y - saturationBar.top) /
+                                (saturationBar.bottom - saturationBar.top), 0.0f, 1.0f);
+        changed = true;
+    }
+    if (changed) HSVtoRGB(hue, saturation, value,
+                          menuAccentColor[0], menuAccentColor[1], menuAccentColor[2]);
+    wchar_t hex[16]{};
+    std::swprintf(hex, 16, L"#%02X%02X%02X",
+                  static_cast<int>(menuAccentColor[0] * 255.0f),
+                  static_cast<int>(menuAccentColor[1] * 255.0f),
+                  static_cast<int>(menuAccentColor[2] * 255.0f));
+    FillRounded(Rect(640, 362, 878, 392), 3, Color(1, 1, 1, 0.035f));
+    StrokeRounded(Rect(640, 362, 878, 392), 3, Border(), 0.8f);
+    Text(hex, Rect(640, 362, 878, 392), g.centered.Get(), White());
+    static bool themeDirty = false;
+    themeDirty = themeDirty || changed;
+    if (themeDirty && !l.down) { SaveConfig(); themeDirty = false; }
 }
 
 void ShutdownD2DMenu() {
