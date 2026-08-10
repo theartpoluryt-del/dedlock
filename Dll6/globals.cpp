@@ -96,6 +96,10 @@ float enemyHealthColor[4] = {0.20f, 1.00f, 0.25f, 1.00f};
 float teammateHealthColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
 float boxThickness = 1.20f;
 float cornerBoxLength = 0.24f;
+float enemyBoxThickness = 1.20f;
+float allyBoxThickness = 1.20f;
+float enemyCornerBoxLength = 0.24f;
+float allyCornerBoxLength = 0.24f;
 bool fovChangerEnabled = false;
 bool overrideScopeFov = false;
 int menuTheme = 0;
@@ -190,7 +194,11 @@ void LoadConfig() {
         else if (key == "drawPlayerNames") drawPlayerNames = value;
         else if (key == "cornerBoxes") cornerBoxes = value;
         else if (key == "boxThickness") boxThickness = static_cast<float>(number);
-        else if (key == "cornerBoxLength") cornerBoxLength = static_cast<float>(number);
+        else if (key == "cornerBoxLength") cornerBoxLength = std::clamp(static_cast<float>(number), 0.10f, 0.35f);
+        else if (key == "enemyBoxThickness") enemyBoxThickness = static_cast<float>(number);
+        else if (key == "allyBoxThickness") allyBoxThickness = static_cast<float>(number);
+        else if (key == "enemyCornerBoxLength") enemyCornerBoxLength = std::clamp(static_cast<float>(number), 0.10f, 0.35f);
+        else if (key == "allyCornerBoxLength") allyCornerBoxLength = std::clamp(static_cast<float>(number), 0.10f, 0.35f);
         else if (key == "enemyBoxR") enemyBoxColor[0] = static_cast<float>(number);
         else if (key == "enemyBoxG") enemyBoxColor[1] = static_cast<float>(number);
         else if (key == "enemyBoxB") enemyBoxColor[2] = static_cast<float>(number);
@@ -389,6 +397,10 @@ void SaveConfig() {
            << "cornerBoxes " << cornerBoxes << '\n'
            << "boxThickness " << boxThickness << '\n'
            << "cornerBoxLength " << cornerBoxLength << '\n'
+           << "enemyBoxThickness " << enemyBoxThickness << '\n'
+           << "allyBoxThickness " << allyBoxThickness << '\n'
+           << "enemyCornerBoxLength " << enemyCornerBoxLength << '\n'
+           << "allyCornerBoxLength " << allyCornerBoxLength << '\n'
            << "enemyBoxR " << enemyBoxColor[0] << '\n'
            << "enemyBoxG " << enemyBoxColor[1] << '\n'
            << "enemyBoxB " << enemyBoxColor[2] << '\n'

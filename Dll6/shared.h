@@ -112,6 +112,8 @@ extern bool allyCreepEspEnabled, allyCreepBoxesEnabled, allyCreepCornerBoxesEnab
 extern bool allyCreepHealthEnabled, allyCreepHealthValuesEnabled, allyCreepDistanceEnabled;
 extern float allyCreepBoxColor[4], allyCreepHealthColor[4], allyCreepHealthValueColor[4];
 extern float boxThickness, cornerBoxLength;
+extern float enemyBoxThickness, allyBoxThickness;
+extern float enemyCornerBoxLength, allyCornerBoxLength;
 extern bool fovChangerEnabled, overrideScopeFov;
 extern int menuTheme; extern float menuAccentColor[4];
 extern float cameraFov, scopedCameraFov;

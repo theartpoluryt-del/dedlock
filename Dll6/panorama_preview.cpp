@@ -1019,6 +1019,8 @@ void UpdatePanoramaPreview(IDXGISwapChain* swapChain,
         appliedGeneration.load(std::memory_order_acquire);
     const bool reloadPending = !rendererReady.load(std::memory_order_acquire) &&
         !reloadExhausted.load(std::memory_order_acquire);
+    // UI script execution is expensive enough to stall the render thread when
+    // delivered synchronously. Keep it on the window message queue.
     if ((requestPending || reloadPending || contextChanged) &&
         gameWindow && now - lastUiDispatchAt >= 16) {
         PostMessageW(gameWindow, PanoramaPreviewUiMessage, 0, 0);
@@ -1095,8 +1097,10 @@ void UpdatePanoramaPreview(IDXGISwapChain* swapChain,
 }
 
 ID3D11Texture2D* GetPanoramaPreviewTexture() {
-    return panelVisible.load(std::memory_order_acquire) &&
-        rendererReady.load(std::memory_order_acquire) &&
+    // Retain the most recent valid frame while the source panel is hidden
+    // during a menu drag.  D2D can then move the preview smoothly without a
+    // delayed, duplicate Panorama panel being visible elsewhere.
+    return rendererReady.load(std::memory_order_acquire) &&
         captureSerial.load(std::memory_order_acquire) != 0
         ? captureTexture.Get() : nullptr;
 }
@@ -1344,6 +1348,18 @@ void ProcessPanoramaPreviewUiThread() {
 }
 
 void ShutdownPanoramaPreview() {
+    // The Panorama source is an independent game panel.  Remove it while the
+    // RunScript hook is still live; otherwise it can outlast an unload as a
+    // black/stale preview rectangle on screen.
+    const uintptr_t engine = activeCuiEngine.load(std::memory_order_acquire);
+    const uintptr_t contextPanel = activeContextPanel.load(std::memory_order_acquire);
+    if (engine && contextPanel && originalRunScript) {
+        constexpr const char* removePreviewScript = R"JS(
+(function(){var r=$.GetContextPanel();while(r.GetParent())r=r.GetParent();
+var p=r.FindChildTraverse('Dll6_esp_preview');if(p)p.DeleteAsync(0);})();
+)JS";
+        RunPanoramaScript(engine, contextPanel, removePreviewScript);
+    }
     if (runScriptTarget) {
         MH_DisableHook(runScriptTarget);
         MH_RemoveHook(runScriptTarget);

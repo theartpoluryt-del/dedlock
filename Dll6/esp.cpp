@@ -1818,7 +1818,7 @@ void RenderESP(const std::vector<PlayerData>& players) {
                     drawList->AddRect(ImVec2(left, top), ImVec2(right, bottom), color, 0.0f, 0,
                                       ally ? 1.0f : 1.25f);
                 } else {
-                    const float length = std::clamp((std::min)(right - left, bottom - top) * cornerBoxLength,
+                    const float length = std::clamp((std::min)(right - left, bottom - top) * std::clamp(cornerBoxLength, 0.10f, 0.35f),
                                                     4.0f, 32.0f);
                     const float thickness = std::clamp(boxThickness, 0.5f, 4.0f);
                     drawList->AddLine(ImVec2(left, top), ImVec2(left + length, top), color, thickness);
@@ -1900,12 +1900,13 @@ void RenderESP(const std::vector<PlayerData>& players) {
         return ImColor(color[0], color[1], color[2], color[3]);
     };
     const auto addCornerBox = [&](ImDrawList* list, float left, float top,
-                                  float right, float bottom, ImU32 color) {
+                                  float right, float bottom, ImU32 color,
+                                  float cornerLength, float thicknessValue) {
         const float width = right - left;
         const float height = bottom - top;
-        const float length = std::clamp(cornerBoxLength, 0.05f, 0.50f) *
+        const float length = std::clamp(cornerLength, 0.05f, 0.35f) *
             (std::min)(width, height);
-        const float thickness = std::clamp(boxThickness, 0.5f, 4.0f);
+        const float thickness = std::clamp(thicknessValue, 0.5f, 4.0f);
         list->AddLine(ImVec2(left, top), ImVec2(left + length, top), color, thickness);
         list->AddLine(ImVec2(left, top), ImVec2(left, top + length), color, thickness);
         list->AddLine(ImVec2(right - length, top), ImVec2(right, top), color, thickness);
@@ -2039,6 +2040,8 @@ void RenderESP(const std::vector<PlayerData>& players) {
         const uint8_t localTeam = currentLocalPawn
             ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
         const bool ally = localTeam != 0 && player.team == localTeam;
+        const float teamBoxThickness = ally ? allyBoxThickness : enemyBoxThickness;
+        const float teamCornerLength = ally ? allyCornerBoxLength : enemyCornerBoxLength;
         const bool teamEsp = ally ? allyEspEnabled : enemyEspEnabled;
         const bool teamSnaplines = ally ? allySnaplinesEnabled : enemySnaplinesEnabled;
         // Snaplines belong to the same team ESP channel. Do this gate before
@@ -2159,11 +2162,11 @@ void RenderESP(const std::vector<PlayerData>& players) {
         if (teamBoxes) {
             if (teamCornerBoxes) {
                 addCornerBox(drawList, frameLeft, boxTop, frameRight,
-                             screenY, boxColor);
+                             screenY, boxColor, teamCornerLength, teamBoxThickness);
             } else {
                 drawList->AddRect(ImVec2(frameLeft, boxTop),
                                   ImVec2(frameRight, screenY), boxColor,
-                                  0.0f, 0, boxThickness);
+                                  0.0f, 0, teamBoxThickness);
             }
         }
 
@@ -2220,7 +2223,7 @@ static void RenderMenuLegacy(size_t playerCount) {
             ImGui::Checkbox("Corner boxes", &cornerBoxes);
             ImGui::Checkbox("Show teammates", &drawTeammates);
             ImGui::SliderFloat("Box thickness", &boxThickness, 0.5f, 4.0f, "%.1f");
-            ImGui::SliderFloat("Corner length", &cornerBoxLength, 0.10f, 0.50f, "%.2f");
+            ImGui::SliderFloat("Corner length", &cornerBoxLength, 0.10f, 0.35f, "%.2f");
             if (ImGui::TreeNode("ESP colors")) {
                 ImGui::ColorEdit4("Enemy box", enemyBoxColor, ImGuiColorEditFlags_NoInputs);
                 ImGui::ColorEdit4("Teammate box", teammateBoxColor, ImGuiColorEditFlags_NoInputs);
@@ -2479,7 +2482,7 @@ static void RenderMenuV1(size_t playerCount) {
         Toggle("Glow", &glowEnabled);
         Toggle("FOV circle", &drawFovCircle);
         ImGui::SliderFloat("Box thickness", &boxThickness, 0.5f, 4.0f, "%.1f");
-        ImGui::SliderFloat("Corner length", &cornerBoxLength, 0.10f, 0.50f, "%.2f");
+        ImGui::SliderFloat("Corner length", &cornerBoxLength, 0.10f, 0.35f, "%.2f");
         ImGui::ColorEdit4("Enemy box color", enemyBoxColor, ImGuiColorEditFlags_NoInputs);
         ImGui::ColorEdit4("Teammate box color", teammateBoxColor, ImGuiColorEditFlags_NoInputs);
         EndCard();
@@ -2857,7 +2860,7 @@ static void RenderMenuV2(size_t playerCount) {
             Toggle("Model glow", nullptr, &glowEnabled);
             Toggle("FOV circle", nullptr, &drawFovCircle);
             Slider("Box thickness", &boxThickness, 0.5f, 4.0f, "%.1f px");
-            Slider("Corner length", &cornerBoxLength, 0.10f, 0.50f, "%.2f");
+            Slider("Corner length", &cornerBoxLength, 0.10f, 0.35f, "%.2f");
             ImGui::TextColored(secondary, "Colors");
             ImGui::ColorEdit4("Enemy##menu_v2", enemyBoxColor,
                               ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaPreviewHalf);
@@ -3380,7 +3383,7 @@ void RenderMenu(size_t playerCount) {
             Toggle("Bounding boxes", &drawBoxes, visualTeam == 0 ? enemyBoxColor : teammateBoxColor);
             Slider("Box thickness", &boxThickness, 0.5f, 4.0f, "%.2f px");
             Toggle("Corner boxes", &cornerBoxes, enemyHealthColor);
-            Slider("Corner length", &cornerBoxLength, 0.10f, 0.50f, "%.2f");
+            Slider("Corner length", &cornerBoxLength, 0.10f, 0.35f, "%.2f");
             Toggle("Health bar", &drawHealth, enemyHealthColor);
             Toggle("Health value", &drawHealthValues, teammateHealthColor);
             Toggle("Skeleton", &drawBones, enemyNameColor);
