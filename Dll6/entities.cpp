@@ -321,26 +321,39 @@ std::string GetEntityClassName(uintptr_t entity) {
     return typeName;
 }
 
-bool NotifyGlowTypeChanged(uintptr_t glow) {
-    if (!glow) return false;
-    const uintptr_t entity = glow - Offsets::Glow;
+namespace {
+bool NotifyNativeGlowRegistration(uintptr_t glow, uintptr_t entity, bool isTrooper) {
     __try {
         // The fixed callback moved with the client build and currently
         // raises an exception. Use the validated native wrapper discovered
         // from the live client image instead.
         Write<bool>(glow + Offsets::GlowEligible, true);
         Write<bool>(glow + Offsets::IsGlowing, true);
-        if (!RegisterNativeGlow(entity)) {
-            LogNativeGlow("native wrapper failed");
+        const bool registered = isTrooper
+            ? RegisterNativeTrooperGlow(entity)
+            : RegisterNativeGlow(entity);
+        if (!registered) {
+            LogNativeGlow(isTrooper ? "native trooper wrapper failed"
+                                   : "native player wrapper failed");
             return false;
         }
-        LogNativeGlow("native wrapper ok");
+        LogNativeGlow(isTrooper ? "native trooper wrapper ok"
+                                : "native player wrapper ok");
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         LogNativeGlow("native wrapper exception");
         return false;
     }
+}
+}
+
+bool NotifyGlowTypeChanged(uintptr_t glow) {
+    if (!glow) return false;
+    const uintptr_t entity = glow - Offsets::Glow;
+    const std::string className = GetEntityClassName(entity);
+    const bool isTrooper = className.find("NPC_Trooper") != std::string::npos;
+    return NotifyNativeGlowRegistration(glow, entity, isTrooper);
 }
 
 void ApplyHeroGlow(uintptr_t entity) {
@@ -415,6 +428,82 @@ void ApplyHeroGlow(uintptr_t entity) {
     // WndProc runs on Deadlock's main thread. Post there instead of mutating
     // the engine-owned render list from the Present/render thread.
     if (shouldNotify && gameWindow && oWndProc) {
+        SendMessage(gameWindow, ApplyGlowMessage, static_cast<WPARAM>(glow), 0);
+    } else if (shouldNotify) {
+        std::lock_guard lock(glowMutex);
+        queuedGlows.erase(entity);
+    }
+}
+
+void ApplyTrooperGlow(uintptr_t entity) {
+    if (!entity) return;
+    const uint8_t localTeam = currentLocalPawn
+        ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
+    const uint8_t entityTeam = Read<uint8_t>(entity + Offsets::Team);
+    const bool neutral = entityTeam == 4;
+    const bool ally = !neutral && localTeam >= 2 && localTeam <= 3 && entityTeam == localTeam;
+    const bool enabled = neutral ? neutralChams
+        : (ally ? allyTrooperChams : enemyTrooperChams);
+    const float* color = neutral ? neutralChamsColor
+        : (ally ? allyTrooperChamsColor : enemyTrooperChamsColor);
+    const uintptr_t glow = entity + Offsets::Glow;
+
+    const auto clearTrooperGlow = [&] {
+        Write<bool>(glow + Offsets::IsGlowing, false);
+        Write<bool>(glow + Offsets::GlowEligible, false);
+        Write<int>(glow + Offsets::GlowType, 0);
+        std::lock_guard lock(glowMutex);
+        registeredGlows.erase(entity);
+        queuedGlows.erase(entity);
+    };
+
+    if (!enabled) {
+        clearTrooperGlow();
+        return;
+    }
+
+    Vector3 position{};
+    if (currentLocalPositionReady && GetEntityPosition(entity, position)) {
+        const float dx = position.x - currentLocalPosition.x;
+        const float dy = position.y - currentLocalPosition.y;
+        const float dz = position.z - currentLocalPosition.z;
+        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz) / 39.37f;
+        if (!std::isfinite(distance) || distance > creepEspMaxDistance) {
+            clearTrooperGlow();
+            return;
+        }
+    }
+
+    Write<Vector3>(glow + Offsets::GlowColor, {color[0], color[1], color[2]});
+    Write<int>(glow + Offsets::GlowType, 2);
+    Write<int>(glow + Offsets::GlowTeam, -1);
+    Write<int>(glow + Offsets::GlowRange, 0);
+    Write<int>(glow + Offsets::GlowRangeMin, 0);
+    Write<ColorRGBA>(glow + Offsets::GlowColorOverride,
+                     {static_cast<uint8_t>(std::clamp(color[0], 0.0f, 1.0f) * 255.0f),
+                      static_cast<uint8_t>(std::clamp(color[1], 0.0f, 1.0f) * 255.0f),
+                      static_cast<uint8_t>(std::clamp(color[2], 0.0f, 1.0f) * 255.0f),
+                      static_cast<uint8_t>(std::clamp(color[3], 0.0f, 1.0f) * 255.0f)});
+    Write<bool>(glow + Offsets::GlowFlashing, false);
+    Write<float>(glow + Offsets::GlowTime, 0.0f);
+    Write<bool>(glow + Offsets::GlowEligible, true);
+    Write<bool>(glow + Offsets::IsGlowing, true);
+    Write<float>(entity + Offsets::GlowBackfaceMult, 1.0f);
+
+    bool shouldNotify = false;
+    {
+        std::lock_guard lock(glowMutex);
+        // An NPC is removed from this set whenever its chams channel or its
+        // distance condition becomes false. A later enable must therefore
+        // invoke the engine's generic NPC registration again.
+        if (registeredGlows.find(entity) == registeredGlows.end() &&
+            queuedGlows.insert(entity).second) {
+            shouldNotify = true;
+        }
+    }
+    if (shouldNotify && gameWindow && oWndProc) {
+        // Registration modifies the engine-owned highlight list, so it has
+        // to execute on the game window thread rather than this scan worker.
         SendMessage(gameWindow, ApplyGlowMessage, static_cast<WPARAM>(glow), 0);
     } else if (shouldNotify) {
         std::lock_guard lock(glowMutex);
@@ -772,15 +861,26 @@ void QueueOrbEntityRemoved(uint32_t handle) {
 
 void RefreshFarmTargets() {
     static ULONGLONG lastRefresh = 0;
+    static bool trooperChamsWereActive = false;
     const ULONGLONG now = GetTickCount64();
     const bool configuredFarmKeyDown = (GetAsyncKeyState(farmAssistKey) & 0x8000) != 0;
     const bool farmActive = farmAssist &&
         (farmToggleMode ? farmToggleActive : configuredFarmKeyDown);
-    if (!farmActive && !creepEspEnabled && !autoLastHitOrbs && !drawOrbEsp) {
+    const bool trooperChamsActive = enemyTrooperChams || allyTrooperChams || neutralChams;
+    const bool worldEntityScanActive = powerupEspEnabled || talonEspEnabled || campTimersEnabled;
+    // `drawCreepEsp` is used by the established Aim-page control.  Keep it
+    // wired to the scanner alongside the newer per-team Visuals controls;
+    // otherwise that control reports enabled while the worker clears every
+    // target before Creep ESP/Aim can consume it.
+    if (!farmActive && !drawCreepEsp && !creepEspEnabled && !allyCreepEspEnabled && !neutralCreepEspEnabled &&
+        !autoLastHitOrbs && !drawOrbEsp && !trooperChamsActive &&
+        !trooperChamsWereActive && !worldEntityScanActive) {
         std::lock_guard lock(farmTargetsMutex);
         farmTargets.clear();
         std::lock_guard orbLock(orbTargetsMutex);
         orbTargets.clear();
+        std::lock_guard worldLock(worldEspTargetsMutex);
+        worldEspTargets.clear();
         return;
     }
     // Flying souls can exist for less than a second.  A one-second scan
@@ -806,6 +906,13 @@ void RefreshFarmTargets() {
 
     std::vector<FarmTarget> found;
     std::vector<OrbTarget> foundOrbs;
+    std::vector<WorldEspTarget> foundWorldTargets;
+    uint32_t scannedEntities = 0;
+    uint32_t npcClasses = 0;
+    uint32_t trooperClasses = 0;
+    uint32_t trooperWithSceneNode = 0;
+    uint32_t trooperAlive = 0;
+    std::unordered_set<std::string> observedNpcClasses;
     struct OrbMotionState {
         Vector3 visualPosition{};
         Vector3 entityPosition{};
@@ -815,10 +922,9 @@ void RefreshFarmTargets() {
     };
     static std::unordered_map<uintptr_t, OrbMotionState> orbMotion;
     if (!clientBase) return;
-    // The current dump identifies this as a pointer to the client entity
-    // system. Its entity identity chunk array starts at +0x10. Do not scan
-    // speculative auxiliary tables: that multiplies the work and can make
-    // the render thread compete with the worker for CPU time.
+    // NPC troopers are published through the primary identity table. Keeping
+    // this scan on that table avoids starving farm target refreshes with
+    // speculative auxiliary-table walks.
     const uintptr_t root = Read<uintptr_t>(clientBase + Offsets::GameEntitySystem);
     const uintptr_t tableOffset = Offsets::EntityChunks;
     std::unordered_set<uintptr_t> seen;
@@ -847,8 +953,14 @@ void RefreshFarmTargets() {
                     if ((storedHandle & Offsets::HandleIndexMask) != expectedIndex) continue;
                     const uintptr_t entity = Read<uintptr_t>(identity);
                     if (!entity || !seen.insert(entity).second || entity == currentLocalPawn) continue;
+                    ++scannedEntities;
 
                     const std::string className = GetEntityClassName(entity);
+                    if (className.find("NPC") != std::string::npos &&
+                        observedNpcClasses.size() < 32) {
+                        ++npcClasses;
+                        observedNpcClasses.insert(className);
+                    }
                     // Reading CUtlSymbolLarge character-by-character is much
                     // more expensive than the class-name check. Only read it
                     // for classes that can plausibly be an orb; CItemXP is
@@ -858,8 +970,48 @@ void RefreshFarmTargets() {
                         className.find("Pickup") != std::string::npos ||
                         className.find("XP") != std::string::npos ||
                         className.find("Soul") != std::string::npos;
-                    const std::string designerName = possibleOrbClass
+                    const bool possibleWorldClass = className.find("Power") != std::string::npos ||
+                        className.find("Rune") != std::string::npos ||
+                        className.find("Pickup") != std::string::npos ||
+                        className.find("Talon") != std::string::npos ||
+                        className.find("Guided_Arrow") != std::string::npos ||
+                        className.find("GuidedArrow") != std::string::npos ||
+                        className.find("Projectile") != std::string::npos ||
+                        className.find("Ability") != std::string::npos;
+                    // A number of world pickups use a generic entity class.
+                    // In that case only the designer name identifies a rune or
+                    // powerup, so do not discard the entity before reading it.
+                    const std::string designerName =
+                        (possibleOrbClass || possibleWorldClass || worldEntityScanActive)
                         ? ReadIdentityDesignerName(identity) : std::string{};
+                    if (possibleWorldClass || !designerName.empty()) {
+                        std::string markerName = className + " " + designerName;
+                        std::transform(markerName.begin(), markerName.end(), markerName.begin(),
+                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                        const bool pickupCandidate = markerName.find("_pickup_") != std::string::npos ||
+                            markerName.find("itempickup") != std::string::npos;
+                        const bool excludedPickup = markerName.find("itemxp") != std::string::npos ||
+                            markerName.find("gold") != std::string::npos ||
+                            markerName.find("currency") != std::string::npos;
+                        const bool isPowerup = markerName.find("powerup") != std::string::npos ||
+                            markerName.find("rune") != std::string::npos ||
+                            (pickupCandidate && !excludedPickup);
+                        const bool isTalon = markerName.find("guided_arrow") != std::string::npos ||
+                            markerName.find("guidedarrow") != std::string::npos ||
+                            (markerName.find("talon") != std::string::npos &&
+                             (markerName.find("projectile") != std::string::npos ||
+                              markerName.find("ability") != std::string::npos ||
+                              markerName.find("ultimate") != std::string::npos ||
+                              markerName.find("owl") != std::string::npos));
+                        if ((powerupEspEnabled && isPowerup) || (talonEspEnabled && isTalon)) {
+                            Vector3 markerPosition{};
+                            if (GetEntityPosition(entity, markerPosition)) {
+                                foundWorldTargets.push_back(
+                                    {entity, markerPosition, className,
+                                     designerName.empty() ? className : designerName});
+                            }
+                        }
+                    }
                     if (possibleOrbClass) {
                         static std::unordered_set<std::string> loggedCandidates;
                         if (loggedCandidates.insert(className).second) {
@@ -924,12 +1076,12 @@ void RefreshFarmTargets() {
                             }
                         }
                         motion.lastSeen = now;
-                        // Two consecutive scans with the same coordinates are
-                        // the disappearance signal used by the orb tracker.
-                        // Keep this filter authoritative: ESP and aim both
-                        // consume orbTargets produced below.
-                        if (motion.stationarySamples >= 1) continue;
-
+                        // A stationary coordinate is normal for an orb while it
+                        // is waiting to be collected.  The former two-sample
+                        // filter removed a valid CItemXP after roughly 16 ms,
+                        // so neither Orb ESP nor Orb Aim had a stable target.
+                        // Lifetime is validated by the entity handle in the
+                        // consumer and stale motion records are pruned below.
                         foundOrbs.push_back({ entity, position,
                             designerName.empty() ? className : designerName, storedHandle,
                             Read<uint8_t>(entity + Offsets::Team) });
@@ -943,11 +1095,14 @@ void RefreshFarmTargets() {
                     }
                     if (className.find("NPC_Trooper") == std::string::npos &&
                         className.find("C_NPC_Trooper") == std::string::npos) continue;
+                    ++trooperClasses;
                     if (className.find("TrooperBoss") != std::string::npos) continue;
                     const uintptr_t sceneNode = Read<uintptr_t>(entity + Offsets::GameSceneNode);
                     if (!sceneNode || Read<uint8_t>(sceneNode + Offsets::SceneNodeDormant) != 0) continue;
+                    ++trooperWithSceneNode;
                     const int health = Read<int>(entity + Offsets::Health);
                     if (health <= 0 || health > 100000 || Read<uint8_t>(entity + Offsets::LifeState) != 0) continue;
+                    ++trooperAlive;
                     Vector3 position{};
                     if (!GetEntityPosition(entity, position)) continue;
                     FarmTarget target{};
@@ -957,6 +1112,8 @@ void RefreshFarmTargets() {
                     target.maxHealth = Read<int>(entity + Offsets::MaxHealth);
                     target.team = Read<uint8_t>(entity + Offsets::Team);
                     if (target.team != 2 && target.team != 3 && target.team != 4) continue;
+                    if (trooperChamsActive || trooperChamsWereActive)
+                        ApplyTrooperGlow(entity);
                     target.className = className;
                     found.push_back(target);
                 }
@@ -972,6 +1129,25 @@ void RefreshFarmTargets() {
         std::lock_guard orbLock(orbTargetsMutex);
         orbTargets = std::move(foundOrbs);
     }
+    {
+        std::lock_guard worldLock(worldEspTargetsMutex);
+        worldEspTargets = std::move(foundWorldTargets);
+    }
+    static ULONGLONG lastCreepScanLog = 0;
+    if ((drawCreepEsp || creepEspEnabled || allyCreepEspEnabled || neutralCreepEspEnabled || farmActive) &&
+        now - lastCreepScanLog >= 1000) {
+        lastCreepScanLog = now;
+        std::ofstream log("C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\creep_scan.log",
+                          std::ios::app);
+        if (log) {
+            log << "entities=" << scannedEntities << " npc=" << npcClasses
+                << " trooperClass=" << trooperClasses << " scene=" << trooperWithSceneNode
+                << " alive=" << trooperAlive << " targets=" << farmTargets.size() << " classes=";
+            for (const auto& name : observedNpcClasses) log << '[' << name << ']';
+            log << '\n';
+        }
+    }
+    trooperChamsWereActive = trooperChamsActive;
 }
 
 DWORD WINAPI FarmTargetWorker(LPVOID) {
@@ -1018,8 +1194,25 @@ DWORD WINAPI GlowApplyWorker(LPVOID) {
                 pawn != currentLocalPawn &&
                 (localTeam == 0 || localTeam == 2 || localTeam == 3)) {
                 const bool ally = localTeam >= 2 && localTeam <= 3 && team == localTeam;
+                // Model glow is a presentation layer of the corresponding
+                // hero ESP channel. It must never survive when that channel
+                // is disabled, even if the standalone master glow switch is
+                // still enabled.
+                const bool teamEspEnabled = ally ? allyEspEnabled : enemyEspEnabled;
                 const bool teamGlowEnabled = ally ? allyGlowEnabled : enemyGlowEnabled;
-                if (glowEnabled && teamGlowEnabled) {
+                const float maxDistance = ally ? allyEspMaxDistance : enemyEspMaxDistance;
+                bool withinDistance = true;
+                if (currentLocalPositionReady) {
+                    Vector3 position{};
+                    if (GetEntityPosition(pawn, position)) {
+                        const float dx = position.x - currentLocalPosition.x;
+                        const float dy = position.y - currentLocalPosition.y;
+                        const float dz = position.z - currentLocalPosition.z;
+                        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz) / 39.37f;
+                        withinDistance = std::isfinite(distance) && distance <= maxDistance;
+                    }
+                }
+                if (glowEnabled && teamEspEnabled && teamGlowEnabled && withinDistance) {
                     ApplyHeroGlow(pawn);
                 } else {
                     Write<bool>(pawn + Offsets::Glow + Offsets::GlowEligible, false);

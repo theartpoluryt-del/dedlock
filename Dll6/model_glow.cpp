@@ -90,6 +90,12 @@ constexpr size_t MeshMaterialDescriptor = 0x08;
 constexpr size_t MaterialDescriptorSize = 0x108;
 constexpr size_t MaterialTintOffset = 0x04;
 constexpr size_t MaterialAlphaOffset = 0x10;
+struct alignas(8) MeshEntryCopy {
+    std::array<uint8_t, MeshEntryStride> bytes;
+};
+struct alignas(8) MaterialDescriptorCopy {
+    std::array<uint8_t, MaterialDescriptorSize> bytes;
+};
 // The engine's CPlayerHealthGlowRenderer handles the existing HP-based path.
 // Keep the old experimental DrawModel duplicate pass out of the render path.
 constexpr bool EnableExperimentalModelGlowPass = false;
@@ -218,7 +224,55 @@ bool IsGlowEnabledForPawn(uintptr_t pawn) {
     const uint8_t pawnTeam = Read<uint8_t>(pawn + Offsets::Team);
     if (pawnTeam != 2 && pawnTeam != 3) return false;
     const bool ally = localTeam >= 2 && localTeam <= 3 && pawnTeam == localTeam;
-    return ally ? allyGlowEnabled : enemyGlowEnabled;
+    const bool teamEspEnabled = ally ? allyEspEnabled : enemyEspEnabled;
+    const float maxDistance = ally ? allyEspMaxDistance : enemyEspMaxDistance;
+    if (currentLocalPositionReady) {
+        Vector3 position{};
+        if (GetEntityPosition(pawn, position)) {
+            const float dx = position.x - currentLocalPosition.x;
+            const float dy = position.y - currentLocalPosition.y;
+            const float dz = position.z - currentLocalPosition.z;
+            const float distance = std::sqrt(dx * dx + dy * dy + dz * dz) / 39.37f;
+            if (!std::isfinite(distance) || distance > maxDistance) return false;
+        }
+    }
+    return teamEspEnabled && (ally ? allyGlowEnabled : enemyGlowEnabled);
+}
+
+// PlayerOutlineRenderer never consumes CGlowProperty for NPC_Trooper.  Apply
+// their chams in the model submission path instead, where every animated
+// trooper mesh is available together with its owning entity.
+const float* GetTrooperChamsTint(uintptr_t entity) {
+    if (!entity || !currentLocalPawn) return nullptr;
+    const std::string className = GetEntityClassName(entity);
+    if (className.find("NPC_Trooper") == std::string::npos ||
+        className.find("TrooperBoss") != std::string::npos ||
+        Read<int>(entity + Offsets::Health) <= 0 ||
+        Read<uint8_t>(entity + Offsets::LifeState) != 0) {
+        return nullptr;
+    }
+
+    const uint8_t localTeam = Read<uint8_t>(currentLocalPawn + Offsets::Team);
+    const uint8_t team = Read<uint8_t>(entity + Offsets::Team);
+    const bool neutral = team == 4;
+    const bool ally = !neutral && localTeam >= 2 && localTeam <= 3 && team == localTeam;
+    const bool enabled = neutral ? neutralChams
+        : (ally ? allyTrooperChams : enemyTrooperChams);
+    if (!enabled) return nullptr;
+
+    if (currentLocalPositionReady) {
+        Vector3 position{};
+        if (!GetEntityPosition(entity, position)) return nullptr;
+        const float dx = position.x - currentLocalPosition.x;
+        const float dy = position.y - currentLocalPosition.y;
+        const float dz = position.z - currentLocalPosition.z;
+        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz) / 39.37f;
+        if (!std::isfinite(distance) || distance > creepEspMaxDistance)
+            return nullptr;
+    }
+
+    return neutral ? neutralChamsColor
+                   : (ally ? allyTrooperChamsColor : enemyTrooperChamsColor);
 }
 
 bool IsEnemyHeroMesh(uintptr_t entry) {
@@ -240,7 +294,8 @@ bool IsNormalFillPawn(uintptr_t pawn) {
     if ((localTeam != 2 && localTeam != 3) ||
         (pawnTeam != 2 && pawnTeam != 3)) return false;
     const bool ally = pawnTeam == localTeam;
-    return (ally ? allyGlowEnabled : enemyGlowEnabled) &&
+    const bool teamEspEnabled = ally ? allyEspEnabled : enemyEspEnabled;
+    return teamEspEnabled && (ally ? allyGlowEnabled : enemyGlowEnabled) &&
            (ally ? allyGlowMode : enemyGlowMode) == 1;
 }
 
@@ -263,9 +318,23 @@ __int64 __fastcall HookPlayerOutline(
         const uint8_t pawnTeam = Read<uint8_t>(static_cast<uintptr_t>(pawn) + Offsets::Team);
         const bool validTeam = pawnTeam == 2 || pawnTeam == 3;
         const bool ally = localTeam >= 2 && localTeam <= 3 && pawnTeam == localTeam;
+        const bool teamEspEnabled = ally ? allyEspEnabled : enemyEspEnabled;
         const bool teamGlowEnabled = ally ? allyGlowEnabled : enemyGlowEnabled;
-        if (!validTeam || !teamGlowEnabled)
-            return originalResult;
+        const float maxDistance = ally ? allyEspMaxDistance : enemyEspMaxDistance;
+        bool withinDistance = true;
+        if (currentLocalPositionReady) {
+            Vector3 position{};
+            if (GetEntityPosition(static_cast<uintptr_t>(pawn), position)) {
+                const float dx = position.x - currentLocalPosition.x;
+                const float dy = position.y - currentLocalPosition.y;
+                const float dz = position.z - currentLocalPosition.z;
+                const float distance = std::sqrt(dx * dx + dy * dy + dz * dz) / 39.37f;
+                withinDistance = std::isfinite(distance) && distance <= maxDistance;
+            }
+        }
+        if (!validTeam) return originalResult;
+        if (!teamEspEnabled || !teamGlowEnabled || !withinDistance)
+            return 0;
         const float* glowColor = ally ? teammateGlowColor : enemyGlowColor;
 
         float adjusted[4] = {
@@ -329,8 +398,25 @@ bool BeginGlowPipeline(
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (SUCCEEDED(context->Map(glowColorBuffer, 0, D3D11_MAP_WRITE_DISCARD,
                                0, &mapped))) {
-        const float* glowColor = renderGlowTeam.load(std::memory_order_acquire) == 1
-            ? teammateGlowColor : enemyGlowColor;
+        const int mode = renderGlowTeam.load(std::memory_order_acquire);
+        float modulationColor[4] = {};
+        const float* glowColor = enemyGlowColor;
+        if (mode == 1) {
+            glowColor = teammateGlowColor;
+        } else if (mode == 2) {
+            // World/sky geometry is submitted without an entity owner.
+            modulationColor[0] = disableSkybox ? 0.0f : skyboxColor[0] * skyboxBrightness * lightColor[0] * lightBrightness;
+            modulationColor[1] = disableSkybox ? 0.0f : skyboxColor[1] * skyboxBrightness * lightColor[1] * lightBrightness;
+            modulationColor[2] = disableSkybox ? 0.0f : skyboxColor[2] * skyboxBrightness * lightColor[2] * lightBrightness;
+            modulationColor[3] = 1.0f;
+            glowColor = modulationColor;
+        } else if (mode == 3) {
+            modulationColor[0] = propsColor[0] * lightColor[0] * lightBrightness;
+            modulationColor[1] = propsColor[1] * lightColor[1] * lightBrightness;
+            modulationColor[2] = propsColor[2] * lightColor[2] * lightBrightness;
+            modulationColor[3] = 1.0f;
+            glowColor = modulationColor;
+        }
         const float color[4] = {
             glowColor[0], glowColor[1], glowColor[2], glowColor[3]};
         std::memcpy(mapped.pData, color, sizeof(color));
@@ -494,9 +580,110 @@ void STDMETHODCALLTYPE HookDrawInstancedIndirect(
 void** __fastcall HookDrawModel(
     __int64 sceneObjectDesc, __int64 dx11, __int64* meshDraws,
     int meshCount, __int64 sceneView, __int64 sceneLayer, __int64 a7) {
+    std::vector<MeshEntryCopy> worldMeshes;
+    std::vector<MaterialDescriptorCopy> worldDescriptors;
+    __int64* submittedMeshes = meshDraws;
+    const int safeWorldCount = meshCount > 0 && meshCount < 512 ? meshCount : 0;
+    const bool trooperChamsActive = enemyTrooperChams || allyTrooperChams || neutralChams;
+    if ((worldModulationEnabled || trooperChamsActive) &&
+        meshDraws && safeWorldCount > 0) {
+        worldMeshes.resize(static_cast<size_t>(safeWorldCount));
+        worldDescriptors.resize(static_cast<size_t>(safeWorldCount));
+        const uintptr_t source = reinterpret_cast<uintptr_t>(meshDraws);
+        bool complete = true;
+        for (int i = 0; i < safeWorldCount; ++i) {
+            const uintptr_t entry = source + static_cast<uintptr_t>(i) * MeshEntryStride;
+            auto& mesh = worldMeshes[static_cast<size_t>(i)];
+            if (!CopyReadableBytes(mesh.bytes.data(), reinterpret_cast<const void*>(entry),
+                                   MeshEntryStride)) {
+                complete = false;
+                break;
+            }
+            const uintptr_t descriptor = Read<uintptr_t>(entry + MeshMaterialDescriptor);
+            auto& descriptorCopy = worldDescriptors[static_cast<size_t>(i)];
+            if (!descriptor || !CopyReadableBytes(descriptorCopy.bytes.data(),
+                                                   reinterpret_cast<const void*>(descriptor),
+                                                   MaterialDescriptorSize))
+                continue;
+
+            const uintptr_t sceneObject = Read<uintptr_t>(entry + MeshSceneObject);
+            const uint32_t ownerHandle = sceneObject
+                ? Read<uint32_t>(sceneObject + SceneObjectOwner) : 0xFFFFFFFFu;
+            const uintptr_t owner = ownerHandle != 0xFFFFFFFFu
+                ? ResolveEntity(ownerHandle) : 0;
+            const bool hero = owner == currentLocalPawn || GetGlowHeroMeshPawn(entry) != 0;
+            const float* trooperTint = GetTrooperChamsTint(owner);
+            if (trooperTint) {
+                const float tint[4] = {
+                    std::clamp(trooperTint[0], 0.0f, 1.0f),
+                    std::clamp(trooperTint[1], 0.0f, 1.0f),
+                    std::clamp(trooperTint[2], 0.0f, 1.0f),
+                    1.0f
+                };
+                SetGlowDescriptorTint(descriptorCopy.bytes, tint);
+            } else if (worldModulationEnabled && !hero) {
+                const float* base = owner ? propsColor : worldColor;
+                const float skyFactor = owner ? 1.0f : skyboxBrightness;
+                const float tint[4] = {
+                    std::clamp(base[0] * lightColor[0] * lightBrightness *
+                               (owner ? 1.0f : skyboxColor[0]) * skyFactor, 0.0f, 4.0f),
+                    std::clamp(base[1] * lightColor[1] * lightBrightness *
+                               (owner ? 1.0f : skyboxColor[1]) * skyFactor, 0.0f, 4.0f),
+                    std::clamp(base[2] * lightColor[2] * lightBrightness *
+                               (owner ? 1.0f : skyboxColor[2]) * skyFactor, 0.0f, 4.0f),
+                    disableSkybox && !owner ? 0.0f : 1.0f
+                };
+                SetGlowDescriptorTint(descriptorCopy.bytes, tint);
+            }
+            const uintptr_t descriptorAddress = reinterpret_cast<uintptr_t>(
+                descriptorCopy.bytes.data());
+            std::memcpy(mesh.bytes.data() + MeshMaterialDescriptor,
+                        &descriptorAddress, sizeof(descriptorAddress));
+        }
+        if (complete)
+            submittedMeshes = reinterpret_cast<__int64*>(worldMeshes.data());
+    }
+
+    bool hasOwnedMesh = false;
+    bool hasHeroMesh = false;
+    if (worldModulationEnabled && meshDraws && safeWorldCount > 0) {
+        const uintptr_t source = reinterpret_cast<uintptr_t>(meshDraws);
+        for (int i = 0; i < safeWorldCount; ++i) {
+            const uintptr_t entry = source + static_cast<uintptr_t>(i) * MeshEntryStride;
+            const uintptr_t sceneObject = Read<uintptr_t>(entry + MeshSceneObject);
+            const uint32_t handle = sceneObject
+                ? Read<uint32_t>(sceneObject + SceneObjectOwner) : 0xFFFFFFFFu;
+            const uintptr_t owner = handle != 0xFFFFFFFFu ? ResolveEntity(handle) : 0;
+            if (!owner) continue;
+            hasOwnedMesh = true;
+            if (GetEntityClassName(owner).find("CitadelPlayerPawn") != std::string::npos) {
+                hasHeroMesh = true;
+                break;
+            }
+        }
+    }
+    // Do not recolour player model batches.  All non-player scene batches use
+    // the active D3D context, which affects the final shader rather than an
+    // unused material-descriptor copy.
+    auto* modulationContext = worldModulationEnabled && !hasHeroMesh &&
+            LooksLikeD3D11Context(reinterpret_cast<void*>(dx11))
+        ? reinterpret_cast<ID3D11DeviceContext*>(dx11) : nullptr;
+    SavedPipelineState modulationSaved{};
+    if (modulationContext) {
+        renderGlowTeam.store(hasOwnedMesh ? 3 : 2, std::memory_order_release);
+    }
+    const bool modulationOverridden = modulationContext &&
+        BeginGlowPipeline(modulationContext, modulationSaved);
+    if (modulationContext && !modulationOverridden) {
+        renderGlowTeam.store(-1, std::memory_order_release);
+    }
     void** result = originalDrawModel(
-        sceneObjectDesc, dx11, meshDraws, meshCount,
+        sceneObjectDesc, dx11, submittedMeshes, meshCount,
         sceneView, sceneLayer, a7);
+    if (modulationOverridden) {
+        EndGlowPipeline(modulationContext, modulationSaved);
+        renderGlowTeam.store(-1, std::memory_order_release);
+    }
 
     if (!EnableExperimentalModelGlowPass ||
         enemyGlowMode != 1 && allyGlowMode != 1 || !meshDraws || meshCount <= 0 ||
@@ -505,14 +692,8 @@ void** __fastcall HookDrawModel(
     }
 
     const int safeCount = meshCount < 256 ? meshCount : 256;
-    struct alignas(8) MeshEntry {
-        std::array<uint8_t, MeshEntryStride> bytes;
-    };
-    struct alignas(8) MaterialDescriptor {
-        std::array<uint8_t, MaterialDescriptorSize> bytes;
-    };
-    std::vector<MeshEntry> enemyMeshes;
-    std::vector<MaterialDescriptor> glowDescriptors;
+    std::vector<MeshEntryCopy> enemyMeshes;
+    std::vector<MaterialDescriptorCopy> glowDescriptors;
     int batchTeam = -1;
     enemyMeshes.reserve(static_cast<size_t>(safeCount));
     glowDescriptors.reserve(static_cast<size_t>(safeCount));
@@ -528,7 +709,7 @@ void** __fastcall HookDrawModel(
         const uint8_t pawnTeam = Read<uint8_t>(pawn + Offsets::Team);
         const bool ally = localTeam >= 2 && localTeam <= 3 && pawnTeam == localTeam;
         if (batchTeam < 0) batchTeam = ally ? 1 : 0;
-        MeshEntry copy{};
+        MeshEntryCopy copy{};
         if (!CopyReadableBytes(copy.bytes.data(),
                                reinterpret_cast<const void*>(entry), MeshEntryStride))
             continue;
