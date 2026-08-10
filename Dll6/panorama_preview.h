@@ -14,6 +14,7 @@ void UpdatePanoramaPreview(IDXGISwapChain* swapChain,
                            float left, float top, float right, float bottom,
                            bool visible);
 ID3D11Texture2D* GetPanoramaPreviewTexture();
+uint64_t GetPanoramaPreviewCaptureSerial();
 bool GetPanoramaPreviewSkeleton(Preview3DPoint* points, std::size_t count);
 void SetPanoramaPreviewHero(int heroId);
 int GetPanoramaPreviewHero();

@@ -1105,6 +1105,10 @@ ID3D11Texture2D* GetPanoramaPreviewTexture() {
         ? captureTexture.Get() : nullptr;
 }
 
+uint64_t GetPanoramaPreviewCaptureSerial() {
+    return captureSerial.load(std::memory_order_acquire);
+}
+
 bool GetPanoramaPreviewSkeleton(Preview3DPoint* points, std::size_t count) {
     if (!points || count < 18 || !portraitEntityListGlobal) return false;
     for (std::size_t i = 0; i < count; ++i) points[i] = {};

@@ -47,6 +47,9 @@ struct Renderer {
     std::vector<uint8_t> preview3dPixels;
     bool preview3dShared = false;
     bool preview3dActive = false;
+    bool previewWasDragging = false;
+    bool previewFreezeAfterDrag = false;
+    uint64_t previewFreezeSerial = 0;
     ComPtr<ID2D1Bitmap> tabIcons[4];
     ComPtr<ID2D1Bitmap> sceneBitmap;
     ComPtr<ID2D1BitmapRenderTarget> blurTarget;
@@ -1362,6 +1365,9 @@ void ResetTarget() {
     g.preview3dPixels.clear();
     g.preview3dShared = false;
     g.preview3dActive = false;
+    g.previewWasDragging = false;
+    g.previewFreezeAfterDrag = false;
+    g.previewFreezeSerial = 0;
     for (auto& icon : g.tabIcons) icon.Reset();
     g.blurBitmap.Reset();
     g.blurTarget.Reset();
@@ -1626,11 +1632,22 @@ void RenderD2DMenu(std::size_t playerCount) {
         : PrepareBackgroundBlur(displayWidth, displayHeight);
     ID2D1Bitmap* backdropBlur = g.softwareTarget ? g.sceneBitmap.Get()
                                                   : g.blurBitmap.Get();
-    // While the native Panorama source is deliberately hidden during a drag,
-    // keep its whole D2D presentation frozen: texture, bounds and skeleton.
-    // Updating only the texture would make ESP lines drift independently.
-    const bool freezePreview = g.draggingWindow && g.preview3dActive &&
-                               g.preview3dBitmap;
+    // Keep one complete D2D preview snapshot through a drag and until Panorama
+    // has actually captured the resumed panel at its new position.  Without
+    // the serial fence, fresh ESP bounds are drawn over the previous texture
+    // for one frame after mouse release.
+    const uint64_t captureSerial = GetPanoramaPreviewCaptureSerial();
+    if (g.draggingWindow && !g.previewWasDragging) {
+        g.previewFreezeAfterDrag = true;
+        g.previewFreezeSerial = captureSerial;
+    }
+    if (!g.draggingWindow && g.previewFreezeAfterDrag &&
+        captureSerial > g.previewFreezeSerial) {
+        g.previewFreezeAfterDrag = false;
+    }
+    const bool freezePreview = (g.draggingWindow || g.previewFreezeAfterDrag) &&
+                               g.preview3dActive && g.preview3dBitmap;
+    g.previewWasDragging = g.draggingWindow;
     if (!freezePreview) {
         g.preview3dActive = false;
     }
