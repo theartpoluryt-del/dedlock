@@ -655,7 +655,7 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
                         bool* enabledToggle, bool* boxesToggle, bool* cornerToggle,
                         bool* skeletonToggle, bool* healthToggle, bool* healthValueToggle,
                         bool* heroNameToggle, bool* playerNameToggle, bool* distanceToggle,
-                        bool* snaplineToggle, bool* glowToggle) {
+                        bool* snaplineToggle) {
     GlowRounded(Rect(x, y, x + width, y + height), 16,
                 Color(0, 0, 0, 0.65f), 5, 2.0f);
     FillRounded(Rect(x, y, x + width, y + height), 8,
@@ -707,7 +707,6 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
     drawFlowTile(L"Corner box", cornerToggle);
     drawFlowTile(L"Health", healthToggle);
     drawFlowTile(L"Health bar", healthValueToggle);
-    drawFlowTile(L"Model glow", glowToggle);
     drawFlowTile(L"Snapline", snaplineToggle);
     // Keep the character aspect ratio from the source sheet. The previous
     // crop used coordinates for a 2048px image, while the embedded reference
@@ -1852,25 +1851,26 @@ void RenderD2DMenu(std::size_t playerCount) {
     // The main window already supplies the page surface.  Do not add a second
     // dark card behind every settings area: it reads as a large black block.
 
-    const wchar_t* cardTitles[] = {L"Overlay", L"Aim configuration", L"Miscellaneous"};
-    Text(cardTitles[g.tab], Rect(350, cardTop + 10, 700, cardTop + 42),
-         g.semibold.Get(), White());
-    Line(D2D1::Point2F(350, cardTop + 50), D2D1::Point2F(992, cardTop + 50), Border());
-    if (!visualEditor) Line(D2D1::Point2F(655, cardTop + 66),
+    // The page title in the header already identifies the active tab.  Do not
+    // repeat it as an "Overlay" card title or draw a redundant divider here.
+    if (!visualEditor) Line(D2D1::Point2F(655, cardTop),
                             D2D1::Point2F(655, contentPanelBottom - 28), Border());
 
     const float leftX = visualEditor ? 350.0f : 330.0f;
     const float rightX = visualEditor ? 660.0f : 675.0f;
     const float leftColumnWidth = visualEditor ? 288.0f : 300.0f;
-    const float rightColumnWidth = visualEditor ? 308.0f : 300.0f;
+    // Leave a deliberate, consistent breathing margin at the right edge of
+    // every page. The left columns keep their existing geometry; right-hand
+    // content stops before the page border instead of touching it.
+    const float rightColumnWidth = visualEditor ? 276.0f : 270.0f;
     const float leftColorWidth = leftColumnWidth;
     const float rightColorWidth = rightColumnWidth;
     const float columnWidth = leftColumnWidth;
-    // The card title divider is at cardTop + 50.  Start controls below it so
-    // the divider never cuts through the first row's label.
-    const float firstY = cardTop + 56;
+    // The redundant card heading was removed, so the content occupies its
+    // former space rather than leaving an empty strip at the top.
+    const float firstY = cardTop;
 
-    const float viewportTop = cardTop + 44.0f;
+    const float viewportTop = cardTop;
     const bool mouseInColumnViewport =
         l.mouse.y >= viewportTop && l.mouse.y <= contentPanelBottom;
     const float previousLeftMax = ColumnMaxScroll(g.leftContentBottom);
@@ -1924,6 +1924,8 @@ void RenderD2DMenu(std::size_t playerCount) {
         float* teamHealthValueColor = g.visualTeam == 0 ? enemyHealthValueColor : teammateHealthValueColor;
         float* teamGlowColor = g.visualTeam == 0 ? enemyGlowColor : teammateGlowColor;
         bool* teamGlowEnabled = g.visualTeam == 0 ? &enemyGlowEnabled : &allyGlowEnabled;
+        float* teamMaxDistance = g.visualTeam == 0 ? &enemyEspMaxDistance :
+                                 g.visualTeam == 1 ? &allyEspMaxDistance : &creepEspMaxDistance;
         float* teamBoxThickness = g.visualTeam == 0 ? &enemyBoxThickness :
                                   g.visualTeam == 1 ? &allyBoxThickness : &boxThickness;
         float* teamCornerLength = g.visualTeam == 0 ? &enemyCornerBoxLength :
@@ -1940,7 +1942,7 @@ void RenderD2DMenu(std::size_t playerCount) {
                            *teamBoxThickness, *teamCornerLength, l,
                            teamEsp, teamBoxes, teamCornerBoxes, teamBones,
                            teamHealth, teamHealthValues, teamNames, teamPlayerNames,
-                           teamDistance, teamSnaplines, teamGlowEnabled);
+                           teamDistance, teamSnaplines);
 
         // Boolean ESP controls live in the preview companion window. Keep the
         // old in-card layout disabled so controls cannot be duplicated.
@@ -2009,21 +2011,38 @@ void RenderD2DMenu(std::size_t playerCount) {
                       teamGlowMode, glowModes, 2);
         }
         } else {
-            DrawSectionHeading(leftX, firstY + 18,
-                               rightX + rightColumnWidth - leftX, L"Appearance");
-            DrawToggle(l, leftX, firstY + 58,
-                       rightX + rightColumnWidth - leftX, L"Enable ESP", L"", teamEsp);
-            DrawSlider(l, leftX, firstY + 128,
-                       rightX + rightColumnWidth - leftX, L"Box thickness",
-                       teamBoxThickness, 0.5f, 4.0f, L"%.2f px");
-            DrawSlider(l, leftX, firstY + 198,
-                       rightX + rightColumnWidth - leftX, L"Corner length",
-                       teamCornerLength, 0.10f, 0.35f, L"%.2f");
-            const wchar_t* glowModes[] = {L"HP-based fill", L"Normal fill"};
-            int* teamGlowMode = g.visualTeam == 0 ? &enemyGlowMode : &allyGlowMode;
-            DrawCombo(l, 401, leftX, firstY + 268,
-                      rightX + rightColumnWidth - leftX, L"Glow mode",
-                      teamGlowMode, glowModes, 2);
+            const float fullWidth = rightX + rightColumnWidth - leftX;
+            if (g.visualTeam < 2) {
+                DrawSectionHeading(leftX, firstY + 18, fullWidth, L"General");
+                DrawToggle(l, leftX, firstY + 58, fullWidth,
+                           L"Enable ESP", L"", teamEsp);
+                DrawSlider(l, leftX, firstY + 128, fullWidth,
+                           L"Max render distance", teamMaxDistance,
+                           10.0f, 500.0f, L"%.0f m");
+                DrawSectionHeading(leftX, firstY + 210, fullWidth, L"Appearance");
+                DrawToggle(l, leftX, firstY + 250, fullWidth,
+                           L"Model glow", L"", teamGlowEnabled);
+                const wchar_t* glowModes[] = {L"HP-based fill", L"Normal fill"};
+                int* teamGlowMode = g.visualTeam == 0 ? &enemyGlowMode : &allyGlowMode;
+                DrawCombo(l, 401, leftX, firstY + 320, fullWidth, L"Glow mode",
+                          teamGlowMode, glowModes, 2);
+                DrawSlider(l, leftX, firstY + 390, fullWidth, L"Box thickness",
+                           teamBoxThickness, 0.5f, 4.0f, L"%.2f px");
+                DrawSlider(l, leftX, firstY + 460, fullWidth, L"Corner length",
+                           teamCornerLength, 0.10f, 0.35f, L"%.2f");
+            } else {
+                DrawSectionHeading(leftX, firstY + 18, fullWidth, L"General");
+                DrawToggle(l, leftX, firstY + 58, fullWidth,
+                           L"Enable ESP", L"", teamEsp);
+                DrawSlider(l, leftX, firstY + 128, fullWidth,
+                           L"Max render distance", teamMaxDistance,
+                           10.0f, 500.0f, L"%.0f m");
+                DrawSectionHeading(leftX, firstY + 210, fullWidth, L"Appearance");
+                DrawSlider(l, leftX, firstY + 250, fullWidth, L"Box thickness",
+                           teamBoxThickness, 0.5f, 4.0f, L"%.2f px");
+                DrawSlider(l, leftX, firstY + 320, fullWidth, L"Corner length",
+                           teamCornerLength, 0.10f, 0.35f, L"%.2f");
+            }
         }
     } else if (g.tab == 1) {
         if (g.aimSubtab == 0) {
@@ -2032,39 +2051,39 @@ void RenderD2DMenu(std::size_t playerCount) {
         if (aimAssist) {
         // Keep the key capture in the left column.  The old inline placement
         // crossed the column divider and overpainted the Target point combo.
-        DrawKeyBind(l, leftX, firstY + 54, columnWidth,
+        DrawKeyBind(l, leftX, firstY + 56, columnWidth,
                     aimKeyCapture, aimAssistKey, &aimKeyCapture);
-        DrawToggle(l, leftX, firstY + 106, columnWidth, L"Visibility check",
+        DrawToggle(l, leftX, firstY + 110, columnWidth, L"Visibility check",
                    L"Ignore occluded targets", &aimVisibilityCheck);
         int aimMode = aimMixedMode ? 2 : (aimSilentMode ? 1 : 0);
         const wchar_t* aimModes[] = {L"Normal", L"pSilent", L"Mixed"};
-        DrawCombo(l, 101, leftX, firstY + 160, columnWidth, L"Aim mode",
+        DrawCombo(l, 101, leftX, firstY + 166, columnWidth, L"Aim mode",
                   &aimMode, aimModes, 3);
         aimSilentMode = aimMode == 1;
         aimMixedMode = aimMode == 2;
         int bindMode = aimToggleMode ? 1 : 0;
         const wchar_t* bindModes[] = {L"Hold", L"Toggle"};
-        DrawCombo(l, 102, leftX, firstY + 231, columnWidth, L"Activation",
+        DrawCombo(l, 102, leftX, firstY + 239, columnWidth, L"Activation",
                   &bindMode, bindModes, 2);
         aimToggleMode = bindMode == 1;
         int targetMode = static_cast<int>(aimTargetMode);
         const wchar_t* targets[] = {L"Head", L"Body", L"Closest"};
-        DrawCombo(l, 103, rightX, firstY, columnWidth, L"Target point",
+        DrawCombo(l, 103, rightX, firstY, rightColumnWidth, L"Target point",
                   &targetMode, targets, 3);
         aimTargetMode = static_cast<AimTargetMode>(std::clamp(targetMode, 0, 2));
         int selectionMode = static_cast<int>(aimSelectionMode);
         const wchar_t* selections[] = {L"Crosshair", L"Distance", L"Health"};
-        DrawCombo(l, 104, rightX, firstY + 71, columnWidth, L"Target selection",
+        DrawCombo(l, 104, rightX, firstY + 73, rightColumnWidth, L"Target selection",
                   &selectionMode, selections, 3);
         aimSelectionMode = static_cast<AimSelectionMode>(std::clamp(selectionMode, 0, 2));
         const float previousAimFov = aimFov;
         const float previousPitchSmooth = aimPitchSmooth;
         const float previousYawSmooth = aimYawSmooth;
-        DrawSlider(l, rightX, firstY + 142, columnWidth, L"Aim FOV",
+        DrawSlider(l, rightX, firstY + 146, rightColumnWidth, L"Aim FOV",
                    &aimFov, 40.0f, 600.0f, L"%.0f px");
-        DrawSlider(l, rightX, firstY + 213, columnWidth, L"Pitch smoothing",
+        DrawSlider(l, rightX, firstY + 224, rightColumnWidth, L"Pitch smoothing",
                    &aimPitchSmooth, 1.0f, 20.0f, L"%.1f");
-        DrawSlider(l, rightX, firstY + 284, columnWidth, L"Yaw smoothing",
+        DrawSlider(l, rightX, firstY + 302, rightColumnWidth, L"Yaw smoothing",
                    &aimYawSmooth, 1.0f, 20.0f, L"%.1f");
         static bool aimSliderConfigDirty = false;
         if (aimFov != previousAimFov ||
@@ -2075,22 +2094,22 @@ void RenderD2DMenu(std::size_t playerCount) {
             SaveConfig();
             aimSliderConfigDirty = false;
         }
-        DrawSectionHeading(leftX, firstY + 302, columnWidth, L"Accuracy");
-        DrawSlider(l, leftX, firstY + 343, columnWidth, L"Hitchance",
+        DrawSectionHeading(leftX, firstY + 322, columnWidth, L"Accuracy");
+        DrawSlider(l, leftX, firstY + 363, columnWidth, L"Hitchance",
                    &aimHitchance, 0.0f, 100.0f, L"%.0f%%");
-        DrawToggle(l, leftX, firstY + 414, columnWidth, L"Backtrack",
+        DrawToggle(l, leftX, firstY + 441, columnWidth, L"Backtrack",
                    L"Aim at a recent target position", &aimBacktrack);
         if (aimBacktrack)
-            DrawSlider(l, leftX, firstY + 468, columnWidth, L"Backtrack time",
+            DrawSlider(l, leftX, firstY + 497, columnWidth, L"Backtrack time",
                        &aimBacktrackMs, 1.0f, 1000.0f, L"%.0f ms");
-        DrawSectionHeading(rightX, firstY + 355, columnWidth, L"Behavior");
-        DrawToggle(l, rightX, firstY + 396, columnWidth, L"Only Yaw",
+        DrawSectionHeading(rightX, firstY + 390, rightColumnWidth, L"Behavior");
+        DrawToggle(l, rightX, firstY + 431, rightColumnWidth, L"Only Yaw",
                    L"Adjust horizontal aim only", &aimOnlyYaw);
-        DrawToggle(l, rightX, firstY + 450, columnWidth, L"Lock Target",
+        DrawToggle(l, rightX, firstY + 485, rightColumnWidth, L"Lock Target",
                    L"Keep the current target while valid", &aimLockTarget);
-        DrawToggle(l, rightX, firstY + 504, columnWidth, L"Draw FOV circle",
+        DrawToggle(l, rightX, firstY + 539, rightColumnWidth, L"Draw FOV circle",
                    L"Show active target radius", &drawFovCircle);
-        DrawSlider(l, rightX, firstY + 558, columnWidth, L"FOV opacity",
+        DrawSlider(l, rightX, firstY + 593, rightColumnWidth, L"FOV opacity",
                    &fovCircleAlpha, 0.0f, 255.0f, L"%.0f");
         }
         } else if (g.aimSubtab == 99) {
@@ -2152,20 +2171,20 @@ void RenderD2DMenu(std::size_t playerCount) {
                                 &farmFovAlpha, 0.0f, 255.0f, L"%.0f");
              }
 
-            DrawToggle(l, rightX, firstY, columnWidth, L"Orb aim",
+            DrawToggle(l, rightX, firstY, rightColumnWidth, L"Orb aim",
                        L"Aim at valid soul orbs", &autoLastHitOrbs);
             if (autoLastHitOrbs) {
                 int fireMode = autoLastHitOrbsAutoFire ? 0 : 1;
                 const wchar_t* fireModes[] = {L"Auto fire", L"Player fire"};
-                DrawCombo(l, 203, rightX, firstY + 70, columnWidth, L"Fire mode",
+                DrawCombo(l, 203, rightX, firstY + 70, rightColumnWidth, L"Fire mode",
                           &fireMode, fireModes, 2);
                 autoLastHitOrbsAutoFire = fireMode == 0;
                 int orbBind = autoLastHitOrbsToggleMode ? 1 : 0;
                 const wchar_t* binds[] = {L"Hold", L"Toggle"};
-                DrawCombo(l, 204, rightX, firstY + 140, columnWidth, L"Activation",
+                DrawCombo(l, 204, rightX, firstY + 140, rightColumnWidth, L"Activation",
                           &orbBind, binds, 2);
                 autoLastHitOrbsToggleMode = orbBind == 1;
-                DrawKeyBind(l, rightX, firstY + 210, columnWidth,
+                DrawKeyBind(l, rightX, firstY + 210, rightColumnWidth,
                             autoLastHitOrbsKeyCapture, autoLastHitOrbsKey,
                             &autoLastHitOrbsKeyCapture);
             }
@@ -2193,24 +2212,24 @@ void RenderD2DMenu(std::size_t playerCount) {
         DrawKeyBind(l, leftX, firstY + 486, columnWidth,
                     farmKeyCapture, farmAssistKey, &farmKeyCapture);
 
-        DrawToggle(l, rightX, firstY, columnWidth, L"Orb ESP",
+        DrawToggle(l, rightX, firstY, rightColumnWidth, L"Orb ESP",
                    L"Highlight active soul orbs", &drawOrbEsp);
-        DrawToggle(l, rightX, firstY + 72, columnWidth, L"Orb aim",
+        DrawToggle(l, rightX, firstY + 72, rightColumnWidth, L"Orb aim",
                    L"Aim at valid soul orbs", &autoLastHitOrbs);
-        DrawToggle(l, rightX, firstY + 144, columnWidth, L"Visibility check",
+        DrawToggle(l, rightX, firstY + 144, rightColumnWidth, L"Visibility check",
                    L"Ignore occluded orbs", &orbAimVisibilityCheck);
         int fireMode = autoLastHitOrbsAutoFire ? 0 : 1;
         const wchar_t* fireModes[] = {L"Auto fire", L"Player fire"};
-        DrawCombo(l, 203, rightX, firstY + 226, columnWidth, L"Fire mode",
+        DrawCombo(l, 203, rightX, firstY + 226, rightColumnWidth, L"Fire mode",
                   &fireMode, fireModes, 2);
         autoLastHitOrbsAutoFire = fireMode == 0;
         int orbBind = autoLastHitOrbsToggleMode ? 1 : 0;
-        DrawCombo(l, 204, rightX, firstY + 302, columnWidth, L"Activation",
+        DrawCombo(l, 204, rightX, firstY + 302, rightColumnWidth, L"Activation",
                   &orbBind, kFarmActivationModes, 2);
         autoLastHitOrbsToggleMode = orbBind == 1;
-        Text(L"Orb key", Rect(rightX, firstY + 376, rightX + columnWidth, firstY + 404),
+        Text(L"Orb key", Rect(rightX, firstY + 376, rightX + rightColumnWidth, firstY + 404),
              g.regular.Get(), Muted());
-        DrawKeyBind(l, rightX, firstY + 410, columnWidth,
+        DrawKeyBind(l, rightX, firstY + 410, rightColumnWidth,
                     autoLastHitOrbsKeyCapture, autoLastHitOrbsKey,
                     &autoLastHitOrbsKeyCapture);
     } else {
@@ -2227,26 +2246,26 @@ void RenderD2DMenu(std::size_t playerCount) {
                        &freeCamSpeed, 50.0f, 5000.0f, L"%.0f u/s");
         }
 
-        DrawToggle(l, rightX, firstY, columnWidth, L"FOV Changer",
+        DrawToggle(l, rightX, firstY, rightColumnWidth, L"FOV Changer",
                    L"Override the normal camera field of view", &fovChangerEnabled);
-        DrawSlider(l, rightX, firstY + 54, columnWidth, L"Camera FOV",
+        DrawSlider(l, rightX, firstY + 54, rightColumnWidth, L"Camera FOV",
                    &cameraFov, 60.0f, 140.0f, L"%.0f deg");
-        DrawToggle(l, rightX, firstY + 118, columnWidth, L"Override Scope FOV",
+        DrawToggle(l, rightX, firstY + 118, rightColumnWidth, L"Override Scope FOV",
                    L"Use a separate field of view while scoped", &overrideScopeFov);
-        DrawSlider(l, rightX, firstY + 172, columnWidth, L"Scoped FOV",
+        DrawSlider(l, rightX, firstY + 172, rightColumnWidth, L"Scoped FOV",
                    &scopedCameraFov, 20.0f, 140.0f, L"%.0f deg");
 
-        DrawSectionHeading(rightX, firstY + 246, columnWidth, L"Session");
+        DrawSectionHeading(rightX, firstY + 246, rightColumnWidth, L"Session");
         wchar_t status[80]{};
         std::swprintf(status, 80, L"%.0f FPS    %zu players", io.Framerate, playerCount);
         Text(status, Rect(rightX + 10, firstY + 286,
-             rightX + columnWidth, firstY + 321),
+             rightX + rightColumnWidth, firstY + 321),
              g.regular.Get(), Muted());
         Text(L"Unload the module and restore all hooks safely.",
-             Rect(rightX + 10, firstY + 334, rightX + columnWidth, firstY + 374),
+             Rect(rightX + 10, firstY + 334, rightX + rightColumnWidth, firstY + 374),
              g.regular.Get(), Muted());
         const D2D1_RECT_F unload = Rect(rightX, firstY + 392,
-                                       rightX + columnWidth, firstY + 436);
+                                       rightX + rightColumnWidth, firstY + 436);
         GradientRounded(unload, 7, Color(1.0f, 0.10f, 0.19f), Color(0.60f, 0.01f, 0.06f), true);
         InnerGlow(unload, 7);
         Text(L"Unload DLL", unload, g.centered.Get(), White());

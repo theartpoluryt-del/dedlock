@@ -95,6 +95,7 @@ extern bool enemyPlayerNamesEnabled, allyPlayerNamesEnabled;
 extern bool enemyDistanceEnabled, allyDistanceEnabled;
 extern bool enemySnaplinesEnabled, allySnaplinesEnabled;
 extern bool enemyBonesEnabled, allyBonesEnabled;
+extern float enemyEspMaxDistance, allyEspMaxDistance, creepEspMaxDistance;
 extern float enemyBoxColor[4], teammateBoxColor[4];
 extern float enemyNameColor[4], teammateNameColor[4];
 extern float enemySkeletonColor[4], teammateSkeletonColor[4];

@@ -76,6 +76,9 @@ bool enemyPlayerNamesEnabled = true, allyPlayerNamesEnabled = true;
 bool enemyDistanceEnabled = true, allyDistanceEnabled = true;
 bool enemySnaplinesEnabled = true, allySnaplinesEnabled = true;
 bool enemyBonesEnabled = true, allyBonesEnabled = true;
+float enemyEspMaxDistance = 200.0f;
+float allyEspMaxDistance = 200.0f;
+float creepEspMaxDistance = 120.0f;
 float enemyBoxColor[4] = {0.20f, 1.00f, 0.10f, 1.00f};
 float teammateBoxColor[4] = {0.20f, 0.60f, 1.00f, 1.00f};
 float enemyPlayerNameColor[4] = {0.25f, 0.85f, 1.00f, 1.00f};
@@ -164,6 +167,9 @@ void LoadConfig() {
         else if (key == "allyPlayerNamesEnabled") allyPlayerNamesEnabled = value;
         if (key == "enemyDistanceEnabled") enemyDistanceEnabled = value;
         else if (key == "allyDistanceEnabled") allyDistanceEnabled = value;
+        else if (key == "enemyEspMaxDistance") enemyEspMaxDistance = std::clamp(static_cast<float>(number), 10.0f, 500.0f);
+        else if (key == "allyEspMaxDistance") allyEspMaxDistance = std::clamp(static_cast<float>(number), 10.0f, 500.0f);
+        else if (key == "creepEspMaxDistance") creepEspMaxDistance = std::clamp(static_cast<float>(number), 10.0f, 500.0f);
         else if (key == "enemySnaplinesEnabled") enemySnaplinesEnabled = value;
         else if (key == "allySnaplinesEnabled") allySnaplinesEnabled = value;
         else if (key == "enemyBonesEnabled") enemyBonesEnabled = value;
@@ -366,6 +372,9 @@ void SaveConfig() {
            << "allyPlayerNamesEnabled " << allyPlayerNamesEnabled << '\n'
            << "enemyDistanceEnabled " << enemyDistanceEnabled << '\n'
            << "allyDistanceEnabled " << allyDistanceEnabled << '\n'
+           << "enemyEspMaxDistance " << enemyEspMaxDistance << '\n'
+           << "allyEspMaxDistance " << allyEspMaxDistance << '\n'
+           << "creepEspMaxDistance " << creepEspMaxDistance << '\n'
            << "enemySnaplinesEnabled " << enemySnaplinesEnabled << '\n'
            << "allySnaplinesEnabled " << allySnaplinesEnabled << '\n'
            << "enemyBonesEnabled " << enemyBonesEnabled << '\n'

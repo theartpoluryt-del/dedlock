@@ -1810,6 +1810,11 @@ void RenderESP(const std::vector<PlayerData>& players) {
             const float* healthValueColorValue = ally
                 ? allyCreepHealthValueColor : creepHealthValueColor;
             if (!drawThisCreep) continue;
+            const float dx = creep.pos.x - currentLocalPosition.x;
+            const float dy = creep.pos.y - currentLocalPosition.y;
+            const float dz = creep.pos.z - currentLocalPosition.z;
+            const float distance = std::sqrt(dx * dx + dy * dy + dz * dz) / 39.37f;
+            if (distance > creepEspMaxDistance) continue;
             const ImColor color = neutral
                 ? ImColor(190, 190, 190, 150)
                 : ImColor(boxColor[0], boxColor[1], boxColor[2], boxColor[3]);
@@ -1839,10 +1844,6 @@ void RenderESP(const std::vector<PlayerData>& players) {
                            originScreen.y + originOffsetY),
                     3.0f, color, 12);
             }
-            const float dx = creep.pos.x - currentLocalPosition.x;
-            const float dy = creep.pos.y - currentLocalPosition.y;
-            const float dz = creep.pos.z - currentLocalPosition.z;
-            const float distance = std::sqrt(dx * dx + dy * dy + dz * dz) / 39.37f;
             char distanceText[24]{};
             std::snprintf(distanceText, sizeof(distanceText), "%.0fm", distance);
             const ImVec2 textSize = ImGui::CalcTextSize(distanceText);
@@ -2043,10 +2044,11 @@ void RenderESP(const std::vector<PlayerData>& players) {
         const float teamBoxThickness = ally ? allyBoxThickness : enemyBoxThickness;
         const float teamCornerLength = ally ? allyCornerBoxLength : enemyCornerBoxLength;
         const bool teamEsp = ally ? allyEspEnabled : enemyEspEnabled;
+        const float teamMaxDistance = ally ? allyEspMaxDistance : enemyEspMaxDistance;
         const bool teamSnaplines = ally ? allySnaplinesEnabled : enemySnaplinesEnabled;
         // Snaplines belong to the same team ESP channel. Do this gate before
         // both the off-screen and on-screen snapline paths below.
-        if (!teamEsp) continue;
+        if (!teamEsp || player.distance > teamMaxDistance) continue;
         // worldPos and box bounds use the fenced AbsOrigin sample. Bones are
         // rebuilt from the same completed frame before they are projected.
         const Vector3 visualOrigin = player.worldPos;
@@ -2156,6 +2158,13 @@ void RenderESP(const std::vector<PlayerData>& players) {
             drawList->AddText(position, color, text.c_str());
             headerY -= 14.0f;
         };
+        // drawHeaderLine grows upward.  Emit in reverse visual order so the
+        // actual in-game stack reads top-to-bottom: hero, player, HP.
+        if (teamHealth && teamHealthValues) {
+            const std::string healthText = std::to_string(player.health) + "/" +
+                                           std::to_string(player.maxHealth);
+            drawHeaderLine(healthText, healthValueColor);
+        }
         if (teamPlayerNames) drawHeaderLine(player.playerName, playerNameColor);
         if (teamNames) drawHeaderLine(player.heroName, nameColor);
 
@@ -2190,10 +2199,6 @@ void RenderESP(const std::vector<PlayerData>& players) {
                 healthBarColor
             );
 
-            if (teamHealthValues) {
-                const std::string healthText = std::to_string(player.health) + "/" + std::to_string(player.maxHealth);
-                drawHeaderLine(healthText, healthValueColor);
-            }
         }
 
         if (teamDistance && player.distance > 0.0f) {
