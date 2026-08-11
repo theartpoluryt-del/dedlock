@@ -1262,7 +1262,12 @@ bool GetPanoramaPreviewSkeleton(Preview3DPoint* points, std::size_t count) {
 
 void SetPanoramaPreviewHero(int heroId) {
     switch (heroId) {
-        case 1: case 7: case 12: case 13: case 19: case 27:
+        case 1: case 2: case 3: case 4: case 6: case 7: case 8:
+        case 10: case 11: case 12: case 13: case 14: case 15: case 16:
+        case 17: case 18: case 19: case 20: case 25: case 27: case 31:
+        case 35: case 50: case 52: case 58: case 60: case 63: case 64:
+        case 65: case 66: case 67: case 69: case 72: case 76: case 77:
+        case 79: case 80: case 81:
             break;
         case 55: // models/npc/trooper/trooper.vmdl_c
             break;

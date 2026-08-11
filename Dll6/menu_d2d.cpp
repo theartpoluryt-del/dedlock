@@ -52,6 +52,9 @@ struct Renderer {
     uint64_t previewFreezeSerial = 0;
     ComPtr<ID2D1Bitmap> tabIcons[4];
     ComPtr<ID2D1Bitmap> previewAbilityIcons[4];
+    ComPtr<ID2D1Bitmap> previewHeroPortraits[38];
+    int previewAbilityHeroIndex = -1;
+    int heroPopupFirst = 0;
     ComPtr<ID2D1Bitmap> sceneBitmap;
     ComPtr<ID2D1BitmapRenderTarget> blurTarget;
     ComPtr<ID2D1Bitmap> blurBitmap;
@@ -122,6 +125,7 @@ struct Popup {
     const wchar_t* items[8]{};
     int count = 0;
     int selected = 0;
+    bool heroes = false;
     D2D1_RECT_F rect{};
 };
 
@@ -131,6 +135,27 @@ int popupSelectionValue = -1;
 float menuAccentColor[4] = {0.15f, 0.62f, 1.00f, 1.00f};
 static const wchar_t* const kFarmModes[] = {L"Normal", L"pSilent", L"Mixed"};
 static const wchar_t* const kFarmActivationModes[] = {L"Hold", L"Toggle"};
+static const int kPreviewHeroIds[] = {
+    1, 2, 3, 4, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+    20, 25, 27, 31, 35, 50, 52, 58, 60, 63, 64, 65, 66, 67, 69,
+    72, 76, 77, 79, 80, 81};
+static const wchar_t* const kPreviewHeroNames[] = {
+    L"Infernus", L"Seven", L"Vindicta", L"Lady Geist", L"Abrams",
+    L"Wraith", L"McGinnis", L"Paradox", L"Dynamo", L"Kelvin",
+    L"Haze", L"Holliday", L"Bebop", L"Calico", L"Grey Talon",
+    L"Mo & Krill", L"Shiv", L"Ivy", L"Warden", L"Yamato", L"Lash",
+    L"Viscous", L"Pocket", L"Mirage", L"Vyper", L"Sinclair", L"Mina",
+    L"Drifter", L"Venator", L"Victor", L"Paige", L"The Doorman",
+    L"Billy", L"Graves", L"Apollo", L"Rem", L"Silver", L"Celeste"};
+
+static_assert(std::size(kPreviewHeroIds) == std::size(kPreviewHeroNames));
+
+int PreviewHeroIndex(int heroId) {
+    for (int i = 0; i < static_cast<int>(std::size(kPreviewHeroIds)); ++i) {
+        if (kPreviewHeroIds[i] == heroId) return i;
+    }
+    return 0;
+}
 
 D2D1_COLOR_F Color(float r, float gg, float b, float a = 1.0f) {
     return D2D1::ColorF(r, gg, b, a);
@@ -545,6 +570,59 @@ void DrawCombo(const Layout& l, int id, float x, float y, float width,
     }
 }
 
+void DrawHeroCombo(const Layout& l, int id, float x, float y, float width,
+                   const wchar_t* label, int* value) {
+    constexpr int heroCount = static_cast<int>(std::size(kPreviewHeroNames));
+    constexpr int visibleRows = 8;
+    constexpr float rowHeight = 44.0f;
+    if (!value) return;
+    *value = std::clamp(*value, 0, heroCount - 1);
+    const float baseY = y;
+    NoteContent(x, baseY + 42.0f);
+    y = ScrolledY(x, y);
+    Text(label, Rect(x + 10, y + 2, x + width - 190, y + 40),
+         g.regular.Get(), White());
+    const D2D1_RECT_F button = Rect(x + width - 190, y, x + width, y + 42);
+    GradientRounded(button, 6, Color(0.075f, 0.078f, 0.094f),
+                    Color(0.050f, 0.052f, 0.064f), true);
+    StrokeRounded(button, 6, Border());
+    if (g.previewHeroPortraits[*value]) {
+        g.target->DrawBitmap(g.previewHeroPortraits[*value].Get(),
+                             Rect(button.left + 5, button.top + 5,
+                                  button.left + 37, button.bottom - 5),
+                             1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    }
+    Text(kPreviewHeroNames[*value],
+         Rect(button.left + 43, button.top, button.right - 27, button.bottom),
+         g.regular.Get(), White());
+    Line(D2D1::Point2F(button.right - 19, button.top + 17),
+         D2D1::Point2F(button.right - 13, button.top + 23), Muted(), 1.4f);
+    Line(D2D1::Point2F(button.right - 13, button.top + 23),
+         D2D1::Point2F(button.right - 7, button.top + 17), Muted(), 1.4f);
+    if (ColumnVisible(x, y, 42.0f) && Clicked(l, button)) {
+        const bool opening = g.openCombo != id;
+        g.openCombo = opening ? id : 0;
+        if (opening) {
+            g.heroPopupFirst = std::clamp(*value - visibleRows / 2, 0,
+                                          heroCount - visibleRows);
+        }
+    }
+    if (g.openCombo == id) {
+        pendingPopup = {};
+        pendingPopup.id = id;
+        pendingPopup.count = heroCount;
+        pendingPopup.selected = *value;
+        pendingPopup.heroes = true;
+        const float popupHeight = visibleRows * rowHeight + 8.0f;
+        const float popupTop = button.bottom + 5.0f + popupHeight > kDesignHeight
+            ? button.top - 5.0f - popupHeight
+            : button.bottom + 5.0f;
+        pendingPopup.rect = Rect(button.left, popupTop, button.right,
+                                 popupTop + popupHeight);
+        g.comboPopupRect = pendingPopup.rect;
+    }
+}
+
 void DrawEspChip(const Layout& l, float x, float y, float width,
                  const wchar_t* label, bool* value,
                  const float* colorValue = nullptr) {
@@ -645,7 +723,8 @@ float DrawPreviewTile(const Layout& l, float x, float y,
 }
 
 void DrawHeroEspPreview(float x, float y, float width, float height,
-                        const wchar_t* presetLabel, bool enabled,
+                        const wchar_t* presetLabel,
+                        const wchar_t* selectedHeroName, bool enabled,
                         bool boxes, bool cornerBoxes,
                         bool skeleton, bool health, bool healthValue,
                         bool heroName, bool playerName, bool distance,
@@ -855,7 +934,8 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
     }
     float labelY = y + 86.0f;
     if (heroName) {
-        Text(L"Infernus", Rect(left - 20, labelY, right + 20, labelY + 24),
+        Text(selectedHeroName ? selectedHeroName : L"Hero",
+             Rect(left - 20, labelY, right + 20, labelY + 24),
              g.centered.Get(), Color(nameColor[0], nameColor[1], nameColor[2]));
         labelY += 23.0f;
     }
@@ -939,7 +1019,9 @@ void DrawKeyBind(const Layout& l, float x, float y, float width,
 
 void DrawPopup(const Layout& l) {
     if (pendingPopup.id && g.openCombo == pendingPopup.id) {
-        if (pendingPopup.count <= 0 || pendingPopup.count > 8) {
+        const int maximumCount = pendingPopup.heroes
+            ? static_cast<int>(std::size(kPreviewHeroNames)) : 8;
+        if (pendingPopup.count <= 0 || pendingPopup.count > maximumCount) {
             g.openCombo = 0;
             pendingPopup = {};
             return;
@@ -950,21 +1032,52 @@ void DrawPopup(const Layout& l) {
         GlowRounded(r, 7, Color(0, 0, 0, 0.55f), 4, 2.0f);
         FillRounded(r, 7, Color(0.045f, 0.047f, 0.058f, 0.995f));
         StrokeRounded(r, 7, Border());
-        for (int i = 0; i < pendingPopup.count; ++i) {
-            const D2D1_RECT_F item = Rect(r.left + 4, r.top + 4 + i * 38.0f,
-                                         r.right - 4, r.top + 4 + (i + 1) * 38.0f - 4);
-            if (i == pendingPopup.selected)
+        constexpr int visibleHeroRows = 8;
+        constexpr float heroRowHeight = 44.0f;
+        if (pendingPopup.heroes && Contains(r, l.mouse)) {
+            const float wheel = ImGui::GetIO().MouseWheel;
+            if (wheel != 0.0f) {
+                const int maximumFirst = pendingPopup.count - visibleHeroRows;
+                g.heroPopupFirst = std::clamp(
+                    g.heroPopupFirst - (wheel > 0.0f ? 1 : -1),
+                    0, (std::max)(0, maximumFirst));
+            }
+        }
+        const int first = pendingPopup.heroes ? g.heroPopupFirst : 0;
+        const int visibleCount = pendingPopup.heroes
+            ? (std::min)(visibleHeroRows, pendingPopup.count - first)
+            : pendingPopup.count;
+        const float rowHeight = pendingPopup.heroes ? heroRowHeight : 38.0f;
+        for (int row = 0; row < visibleCount; ++row) {
+            const int itemIndex = first + row;
+            const D2D1_RECT_F item = Rect(
+                r.left + 4, r.top + 4 + row * rowHeight,
+                r.right - 4, r.top + 4 + (row + 1) * rowHeight - 4);
+            if (itemIndex == pendingPopup.selected)
                 FillRounded(item, 5, Color(0.94f, 0.025f, 0.12f, 0.16f));
             else if (Contains(item, l.mouse))
                 FillRounded(item, 5, Color(1, 1, 1, 0.04f));
-            const wchar_t* itemLabel = pendingPopup.items[i] ? pendingPopup.items[i] : L"";
-            Text(itemLabel, Rect(item.left + 10, item.top, item.right, item.bottom),
-                 g.regular.Get(), i == pendingPopup.selected ? Red() : White());
-        if (l.clicked && Contains(item, l.mouse)) {
-            popupSelectionId = pendingPopup.id;
-            popupSelectionValue = i;
-            g.openCombo = 0;
-        }
+            const wchar_t* itemLabel = pendingPopup.heroes
+                ? kPreviewHeroNames[itemIndex]
+                : (pendingPopup.items[itemIndex]
+                       ? pendingPopup.items[itemIndex] : L"");
+            float textLeft = item.left + 10.0f;
+            if (pendingPopup.heroes && g.previewHeroPortraits[itemIndex]) {
+                g.target->DrawBitmap(
+                    g.previewHeroPortraits[itemIndex].Get(),
+                    Rect(item.left + 4, item.top + 2,
+                         item.left + 40, item.bottom - 2),
+                    1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                textLeft = item.left + 48.0f;
+            }
+            Text(itemLabel, Rect(textLeft, item.top, item.right, item.bottom),
+                 g.regular.Get(),
+                 itemIndex == pendingPopup.selected ? Red() : White());
+            if (l.clicked && Contains(item, l.mouse)) {
+                popupSelectionId = pendingPopup.id;
+                popupSelectionValue = itemIndex;
+                g.openCombo = 0;
+            }
         }
     }
 
@@ -1146,9 +1259,22 @@ void LoadEmbeddedAssets() {
                           IDR_ICON_SPROUT, IDR_ICON_SETTINGS};
     for (int i = 0; i < 4; ++i)
         LoadEmbeddedBitmap(iconIds[i], g.tabIcons[i]);
-    for (int i = 0; i < 4; ++i)
-        LoadEmbeddedBitmap(IDR_ABILITY_INFERNUS_1 + i,
-                           g.previewAbilityIcons[i], true);
+    for (int i = 0; i < static_cast<int>(std::size(kPreviewHeroIds)); ++i)
+        LoadEmbeddedBitmap(IDR_HERO_PORTRAIT_BASE + i,
+                           g.previewHeroPortraits[i]);
+}
+
+void EnsurePreviewAbilityAssets(int heroIndex) {
+    const int heroCount = static_cast<int>(std::size(kPreviewHeroIds));
+    if (heroIndex < 0 || heroIndex >= heroCount) heroIndex = -1;
+    if (g.previewAbilityHeroIndex == heroIndex) return;
+    for (auto& icon : g.previewAbilityIcons) icon.Reset();
+    g.previewAbilityHeroIndex = heroIndex;
+    if (heroIndex < 0) return;
+    const UINT firstResource = IDR_ABILITY_INFERNUS_1 + heroIndex * 4;
+    for (int slot = 0; slot < 4; ++slot)
+        LoadEmbeddedBitmap(firstResource + slot,
+                           g.previewAbilityIcons[slot], true);
 }
 
 bool BindPreview3DFrame(const Preview3DFrame& frame,
@@ -1458,6 +1584,9 @@ void ResetTarget() {
     g.previewFreezeAfterDrag = false;
     g.previewFreezeSerial = 0;
     for (auto& icon : g.tabIcons) icon.Reset();
+    for (auto& icon : g.previewAbilityIcons) icon.Reset();
+    for (auto& portrait : g.previewHeroPortraits) portrait.Reset();
+    g.previewAbilityHeroIndex = -1;
     g.blurBitmap.Reset();
     g.blurTarget.Reset();
     g.sceneBitmap.Reset();
@@ -1965,7 +2094,7 @@ void RenderD2DMenu(std::size_t playerCount) {
         l.mouse.y >= viewportTop && l.mouse.y <= contentPanelBottom;
     const float previousLeftMax = ColumnMaxScroll(g.leftContentBottom);
     const float previousRightMax = ColumnMaxScroll(g.rightContentBottom);
-    if (mouseInColumnViewport && io.MouseWheel != 0.0f) {
+    if (mouseInColumnViewport && io.MouseWheel != 0.0f && !g.openCombo) {
         const float scrollStep = 72.0f * io.MouseWheel;
         if (l.mouse.x >= leftX && l.mouse.x < rightX)
             g.leftColumnScroll = std::clamp(g.leftColumnScroll + scrollStep,
@@ -2020,9 +2149,16 @@ void RenderD2DMenu(std::size_t playerCount) {
                                  g.visualTeam == 1 ? &allyEspMaxDistance : &creepEspMaxDistance;
         float* teamBoxThickness = &boxThickness;
         float* teamCornerLength = &cornerBoxLength;
+        const int previewHeroIndex = g.visualTeam < 2
+            ? PreviewHeroIndex(GetPanoramaPreviewHeroForRole(g.visualTeam))
+            : -1;
+        const wchar_t* previewHeroName = previewHeroIndex >= 0
+            ? kPreviewHeroNames[previewHeroIndex] : L"Creep";
+        EnsurePreviewAbilityAssets(previewHeroIndex);
         DrawHeroEspPreview(1020.0f, 0.0f, 410.0f, kDesignHeight,
                            g.visualTeam == 0 ? L"Enemy preset" :
                            g.visualTeam == 1 ? L"Ally preset" : L"Creep preset",
+                           previewHeroName,
                            *teamEsp,
                            *teamBoxes, *teamCornerBoxes, *teamBones,
                            *teamHealth, *teamHealthValues, *teamNames,
@@ -2104,21 +2240,26 @@ void RenderD2DMenu(std::size_t playerCount) {
             const float fullWidth = rightX + rightColumnWidth - leftX;
             if (g.visualTeam < 2) {
                 DrawSectionHeading(leftX, firstY + 18, fullWidth, L"General");
-                DrawToggle(l, leftX, firstY + 58, fullWidth,
+                int previewHero = PreviewHeroIndex(
+                    GetPanoramaPreviewHeroForRole(g.visualTeam));
+                DrawHeroCombo(l, g.visualTeam == 0 ? 501 : 502,
+                              leftX, firstY + 74, fullWidth,
+                              L"Preview hero", &previewHero);
+                DrawToggle(l, leftX, firstY + 118, fullWidth,
                            L"Enable ESP", L"", teamEsp);
-                DrawSlider(l, leftX, firstY + 128, fullWidth,
+                DrawSlider(l, leftX, firstY + 188, fullWidth,
                            L"Max render distance", teamMaxDistance,
                            10.0f, 500.0f, L"%.0f m");
-                DrawSectionHeading(leftX, firstY + 210, fullWidth, L"Appearance");
-                DrawToggle(l, leftX, firstY + 250, fullWidth,
+                DrawSectionHeading(leftX, firstY + 270, fullWidth, L"Appearance");
+                DrawToggle(l, leftX, firstY + 310, fullWidth,
                            L"Model glow", L"", teamGlowEnabled);
                 const wchar_t* glowModes[] = {L"HP-based fill", L"Normal fill"};
                 int* teamGlowMode = g.visualTeam == 0 ? &enemyGlowMode : &allyGlowMode;
-                DrawCombo(l, 401, leftX, firstY + 320, fullWidth, L"Glow mode",
+                DrawCombo(l, 401, leftX, firstY + 380, fullWidth, L"Glow mode",
                           teamGlowMode, glowModes, 2);
-                DrawSlider(l, leftX, firstY + 390, fullWidth, L"Box thickness",
+                DrawSlider(l, leftX, firstY + 450, fullWidth, L"Box thickness",
                            teamBoxThickness, 0.5f, 4.0f, L"%.2f px");
-                DrawSlider(l, leftX, firstY + 460, fullWidth, L"Corner length",
+                DrawSlider(l, leftX, firstY + 520, fullWidth, L"Corner length",
                            teamCornerLength, 0.10f, 0.35f, L"%.2f");
             } else {
                 DrawSectionHeading(leftX, firstY + 18, fullWidth, L"General");
@@ -2395,6 +2536,16 @@ void RenderD2DMenu(std::size_t playerCount) {
     } else if (popupSelectionId == 401) {
         if (g.visualTeam == 0) enemyGlowMode = popupSelectionValue;
         else if (g.visualTeam == 1) allyGlowMode = popupSelectionValue;
+    } else if (popupSelectionId == 501) {
+        SetPanoramaPreviewHeroForRole(
+            0, kPreviewHeroIds[std::clamp(
+                   popupSelectionValue, 0,
+                   static_cast<int>(std::size(kPreviewHeroIds)) - 1)]);
+    } else if (popupSelectionId == 502) {
+        SetPanoramaPreviewHeroForRole(
+            1, kPreviewHeroIds[std::clamp(
+                   popupSelectionValue, 0,
+                   static_cast<int>(std::size(kPreviewHeroIds)) - 1)]);
     }
     if (pushedMenuLayer)
         g.target->PopLayer();
