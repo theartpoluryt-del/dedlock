@@ -51,6 +51,7 @@ struct Renderer {
     bool previewFreezeAfterDrag = false;
     uint64_t previewFreezeSerial = 0;
     ComPtr<ID2D1Bitmap> tabIcons[4];
+    ComPtr<ID2D1Bitmap> previewAbilityIcons[4];
     ComPtr<ID2D1Bitmap> sceneBitmap;
     ComPtr<ID2D1BitmapRenderTarget> blurTarget;
     ComPtr<ID2D1Bitmap> blurBitmap;
@@ -127,6 +128,7 @@ struct Popup {
 Popup pendingPopup{};
 int popupSelectionId = 0;
 int popupSelectionValue = -1;
+float menuAccentColor[4] = {0.15f, 0.62f, 1.00f, 1.00f};
 static const wchar_t* const kFarmModes[] = {L"Normal", L"pSilent", L"Mixed"};
 static const wchar_t* const kFarmActivationModes[] = {L"Hold", L"Toggle"};
 
@@ -647,7 +649,7 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
                         bool boxes, bool cornerBoxes,
                         bool skeleton, bool health, bool healthValue,
                         bool heroName, bool playerName, bool distance,
-                        bool snaplines, const float* boxColor,
+                        bool snaplines, bool abilities, const float* boxColor,
                         const float* skeletonColor, const float* healthColor,
                         const float* nameColor, const float* playerColor,
                         const float* healthValueColor, float previewBoxThickness,
@@ -655,7 +657,7 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
                         bool* enabledToggle, bool* boxesToggle, bool* cornerToggle,
                         bool* skeletonToggle, bool* healthToggle, bool* healthValueToggle,
                         bool* heroNameToggle, bool* playerNameToggle, bool* distanceToggle,
-                        bool* snaplineToggle) {
+                        bool* snaplineToggle, bool* abilitiesToggle) {
     GlowRounded(Rect(x, y, x + width, y + height), 16,
                 Color(0, 0, 0, 0.65f), 5, 2.0f);
     FillRounded(Rect(x, y, x + width, y + height), 8,
@@ -708,6 +710,7 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
     drawFlowTile(L"Health", healthToggle);
     drawFlowTile(L"Health bar", healthValueToggle);
     drawFlowTile(L"Snapline", snaplineToggle);
+    drawFlowTile(L"Abilities", abilitiesToggle);
     // Keep the character aspect ratio from the source sheet. The previous
     // crop used coordinates for a 2048px image, while the embedded reference
     // is 2515px wide; that selected half of two poses and pushed the hero out
@@ -865,6 +868,56 @@ void DrawHeroEspPreview(float x, float y, float width, float height,
     if (distance)
         Text(L"12m", Rect(cx - 35, bottom + 2, cx + 35, bottom + 26),
              g.centered.Get(), Muted());
+    // Abilities are a regular D2D overlay, just like the box and labels above.
+    // Do not resize captureRect/renderRect: Panorama must keep its original
+    // destination and aspect ratio. DrawBitmap is intentionally used instead
+    // of FillOpacityMask so a PBGRA WIC bitmap cannot invalidate the target.
+    if (abilities) {
+        constexpr float iconSize = 54.0f;
+        constexpr float iconGap = 5.0f;
+        constexpr float levelGap = 3.0f;
+        constexpr float levelHeight = 4.0f;
+        constexpr int maxAbilityLevel = 3;
+        constexpr int previewLevels[4] = {3, 2, 1, 0};
+        const float rowWidth = iconSize * 4.0f + iconGap * 3.0f;
+        float iconX = stage.left + ((stage.right - stage.left) - rowWidth) * 0.5f;
+        const float iconY = stage.bottom - iconSize - levelHeight - 10.0f;
+        for (int slot = 0; slot < 4; ++slot) {
+            const D2D1_RECT_F tile = Rect(
+                iconX, iconY, iconX + iconSize, iconY + iconSize);
+            FillRounded(tile, 2.0f,
+                        Color(221.0f / 255.0f, 213.0f / 255.0f, 195.0f / 255.0f));
+            if (g.previewAbilityIcons[slot]) {
+                const D2D1_RECT_F image = Rect(
+                    tile.left + 2.0f, tile.top + 2.0f,
+                    tile.right - 2.0f, tile.bottom - 2.0f);
+                g.target->DrawBitmap(
+                    g.previewAbilityIcons[slot].Get(), image, 1.0f,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            }
+            StrokeRounded(tile, 2.0f,
+                          Color(62.0f / 255.0f, 54.0f / 255.0f, 43.0f / 255.0f), 1.0f);
+            const float levelY = tile.bottom + 3.0f;
+            FillRounded(Rect(tile.left + 1.0f, levelY - 1.0f,
+                             tile.right - 1.0f, levelY + levelHeight + 1.0f),
+                        1.0f,
+                        Color(58.0f / 255.0f, 50.0f / 255.0f, 39.0f / 255.0f));
+            const float levelWidth =
+                (iconSize - 6.0f - (maxAbilityLevel - 1) * levelGap) /
+                maxAbilityLevel;
+            for (int level = 0; level < maxAbilityLevel; ++level) {
+                const float levelX = tile.left + 3.0f +
+                    level * (levelWidth + levelGap);
+                const D2D1_COLOR_F levelColor = level < previewLevels[slot]
+                    ? Color(74.0f / 255.0f, 210.0f / 255.0f, 112.0f / 255.0f)
+                    : Color(210.0f / 255.0f, 76.0f / 255.0f, 65.0f / 255.0f);
+                FillRounded(Rect(levelX, levelY,
+                                 levelX + levelWidth, levelY + levelHeight),
+                            0.5f, levelColor);
+            }
+            iconX += iconSize + iconGap;
+        }
+    }
     if (snaplines)
         Line(D2D1::Point2F(x + width * 0.5f, stage.bottom - 8),
              D2D1::Point2F(cx, bottom), Color(1, 1, 1, 0.70f), 1.0f);
@@ -1019,7 +1072,8 @@ bool EnsureFactories() {
     return true;
 }
 
-bool LoadEmbeddedBitmap(UINT resourceId, ComPtr<ID2D1Bitmap>& output) {
+bool LoadEmbeddedBitmap(UINT resourceId, ComPtr<ID2D1Bitmap>& output,
+                        bool tintBlack = false) {
     if (output) return true;
     if (!moduleHandle || !g.wicFactory || !g.target) return false;
 
@@ -1044,9 +1098,42 @@ bool LoadEmbeddedBitmap(UINT resourceId, ComPtr<ID2D1Bitmap>& output) {
         FAILED(g.wicFactory->CreateFormatConverter(&converter)) ||
         FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA,
                                      WICBitmapDitherTypeNone, nullptr, 0.0,
-                                     WICBitmapPaletteTypeCustom)) ||
+                                     WICBitmapPaletteTypeCustom))) {
+        output.Reset();
+        return false;
+    }
+    if (!tintBlack) {
+        if (FAILED(g.target->CreateBitmapFromWicBitmap(
+                converter.Get(), nullptr, output.GetAddressOf()))) {
+            output.Reset();
+            return false;
+        }
+        return true;
+    }
+
+    UINT width = 0;
+    UINT height = 0;
+    if (FAILED(converter->GetSize(&width, &height)) || !width || !height)
+        return false;
+    const UINT stride = width * 4;
+    std::vector<BYTE> pixels(static_cast<size_t>(stride) * height);
+    if (FAILED(converter->CopyPixels(nullptr, stride,
+                                     static_cast<UINT>(pixels.size()),
+                                     pixels.data()))) return false;
+    // 32bppPBGRA: clear B/G/R and preserve the decoded alpha channel. This
+    // produces a true black silhouette without an opacity-mask draw call.
+    for (size_t pixel = 0; pixel + 3 < pixels.size(); pixel += 4) {
+        pixels[pixel + 0] = 0;
+        pixels[pixel + 1] = 0;
+        pixels[pixel + 2] = 0;
+    }
+    ComPtr<IWICBitmap> blackBitmap;
+    if (FAILED(g.wicFactory->CreateBitmapFromMemory(
+            width, height, GUID_WICPixelFormat32bppPBGRA,
+            stride, static_cast<UINT>(pixels.size()), pixels.data(),
+            blackBitmap.GetAddressOf())) ||
         FAILED(g.target->CreateBitmapFromWicBitmap(
-            converter.Get(), nullptr, output.GetAddressOf()))) {
+            blackBitmap.Get(), nullptr, output.GetAddressOf()))) {
         output.Reset();
         return false;
     }
@@ -1059,6 +1146,9 @@ void LoadEmbeddedAssets() {
                           IDR_ICON_SPROUT, IDR_ICON_SETTINGS};
     for (int i = 0; i < 4; ++i)
         LoadEmbeddedBitmap(iconIds[i], g.tabIcons[i]);
+    for (int i = 0; i < 4; ++i)
+        LoadEmbeddedBitmap(IDR_ABILITY_INFERNUS_1 + i,
+                           g.previewAbilityIcons[i], true);
 }
 
 bool BindPreview3DFrame(const Preview3DFrame& frame,
@@ -1913,6 +2003,8 @@ void RenderD2DMenu(std::size_t playerCount) {
         bool* teamDistance = g.visualTeam == 0 ? &enemyDistanceEnabled :
                              g.visualTeam == 1 ? &allyDistanceEnabled : &creepDistanceEnabled;
         bool* teamSnaplines = g.visualTeam == 0 ? &enemySnaplinesEnabled : &allySnaplinesEnabled;
+        bool* teamAbilities = g.visualTeam == 0 ? &enemyAbilitiesEnabled :
+                              g.visualTeam == 1 ? &allyAbilitiesEnabled : &creepAbilitiesEnabled;
         bool* teamBones = g.visualTeam == 0 ? &enemyBonesEnabled : &allyBonesEnabled;
         float* teamBoxColor = g.visualTeam == 0 ? enemyBoxColor :
                               g.visualTeam == 1 ? teammateBoxColor : creepBoxColor;
@@ -1926,23 +2018,21 @@ void RenderD2DMenu(std::size_t playerCount) {
         bool* teamGlowEnabled = g.visualTeam == 0 ? &enemyGlowEnabled : &allyGlowEnabled;
         float* teamMaxDistance = g.visualTeam == 0 ? &enemyEspMaxDistance :
                                  g.visualTeam == 1 ? &allyEspMaxDistance : &creepEspMaxDistance;
-        float* teamBoxThickness = g.visualTeam == 0 ? &enemyBoxThickness :
-                                  g.visualTeam == 1 ? &allyBoxThickness : &boxThickness;
-        float* teamCornerLength = g.visualTeam == 0 ? &enemyCornerBoxLength :
-                                  g.visualTeam == 1 ? &allyCornerBoxLength : &cornerBoxLength;
+        float* teamBoxThickness = &boxThickness;
+        float* teamCornerLength = &cornerBoxLength;
         DrawHeroEspPreview(1020.0f, 0.0f, 410.0f, kDesignHeight,
                            g.visualTeam == 0 ? L"Enemy preset" :
                            g.visualTeam == 1 ? L"Ally preset" : L"Creep preset",
                            *teamEsp,
                            *teamBoxes, *teamCornerBoxes, *teamBones,
                            *teamHealth, *teamHealthValues, *teamNames,
-                           *teamPlayerNames, *teamDistance, *teamSnaplines,
+                           *teamPlayerNames, *teamDistance, *teamSnaplines, *teamAbilities,
                            teamBoxColor, teamSkeletonColor, teamHealthColor,
                            teamNameColor, teamPlayerColor, teamHealthValueColor,
                            *teamBoxThickness, *teamCornerLength, l,
                            teamEsp, teamBoxes, teamCornerBoxes, teamBones,
                            teamHealth, teamHealthValues, teamNames, teamPlayerNames,
-                           teamDistance, teamSnaplines);
+                           teamDistance, teamSnaplines, teamAbilities);
 
         // Boolean ESP controls live in the preview companion window. Keep the
         // old in-card layout disabled so controls cannot be duplicated.

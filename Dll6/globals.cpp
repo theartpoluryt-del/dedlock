@@ -22,7 +22,7 @@ std::mutex movementDebugWishMutex; Vector3 movementDebugWishDirection{}; bool mo
 #include <sstream>
 volatile ULONGLONG lastSilentAttackAppliedAt = 0;
 volatile LONG autoOrbAttackAppliedCount = 0;
-uintptr_t clientBase=0; bool menuOpen=false,drawEsp=true,drawBoxes=true,drawHealth=true,drawHealthValues=true,drawNames=true,drawDistance=true,drawSnaplines=false,drawFovCircle=true,drawFarmFovCircle=false,drawBones=false,drawCreepEsp=false,farmAssist=false,autoLastHitOrbs=false,drawOrbEsp=false,drawSpectatorList=false,collisionDiagnostics=false,remSizedHull=false,glowEnabled=true,aimAssist=true,autoParry=true,imguiInitialized=false,consoleAttached=false; float aimFov=180.0f,farmFov=180.0f,aimSmooth=6.0f,fovCircleAlpha=110.0f,farmFovAlpha=110.0f,snaplineAlpha=180.0f; bool aimVisibilityCheck=true; Vector3 currentLocalPosition{}; bool currentLocalPositionReady=false; Vector3 currentCameraPosition{}; bool currentCameraPositionReady=false; uintptr_t currentLocalPawn=0; uint32_t currentLocalPawnHandle=0xFFFFFFFFu; std::mutex meleeObjectsMutex; std::vector<uintptr_t> meleeObjects; std::mutex silentAnglesMutex; Vector3 pendingSilentAngles{}; bool pendingSilentAnglesReady=false,pendingSilentAttack=false; std::mutex humanSilentMutex,creepSilentMutex,orbSilentMutex; Vector3 pendingHumanAngles{},pendingCreepAngles{},pendingOrbAngles{}; bool pendingHumanReady=false,pendingCreepReady=false,pendingOrbReady=false,pendingOrbAttack=false; std::mutex farmTargetsMutex; std::vector<FarmTarget> farmTargets; std::mutex orbTargetsMutex; std::vector<OrbTarget> orbTargets;
+uintptr_t clientBase=0; bool menuOpen=false,drawEsp=true,drawBoxes=true,drawHealth=true,drawHealthValues=true,drawNames=true,drawDistance=true,drawSnaplines=false,drawFovCircle=true,drawFarmFovCircle=false,drawBones=false,drawCreepEsp=false,farmAssist=false,autoLastHitOrbs=false,drawOrbEsp=false,drawSpectatorList=false,collisionDiagnostics=false,remSizedHull=false,glowEnabled=true,aimAssist=true,autoParry=true,imguiInitialized=false,consoleAttached=false; float aimFov=180.0f,farmFov=180.0f,aimSmooth=6.0f,fovCircleAlpha=110.0f,farmFovAlpha=110.0f,snaplineAlpha=180.0f; bool aimVisibilityCheck=true; Vector3 currentLocalPosition{}; bool currentLocalPositionReady=false; Vector3 currentCameraPosition{}; bool currentCameraPositionReady=false; uintptr_t currentLocalPawn=0; uint32_t currentLocalPawnHandle=0xFFFFFFFFu; std::mutex meleeObjectsMutex; std::vector<uintptr_t> meleeObjects; std::mutex silentAnglesMutex; Vector3 pendingSilentAngles{}; bool pendingSilentAnglesReady=false,pendingSilentAttack=false; std::mutex humanSilentMutex,creepSilentMutex,orbSilentMutex; Vector3 pendingHumanAngles{},pendingCreepAngles{},pendingOrbAngles{}; bool pendingHumanReady=false,pendingCreepReady=false,pendingOrbReady=false,pendingOrbAttack=false; std::mutex farmTargetsMutex; std::vector<FarmTarget> farmTargets; std::mutex orbTargetsMutex; std::vector<OrbTarget> orbTargets; std::mutex worldEspTargetsMutex; std::vector<WorldEspTarget> worldEspTargets;
 ID3D11Texture2D* depthStaging=nullptr; UINT depthWidth=0,depthHeight=0; DXGI_FORMAT depthFormat=DXGI_FORMAT_UNKNOWN; bool depthSnapshotReady=false; int depthDiagnosticState=-1; Matrix4x4 currentViewMatrix{}; bool currentViewMatrixReady=false;
 ID3D11Device* pDevice=nullptr; ID3D11DeviceContext* pContext=nullptr; ID3D11RenderTargetView* pRenderTargetView=nullptr; HWND gameWindow=nullptr; WNDPROC oWndProc=nullptr; HMODULE moduleHandle=nullptr; void** presentVTable=nullptr; volatile LONG unloadRequested=0,unloadThreadStarted=0; std::mutex glowMutex,heroPawnsMutex; std::unordered_set<uintptr_t> registeredGlows,queuedGlows; EspStatus espStatus; std::unordered_map<uintptr_t,bool> combatVTables; std::vector<uintptr_t> heroVTables,heroPawns; HANDLE heroDiscoveryThread=nullptr,glowApplyThread=nullptr,farmTargetThread=nullptr,stopHeroDiscoveryEvent=nullptr; PresentFn oPresent=nullptr;
 bool humanAimTargetFound = false;
@@ -67,6 +67,7 @@ bool drawTeammates = false;
 bool drawPlayerNames = false;
 bool cornerBoxes = true;
 bool enemyEspEnabled = true, allyEspEnabled = false;
+bool enemyAbilitiesEnabled = true, allyAbilitiesEnabled = true, creepAbilitiesEnabled = false;
 bool enemyBoxesEnabled = true, allyBoxesEnabled = true;
 bool enemyCornerBoxesEnabled = true, allyCornerBoxesEnabled = true;
 bool enemyHealthEnabled = true, allyHealthEnabled = true;
@@ -76,9 +77,6 @@ bool enemyPlayerNamesEnabled = true, allyPlayerNamesEnabled = true;
 bool enemyDistanceEnabled = true, allyDistanceEnabled = true;
 bool enemySnaplinesEnabled = true, allySnaplinesEnabled = true;
 bool enemyBonesEnabled = true, allyBonesEnabled = true;
-float enemyEspMaxDistance = 200.0f;
-float allyEspMaxDistance = 200.0f;
-float creepEspMaxDistance = 120.0f;
 float enemyBoxColor[4] = {0.20f, 1.00f, 0.10f, 1.00f};
 float teammateBoxColor[4] = {0.20f, 0.60f, 1.00f, 1.00f};
 float enemyPlayerNameColor[4] = {0.25f, 0.85f, 1.00f, 1.00f};
@@ -99,17 +97,8 @@ float enemyHealthColor[4] = {0.20f, 1.00f, 0.25f, 1.00f};
 float teammateHealthColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
 float boxThickness = 1.20f;
 float cornerBoxLength = 0.24f;
-float enemyBoxThickness = 1.20f;
-float allyBoxThickness = 1.20f;
-float enemyCornerBoxLength = 0.24f;
-float allyCornerBoxLength = 0.24f;
-bool fovChangerEnabled = false;
-bool overrideScopeFov = false;
-int menuTheme = 0;
-float menuAccentColor[4] = {0.15f, 0.62f, 1.00f, 1.00f};
-float cameraFov = 90.0f;
-float scopedCameraFov = 90.0f;
-bool creepEspEnabled = false, creepBoxesEnabled = true, creepCornerBoxesEnabled = false;
+bool creepEspEnabled = false, neutralCreepEspEnabled = false,
+     creepBoxesEnabled = true, creepCornerBoxesEnabled = false;
 bool creepHealthEnabled = true, creepHealthValuesEnabled = true, creepDistanceEnabled = true;
 float creepBoxColor[4] = {1.00f, 0.67f, 0.05f, 1.00f};
 float creepHealthColor[4] = {0.25f, 0.90f, 0.35f, 1.00f};
@@ -119,6 +108,27 @@ bool allyCreepHealthEnabled = true, allyCreepHealthValuesEnabled = true, allyCre
 float allyCreepBoxColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
 float allyCreepHealthColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
 float allyCreepHealthValueColor[4] = {0.70f, 0.85f, 1.00f, 1.00f};
+float enemyEspMaxDistance = 150.0f, allyEspMaxDistance = 150.0f,
+      creepEspMaxDistance = 80.0f;
+bool powerupEspEnabled = false;
+bool enemyTrooperChams = false, allyTrooperChams = false,
+     neutralChams = false;
+float enemyTrooperChamsColor[4] = {1.00f, 0.22f, 0.12f, 1.00f};
+float allyTrooperChamsColor[4] = {0.20f, 0.60f, 1.00f, 1.00f};
+float neutralChamsColor[4] = {1.00f, 0.72f, 0.12f, 1.00f};
+bool fovChangerEnabled = false, overrideScopeFov = false;
+float cameraFov = 90.0f, scopedCameraFov = 90.0f;
+bool worldModulationEnabled = false, disableSkybox = false;
+float skyboxColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
+float skyboxBrightness = 1.0f;
+float propsColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
+float lightColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
+float lightBrightness = 1.0f;
+float worldColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
+bool talonEspEnabled = false, campTimersEnabled = false,
+     campTimersOnScreen = true, campTimersOnMinimap = false;
+float talonEspColor[4] = {0.95f, 0.35f, 0.12f, 1.00f};
+float campTimerColor[4] = {1.00f, 0.82f, 0.20f, 1.00f};
 namespace {
 std::string ConfigPath() {
     // Manual-map injectors do not register the image in the loader list, so
@@ -153,6 +163,9 @@ void LoadConfig() {
         if (key == "drawEsp") drawEsp = value;
         if (key == "enemyEspEnabled") enemyEspEnabled = value;
         else if (key == "allyEspEnabled") allyEspEnabled = value;
+        else if (key == "enemyAbilitiesEnabled") enemyAbilitiesEnabled = value;
+        else if (key == "allyAbilitiesEnabled") allyAbilitiesEnabled = value;
+        else if (key == "creepAbilitiesEnabled") creepAbilitiesEnabled = value;
         else if (key == "enemyBoxesEnabled") enemyBoxesEnabled = value;
         else if (key == "allyBoxesEnabled") allyBoxesEnabled = value;
         else if (key == "enemyCornerBoxesEnabled") enemyCornerBoxesEnabled = value;
@@ -167,9 +180,6 @@ void LoadConfig() {
         else if (key == "allyPlayerNamesEnabled") allyPlayerNamesEnabled = value;
         if (key == "enemyDistanceEnabled") enemyDistanceEnabled = value;
         else if (key == "allyDistanceEnabled") allyDistanceEnabled = value;
-        else if (key == "enemyEspMaxDistance") enemyEspMaxDistance = std::clamp(static_cast<float>(number), 10.0f, 500.0f);
-        else if (key == "allyEspMaxDistance") allyEspMaxDistance = std::clamp(static_cast<float>(number), 10.0f, 500.0f);
-        else if (key == "creepEspMaxDistance") creepEspMaxDistance = std::clamp(static_cast<float>(number), 10.0f, 500.0f);
         else if (key == "enemySnaplinesEnabled") enemySnaplinesEnabled = value;
         else if (key == "allySnaplinesEnabled") allySnaplinesEnabled = value;
         else if (key == "enemyBonesEnabled") enemyBonesEnabled = value;
@@ -185,6 +195,7 @@ void LoadConfig() {
         else if (key == "drawBones") drawBones = value;
         else if (key == "drawCreepEsp") drawCreepEsp = value;
         else if (key == "creepEspEnabled") creepEspEnabled = value;
+        else if (key == "neutralCreepEspEnabled") neutralCreepEspEnabled = value;
         else if (key == "creepBoxesEnabled") creepBoxesEnabled = value;
         else if (key == "creepCornerBoxesEnabled") creepCornerBoxesEnabled = value;
         else if (key == "creepHealthEnabled") creepHealthEnabled = value;
@@ -196,15 +207,31 @@ void LoadConfig() {
         else if (key == "allyCreepHealthEnabled") allyCreepHealthEnabled = value;
         else if (key == "allyCreepHealthValuesEnabled") allyCreepHealthValuesEnabled = value;
         else if (key == "allyCreepDistanceEnabled") allyCreepDistanceEnabled = value;
+        else if (key == "enemyEspMaxDistance") enemyEspMaxDistance = static_cast<float>(number);
+        else if (key == "allyEspMaxDistance") allyEspMaxDistance = static_cast<float>(number);
+        else if (key == "creepEspMaxDistance") creepEspMaxDistance = static_cast<float>(number);
+        else if (key == "powerupEspEnabled") powerupEspEnabled = value;
+        // Migrate old Chams presets to the ordinary Creep ESP switches.
+        else if (key == "enemyTrooperChams") creepEspEnabled = value;
+        else if (key == "allyTrooperChams") allyCreepEspEnabled = value;
+        else if (key == "neutralChams") neutralCreepEspEnabled = value;
+        else if (key == "fovChangerEnabled") fovChangerEnabled = value;
+        else if (key == "overrideScopeFov") overrideScopeFov = value;
+        else if (key == "cameraFov") cameraFov = static_cast<float>(number);
+        else if (key == "scopedCameraFov") scopedCameraFov = static_cast<float>(number);
+        else if (key == "worldModulationEnabled") worldModulationEnabled = value;
+        else if (key == "disableSkybox") disableSkybox = value;
+        else if (key == "skyboxBrightness") skyboxBrightness = static_cast<float>(number);
+        else if (key == "lightBrightness") lightBrightness = static_cast<float>(number);
+        else if (key == "talonEspEnabled") talonEspEnabled = value;
+        else if (key == "campTimersEnabled") campTimersEnabled = value;
+        else if (key == "campTimersOnScreen") campTimersOnScreen = value;
+        else if (key == "campTimersOnMinimap") campTimersOnMinimap = value;
         else if (key == "drawTeammates") drawTeammates = value;
         else if (key == "drawPlayerNames") drawPlayerNames = value;
         else if (key == "cornerBoxes") cornerBoxes = value;
         else if (key == "boxThickness") boxThickness = static_cast<float>(number);
-        else if (key == "cornerBoxLength") cornerBoxLength = std::clamp(static_cast<float>(number), 0.10f, 0.35f);
-        else if (key == "enemyBoxThickness") enemyBoxThickness = static_cast<float>(number);
-        else if (key == "allyBoxThickness") allyBoxThickness = static_cast<float>(number);
-        else if (key == "enemyCornerBoxLength") enemyCornerBoxLength = std::clamp(static_cast<float>(number), 0.10f, 0.35f);
-        else if (key == "allyCornerBoxLength") allyCornerBoxLength = std::clamp(static_cast<float>(number), 0.10f, 0.35f);
+        else if (key == "cornerBoxLength") cornerBoxLength = static_cast<float>(number);
         else if (key == "enemyBoxR") enemyBoxColor[0] = static_cast<float>(number);
         else if (key == "enemyBoxG") enemyBoxColor[1] = static_cast<float>(number);
         else if (key == "enemyBoxB") enemyBoxColor[2] = static_cast<float>(number);
@@ -295,6 +322,42 @@ void LoadConfig() {
         else if (key == "allyCreepHealthValueG") allyCreepHealthValueColor[1] = static_cast<float>(number);
         else if (key == "allyCreepHealthValueB") allyCreepHealthValueColor[2] = static_cast<float>(number);
         else if (key == "allyCreepHealthValueA") allyCreepHealthValueColor[3] = static_cast<float>(number);
+        else if (key == "enemyTrooperChamsR") enemyTrooperChamsColor[0] = static_cast<float>(number);
+        else if (key == "enemyTrooperChamsG") enemyTrooperChamsColor[1] = static_cast<float>(number);
+        else if (key == "enemyTrooperChamsB") enemyTrooperChamsColor[2] = static_cast<float>(number);
+        else if (key == "enemyTrooperChamsA") enemyTrooperChamsColor[3] = static_cast<float>(number);
+        else if (key == "allyTrooperChamsR") allyTrooperChamsColor[0] = static_cast<float>(number);
+        else if (key == "allyTrooperChamsG") allyTrooperChamsColor[1] = static_cast<float>(number);
+        else if (key == "allyTrooperChamsB") allyTrooperChamsColor[2] = static_cast<float>(number);
+        else if (key == "allyTrooperChamsA") allyTrooperChamsColor[3] = static_cast<float>(number);
+        else if (key == "neutralChamsR") neutralChamsColor[0] = static_cast<float>(number);
+        else if (key == "neutralChamsG") neutralChamsColor[1] = static_cast<float>(number);
+        else if (key == "neutralChamsB") neutralChamsColor[2] = static_cast<float>(number);
+        else if (key == "neutralChamsA") neutralChamsColor[3] = static_cast<float>(number);
+        else if (key == "skyboxColorR") skyboxColor[0] = static_cast<float>(number);
+        else if (key == "skyboxColorG") skyboxColor[1] = static_cast<float>(number);
+        else if (key == "skyboxColorB") skyboxColor[2] = static_cast<float>(number);
+        else if (key == "skyboxColorA") skyboxColor[3] = static_cast<float>(number);
+        else if (key == "propsColorR") propsColor[0] = static_cast<float>(number);
+        else if (key == "propsColorG") propsColor[1] = static_cast<float>(number);
+        else if (key == "propsColorB") propsColor[2] = static_cast<float>(number);
+        else if (key == "propsColorA") propsColor[3] = static_cast<float>(number);
+        else if (key == "lightColorR") lightColor[0] = static_cast<float>(number);
+        else if (key == "lightColorG") lightColor[1] = static_cast<float>(number);
+        else if (key == "lightColorB") lightColor[2] = static_cast<float>(number);
+        else if (key == "lightColorA") lightColor[3] = static_cast<float>(number);
+        else if (key == "worldColorR") worldColor[0] = static_cast<float>(number);
+        else if (key == "worldColorG") worldColor[1] = static_cast<float>(number);
+        else if (key == "worldColorB") worldColor[2] = static_cast<float>(number);
+        else if (key == "worldColorA") worldColor[3] = static_cast<float>(number);
+        else if (key == "talonEspColorR") talonEspColor[0] = static_cast<float>(number);
+        else if (key == "talonEspColorG") talonEspColor[1] = static_cast<float>(number);
+        else if (key == "talonEspColorB") talonEspColor[2] = static_cast<float>(number);
+        else if (key == "talonEspColorA") talonEspColor[3] = static_cast<float>(number);
+        else if (key == "campTimerColorR") campTimerColor[0] = static_cast<float>(number);
+        else if (key == "campTimerColorG") campTimerColor[1] = static_cast<float>(number);
+        else if (key == "campTimerColorB") campTimerColor[2] = static_cast<float>(number);
+        else if (key == "campTimerColorA") campTimerColor[3] = static_cast<float>(number);
         else if (key == "enemyGlowMode") enemyGlowMode = static_cast<int>(number);
         else if (key == "allyGlowMode") allyGlowMode = static_cast<int>(number);
         // Compatibility with older configs that had one shared mode.
@@ -307,14 +370,6 @@ void LoadConfig() {
         if (key == "freeCam") freeCam = value;
         else if (key == "freeCamKey") freeCamKey = static_cast<int>(number);
         else if (key == "freeCamSpeed") freeCamSpeed = static_cast<float>(number);
-        else if (key == "fovChangerEnabled") fovChangerEnabled = value;
-        else if (key == "menuTheme") menuTheme = std::clamp(static_cast<int>(number), 0, 2);
-        else if (key == "menuAccentR") menuAccentColor[0] = std::clamp(static_cast<float>(number), 0.0f, 1.0f);
-        else if (key == "menuAccentG") menuAccentColor[1] = std::clamp(static_cast<float>(number), 0.0f, 1.0f);
-        else if (key == "menuAccentB") menuAccentColor[2] = std::clamp(static_cast<float>(number), 0.0f, 1.0f);
-        else if (key == "overrideScopeFov") overrideScopeFov = value;
-        else if (key == "cameraFov") cameraFov = static_cast<float>(number);
-        else if (key == "scopedCameraFov") scopedCameraFov = static_cast<float>(number);
         if (key == "farmAssist") farmAssist = value;
         if (key == "autoLastHitOrbs") autoLastHitOrbs = value;
         else if (key == "autoLastHitOrbsAutoFire") autoLastHitOrbsAutoFire = value;
@@ -358,6 +413,9 @@ void SaveConfig() {
     output << "drawEsp " << drawEsp << '\n'
            << "enemyEspEnabled " << enemyEspEnabled << '\n'
            << "allyEspEnabled " << allyEspEnabled << '\n'
+           << "enemyAbilitiesEnabled " << enemyAbilitiesEnabled << '\n'
+           << "allyAbilitiesEnabled " << allyAbilitiesEnabled << '\n'
+           << "creepAbilitiesEnabled " << creepAbilitiesEnabled << '\n'
            << "enemyBoxesEnabled " << enemyBoxesEnabled << '\n'
            << "allyBoxesEnabled " << allyBoxesEnabled << '\n'
            << "enemyCornerBoxesEnabled " << enemyCornerBoxesEnabled << '\n'
@@ -372,9 +430,6 @@ void SaveConfig() {
            << "allyPlayerNamesEnabled " << allyPlayerNamesEnabled << '\n'
            << "enemyDistanceEnabled " << enemyDistanceEnabled << '\n'
            << "allyDistanceEnabled " << allyDistanceEnabled << '\n'
-           << "enemyEspMaxDistance " << enemyEspMaxDistance << '\n'
-           << "allyEspMaxDistance " << allyEspMaxDistance << '\n'
-           << "creepEspMaxDistance " << creepEspMaxDistance << '\n'
            << "enemySnaplinesEnabled " << enemySnaplinesEnabled << '\n'
            << "allySnaplinesEnabled " << allySnaplinesEnabled << '\n'
            << "enemyBonesEnabled " << enemyBonesEnabled << '\n'
@@ -390,6 +445,7 @@ void SaveConfig() {
            << "drawBones " << drawBones << '\n'
            << "drawCreepEsp " << drawCreepEsp << '\n'
            << "creepEspEnabled " << creepEspEnabled << '\n'
+           << "neutralCreepEspEnabled " << neutralCreepEspEnabled << '\n'
            << "creepBoxesEnabled " << creepBoxesEnabled << '\n'
            << "creepCornerBoxesEnabled " << creepCornerBoxesEnabled << '\n'
            << "creepHealthEnabled " << creepHealthEnabled << '\n'
@@ -401,15 +457,30 @@ void SaveConfig() {
            << "allyCreepHealthEnabled " << allyCreepHealthEnabled << '\n'
            << "allyCreepHealthValuesEnabled " << allyCreepHealthValuesEnabled << '\n'
            << "allyCreepDistanceEnabled " << allyCreepDistanceEnabled << '\n'
+           << "enemyEspMaxDistance " << enemyEspMaxDistance << '\n'
+           << "allyEspMaxDistance " << allyEspMaxDistance << '\n'
+           << "creepEspMaxDistance " << creepEspMaxDistance << '\n'
+           << "powerupEspEnabled " << powerupEspEnabled << '\n'
+           << "enemyTrooperChams " << enemyTrooperChams << '\n'
+           << "allyTrooperChams " << allyTrooperChams << '\n'
+           << "neutralChams " << neutralChams << '\n'
+           << "fovChangerEnabled " << fovChangerEnabled << '\n'
+           << "overrideScopeFov " << overrideScopeFov << '\n'
+           << "cameraFov " << cameraFov << '\n'
+           << "scopedCameraFov " << scopedCameraFov << '\n'
+           << "worldModulationEnabled " << worldModulationEnabled << '\n'
+           << "disableSkybox " << disableSkybox << '\n'
+           << "skyboxBrightness " << skyboxBrightness << '\n'
+           << "lightBrightness " << lightBrightness << '\n'
+           << "talonEspEnabled " << talonEspEnabled << '\n'
+           << "campTimersEnabled " << campTimersEnabled << '\n'
+           << "campTimersOnScreen " << campTimersOnScreen << '\n'
+           << "campTimersOnMinimap " << campTimersOnMinimap << '\n'
            << "drawTeammates " << drawTeammates << '\n'
            << "drawPlayerNames " << drawPlayerNames << '\n'
            << "cornerBoxes " << cornerBoxes << '\n'
            << "boxThickness " << boxThickness << '\n'
            << "cornerBoxLength " << cornerBoxLength << '\n'
-           << "enemyBoxThickness " << enemyBoxThickness << '\n'
-           << "allyBoxThickness " << allyBoxThickness << '\n'
-           << "enemyCornerBoxLength " << enemyCornerBoxLength << '\n'
-           << "allyCornerBoxLength " << allyCornerBoxLength << '\n'
            << "enemyBoxR " << enemyBoxColor[0] << '\n'
            << "enemyBoxG " << enemyBoxColor[1] << '\n'
            << "enemyBoxB " << enemyBoxColor[2] << '\n'
@@ -499,7 +570,43 @@ void SaveConfig() {
             << "allyCreepHealthValueR " << allyCreepHealthValueColor[0] << '\n'
             << "allyCreepHealthValueG " << allyCreepHealthValueColor[1] << '\n'
             << "allyCreepHealthValueB " << allyCreepHealthValueColor[2] << '\n'
-            << "allyCreepHealthValueA " << allyCreepHealthValueColor[3] << '\n'
+             << "allyCreepHealthValueA " << allyCreepHealthValueColor[3] << '\n'
+             << "enemyTrooperChamsR " << enemyTrooperChamsColor[0] << '\n'
+             << "enemyTrooperChamsG " << enemyTrooperChamsColor[1] << '\n'
+             << "enemyTrooperChamsB " << enemyTrooperChamsColor[2] << '\n'
+             << "enemyTrooperChamsA " << enemyTrooperChamsColor[3] << '\n'
+             << "allyTrooperChamsR " << allyTrooperChamsColor[0] << '\n'
+             << "allyTrooperChamsG " << allyTrooperChamsColor[1] << '\n'
+             << "allyTrooperChamsB " << allyTrooperChamsColor[2] << '\n'
+             << "allyTrooperChamsA " << allyTrooperChamsColor[3] << '\n'
+             << "neutralChamsR " << neutralChamsColor[0] << '\n'
+             << "neutralChamsG " << neutralChamsColor[1] << '\n'
+             << "neutralChamsB " << neutralChamsColor[2] << '\n'
+             << "neutralChamsA " << neutralChamsColor[3] << '\n'
+             << "skyboxColorR " << skyboxColor[0] << '\n'
+             << "skyboxColorG " << skyboxColor[1] << '\n'
+             << "skyboxColorB " << skyboxColor[2] << '\n'
+             << "skyboxColorA " << skyboxColor[3] << '\n'
+             << "propsColorR " << propsColor[0] << '\n'
+             << "propsColorG " << propsColor[1] << '\n'
+             << "propsColorB " << propsColor[2] << '\n'
+             << "propsColorA " << propsColor[3] << '\n'
+             << "lightColorR " << lightColor[0] << '\n'
+             << "lightColorG " << lightColor[1] << '\n'
+             << "lightColorB " << lightColor[2] << '\n'
+             << "lightColorA " << lightColor[3] << '\n'
+             << "worldColorR " << worldColor[0] << '\n'
+             << "worldColorG " << worldColor[1] << '\n'
+             << "worldColorB " << worldColor[2] << '\n'
+             << "worldColorA " << worldColor[3] << '\n'
+             << "talonEspColorR " << talonEspColor[0] << '\n'
+             << "talonEspColorG " << talonEspColor[1] << '\n'
+             << "talonEspColorB " << talonEspColor[2] << '\n'
+             << "talonEspColorA " << talonEspColor[3] << '\n'
+             << "campTimerColorR " << campTimerColor[0] << '\n'
+             << "campTimerColorG " << campTimerColor[1] << '\n'
+             << "campTimerColorB " << campTimerColor[2] << '\n'
+             << "campTimerColorA " << campTimerColor[3] << '\n'
            << "enemyGlowMode " << enemyGlowMode << '\n'
            << "allyGlowMode " << allyGlowMode << '\n'
            << "drawOrbEsp " << drawOrbEsp << '\n'
@@ -507,14 +614,6 @@ void SaveConfig() {
            << "freeCam " << freeCam << '\n'
            << "freeCamKey " << freeCamKey << '\n'
            << "freeCamSpeed " << freeCamSpeed << '\n'
-           << "fovChangerEnabled " << fovChangerEnabled << '\n'
-           << "menuTheme " << menuTheme << '\n'
-           << "menuAccentR " << menuAccentColor[0] << '\n'
-           << "menuAccentG " << menuAccentColor[1] << '\n'
-           << "menuAccentB " << menuAccentColor[2] << '\n'
-           << "overrideScopeFov " << overrideScopeFov << '\n'
-           << "cameraFov " << cameraFov << '\n'
-           << "scopedCameraFov " << scopedCameraFov << '\n'
            << "farmAssist " << farmAssist << '\n'
            << "autoLastHitOrbs " << autoLastHitOrbs << '\n'
            << "autoLastHitOrbsAutoFire " << autoLastHitOrbsAutoFire << '\n'

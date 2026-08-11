@@ -446,7 +446,12 @@ bool InitializePatternOffsets() {
     printf("[+] ViewMatrix: %s offset=0x%llX\n",
            cameraOrigin ? "pattern" : "fallback",
            static_cast<unsigned long long>(Offsets::ViewMatrix));
-    return cameraOrigin != 0;
+    // GameEntitySystem is the mandatory resolver for entity features. Camera
+    // matrices may not be published during early injection/menu transitions;
+    // treating their temporary absence as a fatal pattern failure unloads the
+    // entire DLL even though the entity system and live schema are valid.
+    // Visual projection will simply wait for a valid matrix on a later frame.
+    return true;
 }
 
 uintptr_t FindUniqueClientPattern(const char* pattern) {
@@ -724,38 +729,41 @@ bool InitializeRuntimeOffsets() {
 namespace {
 using NativeGlowRegisterFn = void(__fastcall*)(uintptr_t);
 NativeGlowRegisterFn nativeGlowRegister = nullptr;
+NativeGlowRegisterFn nativeTrooperGlowRegister = nullptr;
 NativeGlowRegisterFn nativePreviewGlowRegister = nullptr;
 
-uintptr_t FindNativeGlowWrapper() {
+std::pair<uintptr_t, uintptr_t> FindNativeGlowWrappers() {
     const char* pattern =
         "48 89 5C 24 18 57 48 83 EC 30 48 8B F9 E8 ? ? ? ? "
         "48 8B 07 4C 8D 44 24 48 48 8D 54 24 40 C7 44 24 40 00 00 00 00 "
         "48 8B CF FF 90 60 09 00 00 8B D8 E8 ? ? ? ? F3 0F 10 44 24 48 "
         "4C 8D 4C 24 40 44 8B C3 F3 0F 11 44 24 20 48 8B D7 48 8B C8 E8 ? ? ? ?";
     const uintptr_t first = FindModulePattern(reinterpret_cast<HMODULE>(clientBase), pattern);
-    if (!first) return 0;
+    if (!first) return {};
     // The first match handles another glowable entity type. The following
     // identical wrapper is the player-pawn path in the current client.
-    return FindModulePattern(reinterpret_cast<HMODULE>(clientBase), pattern, first + 1);
+    return {first, FindModulePattern(
+        reinterpret_cast<HMODULE>(clientBase), pattern, first + 1)};
 }
 }
 
 bool InitializeNativeGlow() {
-    const uintptr_t previewWrapper = FindModulePattern(
-        reinterpret_cast<HMODULE>(clientBase),
-        "48 89 5C 24 18 57 48 83 EC 30 48 8B F9 E8 ? ? ? ? "
-        "48 8B 07 4C 8D 44 24 48 48 8D 54 24 40 C7 44 24 40 00 00 00 00 "
-        "48 8B CF FF 90 60 09 00 00 8B D8 E8 ? ? ? ? F3 0F 10 44 24 48 "
-        "4C 8D 4C 24 40 44 8B C3 F3 0F 11 44 24 20 48 8B D7 48 8B C8 E8 ? ? ? ?");
-    const uintptr_t wrapper = FindNativeGlowWrapper();
-    nativePreviewGlowRegister = reinterpret_cast<NativeGlowRegisterFn>(previewWrapper);
-    if (!wrapper) {
+    const auto [previewWrapper, playerWrapper] = FindNativeGlowWrappers();
+    // The first wrapper is the generic CGlowProperty registration path. It
+    // accepts NPC troopers; the second one is specific to player pawns.
+    nativeTrooperGlowRegister = reinterpret_cast<NativeGlowRegisterFn>(
+        previewWrapper);
+    nativePreviewGlowRegister = reinterpret_cast<NativeGlowRegisterFn>(
+        previewWrapper);
+    if (!playerWrapper) {
         nativeGlowReady = false;
         return false;
     }
-    nativeGlowRegister = reinterpret_cast<NativeGlowRegisterFn>(wrapper);
+    nativeGlowRegister = reinterpret_cast<NativeGlowRegisterFn>(playerWrapper);
     nativeGlowReady = true;
-    printf("[+] Native glow wrapper: %p\n", reinterpret_cast<void*>(wrapper));
+    printf("[+] Native glow wrappers: preview=%p player=%p\n",
+           reinterpret_cast<void*>(previewWrapper),
+           reinterpret_cast<void*>(playerWrapper));
     return true;
 }
 
@@ -765,7 +773,24 @@ bool RegisterNativePreviewGlow(uintptr_t entity) {
         nativePreviewGlowRegister(entity);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Keep the independent player-pawn registrar intact if this client
+        // build does not accept C_PortraitWorldUnit in the generic wrapper.
         nativePreviewGlowRegister = nullptr;
+        printf("[!] Native preview glow disabled after exception\n");
+        return false;
+    }
+}
+
+bool RegisterNativeTrooperGlow(uintptr_t entity) {
+    if (!nativeTrooperGlowRegister || !entity) return false;
+    __try {
+        nativeTrooperGlowRegister(entity);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Do not disable the player or portrait paths if a future game build
+        // changes only the generic NPC registration wrapper.
+        nativeTrooperGlowRegister = nullptr;
+        printf("[!] Native trooper glow disabled after exception\n");
         return false;
     }
 }

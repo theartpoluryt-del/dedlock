@@ -1,4 +1,6 @@
 #include "shared.h"
+#include "resource.h"
+#include <wincodec.h>
 extern bool InvertMatrix(const Matrix4x4&, Matrix4x4&);
 #include <algorithm>
 #include <array>
@@ -1120,6 +1122,13 @@ std::vector<PlayerData> GetPlayers() {
     std::vector<PlayerData> players;
     espStatus = {};
 
+    struct CooldownObservation {
+        float endTime{};
+        float duration{};
+        ULONGLONG observedAt{};
+    };
+    static std::unordered_map<uintptr_t, CooldownObservation> cooldownObservations;
+
     if (!clientBase) return players;
 
     Matrix4x4 viewMatrix{};
@@ -1286,6 +1295,113 @@ std::vector<PlayerData> GetPlayers() {
         }
         player.team = team;
         player.heroName = ReadHeroName(entity);
+        // Ability handles and their replicated state are resolved through the
+        // runtime schema offsets.  Only the four hero slots are kept; weapons
+        // and items occupy other slots in the same network vector.
+        const uintptr_t abilityComponent = entity + Offsets::AbilityComponent;
+        const int abilityCount = std::clamp(Read<int>(abilityComponent + Offsets::AbilityVector), 0, 64);
+        const uintptr_t abilityHandles = Read<uintptr_t>(abilityComponent + Offsets::AbilityVector + 8);
+        const auto decodeAbilityLevel = [](uint32_t packedInfo) {
+            // The live client encodes purchased tiers as a cumulative mask in
+            // bits 16..19: 0x1 = level 0, 0x3 = level 1, 0x7 = level 2,
+            // 0xF = level 3.  Bit 0 is an unrelated validity flag.
+            const uint32_t tierMask = (packedInfo >> 16) & 0xFu;
+            const int setTiers = static_cast<int>(tierMask & 0x1u) +
+                                 static_cast<int>((tierMask >> 1) & 0x1u) +
+                                 static_cast<int>((tierMask >> 2) & 0x1u) +
+                                 static_cast<int>((tierMask >> 3) & 0x1u);
+            return std::clamp(setTiers - 1, 0, 3);
+        };
+        std::array<int, 4> replicatedAbilityLevels{ -1, -1, -1, -1 };
+        int upgradeStateCount = 0;
+        uintptr_t upgradeStates = 0;
+        if (controller) {
+            const uintptr_t playerData = controller + Offsets::ControllerPlayerData;
+            upgradeStateCount = std::clamp(
+                Read<int>(playerData + Offsets::PlayerDataAbilityUpgradeStates), 0, 32);
+            upgradeStates = Read<uintptr_t>(
+                playerData + Offsets::PlayerDataAbilityUpgradeStates + 8);
+            // AbilityUpgradeState_t is 0x38 bytes in the live Windows
+            // schema: m_ItemID is at 0x30 and packed m_nUpgradeInfo at 0x34.
+            constexpr uintptr_t abilityUpgradeStateStride = 0x38;
+            for (int slot = 0; slot < static_cast<int>(replicatedAbilityLevels.size()) &&
+                               slot < upgradeStateCount && upgradeStates; ++slot) {
+                const uint32_t packedInfo = Read<uint32_t>(upgradeStates +
+                    static_cast<uintptr_t>(slot) * abilityUpgradeStateStride +
+                    Offsets::AbilityUpgradeStateInfo);
+                replicatedAbilityLevels[slot] = decodeAbilityLevel(packedInfo);
+            }
+        }
+        const float gameTime = GetClientGameTime();
+        for (int i = 0; i < abilityCount && abilityHandles; ++i) {
+            const uintptr_t ability = ResolveEntity(Read<uint32_t>(abilityHandles + i * sizeof(uint32_t)));
+            if (!ability) continue;
+            const int slot = Read<int>(ability + Offsets::AbilitySlot);
+            if (slot < 0 || slot >= static_cast<int>(player.abilities.size())) continue;
+            const uint32_t packedUpgrade = Read<uint32_t>(ability + Offsets::AbilityUpgradeInfo);
+            auto& info = player.abilities[slot];
+            info.valid = true;
+            info.level = decodeAbilityLevel(packedUpgrade);
+            if (replicatedAbilityLevels[slot] >= 0)
+                info.level = replicatedAbilityLevels[slot];
+            const float start = Read<float>(ability + Offsets::AbilityCooldownStart);
+            const float end = Read<float>(ability + Offsets::AbilityCooldownEnd);
+            const float duration = end - start;
+            const float remaining = end - gameTime;
+            // A candidate GlobalVars pointer is only usable when its clock
+            // belongs to this exact server cooldown interval.  This rejects
+            // unrelated client clocks that advance normally but have another
+            // epoch, which otherwise makes a countdown begin at a wrong value.
+            const bool clockMatchesCooldown = std::isfinite(start) &&
+                std::isfinite(end) && gameTime >= start - 5.0f && gameTime <= end;
+            if (std::isfinite(gameTime) && gameTime > 0.0f &&
+                clockMatchesCooldown && remaining > 0.05f && remaining < 180.0f) {
+                info.cooldown = remaining;
+                info.cooldownDuration = duration > 0.05f && duration < 180.0f ? duration : remaining;
+            } else {
+                // m_flCooldownStart and m_flCooldownEnd are both replicated
+                // GameTime_t fields in the live client schema.  This fallback
+                // keeps a genuine countdown even in sessions where GlobalVars
+                // cannot be resolved: once the server publishes a new end
+                // time, decrease the server-provided duration using a local
+                // monotonic clock.
+                const ULONGLONG now = GetTickCount64();
+                if (std::isfinite(start) && std::isfinite(end) &&
+                    duration > 0.05f && duration < 180.0f) {
+                    auto& observation = cooldownObservations[ability];
+                    if (observation.observedAt == 0 ||
+                        std::fabs(observation.endTime - end) > 0.01f) {
+                        observation = { end, duration, now };
+                    }
+                    const float elapsed = static_cast<float>(now - observation.observedAt) / 1000.0f;
+                    const float fallbackRemaining = observation.duration - elapsed;
+                    info.cooldown = fallbackRemaining > 0.0f ? fallbackRemaining : 0.0f;
+                    info.cooldownDuration = observation.duration;
+                } else {
+                    cooldownObservations.erase(ability);
+                    info.cooldown = 0.0f;
+                    info.cooldownDuration = 0.0f;
+                }
+            }
+        }
+        {
+            constexpr uintptr_t abilityUpgradeStateStride = 0x38;
+            std::string state = player.heroName + " count=" + std::to_string(upgradeStateCount);
+            for (int index = 0; index < upgradeStateCount && upgradeStates; ++index) {
+                const uintptr_t entry = upgradeStates +
+                    static_cast<uintptr_t>(index) * abilityUpgradeStateStride;
+                state += " " + std::to_string(Read<uint32_t>(entry + 0x30)) + ":" +
+                    std::to_string(Read<uint32_t>(entry + Offsets::AbilityUpgradeStateInfo));
+            }
+            static std::unordered_map<uintptr_t, std::string> lastLoggedUpgradeStates;
+            if (lastLoggedUpgradeStates[entity] != state) {
+                lastLoggedUpgradeStates[entity] = state;
+                std::ofstream log(
+                    "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\ability_levels.log",
+                    std::ios::app);
+                if (log) log << state << '\n';
+            }
+        }
         const float dx = pos.x - distanceOrigin.x;
         const float dy = pos.y - distanceOrigin.y;
         const float dz = pos.z - distanceOrigin.z;
@@ -1307,6 +1423,47 @@ std::vector<PlayerData> GetPlayers() {
     }
 
     return players;
+}
+
+ID3D11ShaderResourceView* GetAbilityIconSrv(const std::string& heroName, int slot) {
+    static constexpr std::array<const char*, 38> heroNames = { "Infernus", "Seven", "Vindicta", "Lady Geist", "Abrams", "Wraith", "McGinnis", "Paradox", "Dynamo", "Kelvin", "Haze", "Holliday", "Bebop", "Calico", "Grey Talon", "Mo & Krill", "Shiv", "Ivy", "Warden", "Yamato", "Lash", "Viscous", "Pocket", "Mirage", "Vyper", "Sinclair", "Mina", "Drifter", "Venator", "Victor", "Paige", "The Doorman", "Billy", "Graves", "Apollo", "Rem", "Silver", "Celeste" };
+    const auto hero = std::find_if(heroNames.begin(), heroNames.end(), [&](const char* name) { return heroName == name; });
+    if (slot < 0 || slot >= 4 || hero == heroNames.end() || !pDevice || !moduleHandle) return nullptr;
+    const size_t index = static_cast<size_t>(hero - heroNames.begin()) * 4 + static_cast<size_t>(slot);
+    static std::array<ID3D11ShaderResourceView*, 152> icons{};
+    static std::array<bool, 152> attempted{};
+    if (icons[index] || attempted[index]) return icons[index];
+    attempted[index] = true;
+    HRSRC resource = FindResourceW(moduleHandle, MAKEINTRESOURCEW(108 + static_cast<UINT>(index)), MAKEINTRESOURCEW(10));
+    HGLOBAL data = resource ? LoadResource(moduleHandle, resource) : nullptr;
+    BYTE* bytes = data ? static_cast<BYTE*>(LockResource(data)) : nullptr;
+    const DWORD size = resource ? SizeofResource(moduleHandle, resource) : 0;
+    IWICImagingFactory* factory{}; IWICStream* stream{}; IWICBitmapDecoder* decoder{};
+    IWICBitmapFrameDecode* frame{}; IWICFormatConverter* converter{};
+    UINT width{}, height{}; std::vector<uint8_t> pixels; D3D11_TEXTURE2D_DESC desc{};
+    D3D11_SUBRESOURCE_DATA initial{}; ID3D11Texture2D* texture{};
+    if (!bytes || !size || FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory))) || FAILED(factory->CreateStream(&stream)) ||
+        FAILED(stream->InitializeFromMemory(bytes, size)) ||
+        FAILED(factory->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnLoad, &decoder)) ||
+        FAILED(decoder->GetFrame(0, &frame)) || FAILED(factory->CreateFormatConverter(&converter)) ||
+        FAILED(converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                     WICBitmapPaletteTypeCustom))) goto done;
+    converter->GetSize(&width, &height);
+    pixels.resize(static_cast<size_t>(width) * height * 4);
+    if (!width || !height || FAILED(converter->CopyPixels(nullptr, width * 4,
+            static_cast<UINT>(pixels.size()), pixels.data()))) goto done;
+    desc.Width=width; desc.Height=height; desc.MipLevels=1; desc.ArraySize=1;
+    desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count=1; desc.Usage=D3D11_USAGE_DEFAULT;
+    desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+    initial.pSysMem=pixels.data(); initial.SysMemPitch=width*4;
+    if (SUCCEEDED(pDevice->CreateTexture2D(&desc, &initial, &texture))) {
+        pDevice->CreateShaderResourceView(texture, nullptr, &icons[index]); texture->Release();
+    }
+done:
+    if(converter)converter->Release(); if(frame)frame->Release(); if(decoder)decoder->Release();
+    if(stream)stream->Release(); if(factory)factory->Release();
+    return icons[index];
 }
 
 void RenderESP(const std::vector<PlayerData>& players) {
@@ -2041,9 +2198,10 @@ void RenderESP(const std::vector<PlayerData>& players) {
         const uint8_t localTeam = currentLocalPawn
             ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
         const bool ally = localTeam != 0 && player.team == localTeam;
-        const float teamBoxThickness = ally ? allyBoxThickness : enemyBoxThickness;
-        const float teamCornerLength = ally ? allyCornerBoxLength : enemyCornerBoxLength;
+        const float teamBoxThickness = boxThickness;
+        const float teamCornerLength = cornerBoxLength;
         const bool teamEsp = ally ? allyEspEnabled : enemyEspEnabled;
+        const bool teamAbilities = ally ? allyAbilitiesEnabled : enemyAbilitiesEnabled;
         const float teamMaxDistance = ally ? allyEspMaxDistance : enemyEspMaxDistance;
         const bool teamSnaplines = ally ? allySnaplinesEnabled : enemySnaplinesEnabled;
         // Snaplines belong to the same team ESP channel. Do this gate before
@@ -2208,6 +2366,112 @@ void RenderESP(const std::vector<PlayerData>& players) {
                 ImColor(255, 255, 255, 200),
                 distText.c_str()
             );
+        }
+
+        int abilityCount = 0;
+        for (const auto& ability : player.abilities) abilityCount += ability.valid ? 1 : 0;
+        // Ability state is not replicated for every remote bot/player, but
+        // the hero identity is.  Do not hide its artwork merely because the
+        // server has no cooldown state to expose for that pawn.
+        const bool hasHeroAbilityArt = GetAbilityIconSrv(player.heroName, 0) != nullptr;
+        if (hasHeroAbilityArt) abilityCount = static_cast<int>(player.abilities.size());
+        if (teamAbilities && abilityCount) {
+            constexpr float gap = 3.0f;
+            // Scale with the projected box, so ability art follows the same
+            // distance/perspective behavior as the rest of the ESP.
+            const float iconSize = std::clamp((frameRight - frameLeft - gap * 3.0f) * 0.50f,
+                                              26.0f, 72.0f);
+            const float rowWidth = abilityCount * iconSize + (abilityCount - 1) * gap;
+            float iconX = screenX - rowWidth * 0.5f;
+            const float iconY = screenY + (teamDistance ? 25.0f : 8.0f);
+            for (size_t slot = 0; slot < player.abilities.size(); ++slot) {
+                const auto& ability = player.abilities[slot];
+                if (!ability.valid && !hasHeroAbilityArt) continue;
+                // Match the compact HUD-style treatment: a clean white tile
+                // with the transparent ability artwork rendered as a black
+                // silhouette.  This stays legible against every map surface.
+                const ImU32 border = IM_COL32(62, 54, 43, 255);
+                const ImU32 fill = IM_COL32(221, 213, 195, 255);
+                drawList->AddRectFilled(ImVec2(iconX, iconY),
+                                        ImVec2(iconX + iconSize, iconY + iconSize), fill, 1.5f);
+                if (ID3D11ShaderResourceView* icon = GetAbilityIconSrv(player.heroName, static_cast<int>(slot)))
+                    drawList->AddImage(reinterpret_cast<ImTextureID>(icon),
+                                       ImVec2(iconX + 2.0f, iconY + 2.0f),
+                                       ImVec2(iconX + iconSize - 2.0f, iconY + iconSize - 2.0f),
+                                       ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f),
+                                       IM_COL32(12, 12, 12, 255));
+                else {
+                    const char slotText[2] = { static_cast<char>('1' + slot), 0 };
+                    drawList->AddText(ImVec2(iconX + iconSize * 0.36f, iconY + 3.0f),
+                                      IM_COL32(235, 235, 240, 255), slotText);
+                }
+                if (ability.cooldown > 0.05f) {
+                    // Keep the countdown on top of the artwork.  A dark
+                    // clock badge makes it readable on both light and dark
+                    // ability icons without hiding the entire icon.
+                    const ImVec2 center(iconX + iconSize * 0.5f, iconY + iconSize * 0.5f);
+                    const float cooldownFraction = ability.cooldownDuration > 0.05f
+                        ? std::clamp(ability.cooldown / ability.cooldownDuration, 0.0f, 1.0f)
+                        : 0.0f;
+                    if (cooldownFraction > 0.005f) {
+                        constexpr int maxSegments = 32;
+                        const int segments = std::clamp(
+                            static_cast<int>(std::ceil(cooldownFraction * maxSegments)), 1, maxSegments);
+                        std::array<ImVec2, maxSegments + 2> sector{};
+                        sector[0] = center;
+                        const float radius = iconSize * 0.5f - 2.0f;
+                        constexpr float pi = 3.14159265358979323846f;
+                        for (int point = 0; point <= segments; ++point) {
+                            const float angle = -pi * 0.5f +
+                                (2.0f * pi * cooldownFraction * point / segments);
+                            sector[point + 1] = ImVec2(center.x + std::cos(angle) * radius,
+                                                       center.y + std::sin(angle) * radius);
+                        }
+                        drawList->AddConvexPolyFilled(sector.data(), segments + 2,
+                                                      IM_COL32(0, 0, 0, 105));
+                    }
+                    const float radius = iconSize * 0.30f;
+                    drawList->AddCircleFilled(center, radius + 2.0f, IM_COL32(0, 0, 0, 210), 20);
+                    drawList->AddCircleFilled(center, radius, IM_COL32(26, 30, 38, 238), 20);
+
+                    char cooldown[12]{};
+                    std::snprintf(cooldown, sizeof(cooldown),
+                                  ability.cooldown < 10.0f ? "%.1f" : "%.0f",
+                                  ability.cooldown);
+                    const float fontSize = std::clamp(iconSize * 0.31f, 12.0f, 22.0f);
+                    const ImVec2 textSize = ImGui::GetFont()->CalcTextSizeA(
+                        fontSize, FLT_MAX, 0.0f, cooldown);
+                    const ImVec2 textPos(center.x - textSize.x * 0.5f,
+                                         center.y - textSize.y * 0.5f);
+                    drawList->AddText(nullptr, fontSize,
+                                      ImVec2(textPos.x + 1.0f, textPos.y + 1.0f),
+                                      IM_COL32(0, 0, 0, 255), cooldown);
+                    drawList->AddText(nullptr, fontSize, textPos,
+                                      IM_COL32(255, 255, 255, 255), cooldown);
+                }
+                drawList->AddRect(ImVec2(iconX, iconY),
+                                  ImVec2(iconX + iconSize, iconY + iconSize), border, 1.5f);
+                {
+                    constexpr int maxAbilityLevel = 3;
+                    constexpr float levelGap = 3.0f;
+                    const ImU32 purchasedColor = IM_COL32(74, 210, 112, 255);
+                    const ImU32 unpurchasedColor = IM_COL32(210, 76, 65, 255);
+                    const ImU32 levelTrackColor = IM_COL32(58, 50, 39, 255);
+                    const float levelY = iconY + iconSize + 3.0f;
+                    drawList->AddRectFilled(ImVec2(iconX + 1.0f, levelY - 1.0f),
+                                             ImVec2(iconX + iconSize - 1.0f, levelY + 5.0f),
+                                             levelTrackColor, 1.0f);
+                    const float levelWidth = (iconSize - 6.0f -
+                        (maxAbilityLevel - 1) * levelGap) / maxAbilityLevel;
+                    for (int level = 0; level < maxAbilityLevel; ++level) {
+                        const float levelX = iconX + 3.0f + level * (levelWidth + levelGap);
+                        const ImU32 color = level < ability.level ? purchasedColor : unpurchasedColor;
+                        drawList->AddRectFilled(ImVec2(levelX, levelY),
+                                                 ImVec2(levelX + levelWidth, levelY + 4.0f), color, 0.5f);
+                    }
+                }
+                iconX += iconSize + gap;
+            }
         }
     }
 
