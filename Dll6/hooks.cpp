@@ -2300,8 +2300,6 @@ void SetupHooks() {
     DestroyWindow(tempWindow);
 
     printf("[+] VMT Hook installed!\n");
-    // The detours only enqueue handles; entity memory is read later by the
-    // worker thread. This avoids touching partially constructed entities.
     // Orb discovery is handled by the validated polling scan. Lifecycle
     // detours are disabled because callbacks can run while identities are
     // being rebuilt and are unsafe for ESP lifetime tracking.

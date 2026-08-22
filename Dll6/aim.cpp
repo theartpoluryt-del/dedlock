@@ -1190,16 +1190,15 @@ void AutoLastHitOrbs() {
     {
         std::lock_guard<std::mutex> lock(orbTargetsMutex);
         for (const auto& orb : orbTargets) {
-            if (!orb.entity) continue;
+            if (!IsXpOrbAlive(orb.entity, orb.handle)) continue;
             // The orb is visible immediately after launch, but it has no
             // hitbox until CItemXP.m_flAttackableTime has elapsed.
-            if (!IsXpOrbAttackable(orb.entity)) continue;
+            if (!IsXpOrbAttackable(orb.entity, orb.handle)) continue;
             Vector3 point{};
-            // Keep orb aim on the same stable world position as Orb ESP.
-            // RenderOrigin can be a view-dependent render-cache coordinate;
-            // AbsOrigin is the networked position used by the entity itself.
-            if (!GetEntityPosition(orb.entity, point) &&
-                !GetXpOrbPosition(orb.entity, point)) {
+            // Keep orb aim on the same visual position as ESP and the
+            // scanner; this is also the coordinate used for stale detection.
+            if (!GetXpOrbPosition(orb.entity, point) &&
+                !GetEntityPosition(orb.entity, point)) {
                 point = orb.pos;
             }
             if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) continue;

@@ -7,11 +7,80 @@
 namespace {
 std::unordered_map<uintptr_t, int> registeredGlowMode;
 
+std::string NormalizeEntityName(const std::string& name) {
+    std::string normalized;
+    normalized.reserve(name.size());
+    for (const unsigned char c : name) {
+        if (std::isalnum(c)) normalized.push_back(static_cast<char>(std::tolower(c)));
+    }
+    return normalized;
+}
+
 void LogNativeGlow(const char* message) {
     std::ofstream log(
         "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\native_glow.log",
         std::ios::app);
     if (log) log << message << '\n';
+}
+
+// CItemXP stays in the identity table after its scene object has gone away.
+// Do not use its replicated lifetime/health fields for that decision: client
+// captures show those fields have the same values for both flying and stale
+// entries.  The scene node's dormant bit is the actual visual-state signal.
+struct OrbSceneState {
+    ULONGLONG lastObservedAt = 0;
+    ULONGLONG lastDormantSampleAt = 0;
+    uint8_t consecutiveDormantSamples = 0;
+    bool hasBeenVisiblyActive = false;
+};
+
+bool ShouldPublishXpOrb(uint32_t handle, uintptr_t entity, ULONGLONG now) {
+    static std::unordered_map<uint32_t, OrbSceneState> states;
+    constexpr ULONGLONG KnownOrbSampleIntervalMs = 16;
+    constexpr uint8_t KnownOrbSamplesToRemove = 2;
+    constexpr ULONGLONG UnknownOrbSampleIntervalMs = 100;
+    constexpr uint8_t UnknownOrbSamplesToRemove = 3;
+    constexpr ULONGLONG StateRetentionMs = 30000;
+
+    if ((now & 0x3ff) < 16) {
+        for (auto it = states.begin(); it != states.end();) {
+            if (now - it->second.lastObservedAt > StateRetentionMs)
+                it = states.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    OrbSceneState& state = states[handle];
+    state.lastObservedAt = now;
+    const uintptr_t sceneNode = Read<uintptr_t>(entity + Offsets::GameSceneNode);
+    // A scene node can briefly be absent while a newly spawned orb is being
+    // initialized.  That is not evidence that it has disappeared.
+    if (!sceneNode) {
+        state.consecutiveDormantSamples = 0;
+        return true;
+    }
+
+    if (Read<uint8_t>(sceneNode + Offsets::SceneNodeDormant) == 0) {
+        state.consecutiveDormantSamples = 0;
+        state.lastDormantSampleAt = now;
+        state.hasBeenVisiblyActive = true;
+        return true;
+    }
+
+    // An orb that was active in this client session is safe to remove after
+    // two adjacent worker passes. Objects already dormant at first sight get
+    // a longer grace period so an in-progress spawn cannot blink out.
+    const ULONGLONG sampleInterval = state.hasBeenVisiblyActive
+        ? KnownOrbSampleIntervalMs : UnknownOrbSampleIntervalMs;
+    const uint8_t samplesToRemove = state.hasBeenVisiblyActive
+        ? KnownOrbSamplesToRemove : UnknownOrbSamplesToRemove;
+    if (now - state.lastDormantSampleAt >= sampleInterval) {
+        state.lastDormantSampleAt = now;
+        if (state.consecutiveDormantSamples < samplesToRemove)
+            ++state.consecutiveDormantSamples;
+    }
+    return state.consecutiveDormantSamples < samplesToRemove;
 }
 }
 
@@ -220,6 +289,10 @@ bool GetXpOrbPosition(uintptr_t entity, Vector3& position) {
             return true;
         }
     }
+    // Freshly spawned CItemXP instances can be rendered from nodeToWorld
+    // before both RenderOrigin and the replicated entity position arrive.
+    // Use that transform before treating the orb as positionless.
+    if (GetEntityRenderTransformPosition(entity, position)) return true;
     position = Read<Vector3>(entity + Offsets::Pos);
     if (std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z) &&
         std::fabs(position.x) < 100000.0f && std::fabs(position.y) < 100000.0f &&
@@ -677,7 +750,7 @@ float GetClientGameTime() {
     return globalVars ? Read<float>(globalVars + 0x0C) : 0.0f;
 }
 
-bool IsXpOrbAttackable(uintptr_t entity) {
+bool IsXpOrbAttackable(uintptr_t entity, uint32_t handle) {
     if (!entity) return false;
 
     struct OrbObservation {
@@ -686,8 +759,20 @@ bool IsXpOrbAttackable(uintptr_t entity) {
         bool attackable{};
     };
     static std::unordered_map<uintptr_t, OrbObservation> observations;
+    static ULONGLONG lastObservationCleanup = 0;
     const ULONGLONG now = GetTickCount64();
-    auto& observation = observations[entity];
+    if (now - lastObservationCleanup >= 5000) {
+        lastObservationCleanup = now;
+        for (auto it = observations.begin(); it != observations.end();) {
+            if (it->second.lastSeen && now - it->second.lastSeen > 5000)
+                it = observations.erase(it);
+            else
+                ++it;
+        }
+    }
+    const uintptr_t observationKey = handle != 0 && handle != 0xFFFFFFFFu
+        ? static_cast<uintptr_t>(handle) : entity;
+    auto& observation = observations[observationKey];
     if (observation.lastSeen != 0 && now - observation.lastSeen > 1000) {
         observation = {};
     }
@@ -793,20 +878,33 @@ bool IsSoulDesignerName(const std::string& name) {
     std::string lower = name;
     std::transform(lower.begin(), lower.end(), lower.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return lower.rfind("soul", 0) == 0 ||
-           lower.rfind("citadel_soul", 0) == 0 ||
-           lower.rfind("generic_soul", 0) == 0;
+    return lower.find("soul") != std::string::npos &&
+           lower.find("spawner") == std::string::npos;
 }
 
 bool IsExpiredXpOrb(uintptr_t entity) {
+    if (!entity) return true;
+    const float attackableTime = Read<float>(entity + 0x0A0C);
     const float endAttackableTime = Read<float>(entity + 0x0A10);
     const float gameTime = GetClientGameTime();
-    if (!std::isfinite(endAttackableTime) || endAttackableTime <= 0.0f ||
+    if (!std::isfinite(attackableTime) || attackableTime <= 0.0f ||
+        !std::isfinite(endAttackableTime) || endAttackableTime <= 0.0f ||
         !std::isfinite(gameTime) || gameTime <= 0.0f) return false;
-    // Ignore a bad GlobalVars resolution. Valid orb timestamps are close to
-    // the current game clock; an unrelated float must never hide an orb.
-    if (endAttackableTime > gameTime + 120.0f) return false;
+    const float lifetime = endAttackableTime - attackableTime;
+    if (lifetime < 0.05f || lifetime > 30.0f ||
+        attackableTime > gameTime + 120.0f ||
+        endAttackableTime > gameTime + 120.0f) return false;
     return gameTime >= endAttackableTime;
+}
+
+bool IsXpOrbAlive(uintptr_t entity, uint32_t handle) {
+    if (!entity || handle == 0 || handle == 0xFFFFFFFFu ||
+        ResolveEntity(handle) != entity || IsExpiredXpOrb(entity)) return false;
+    std::string className = GetEntityClassName(entity);
+    std::transform(className.begin(), className.end(), className.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (className.find("itemxp") != std::string::npos) return true;
+    return IsSoulDesignerName(GetEntityDesignerName(handle));
 }
 
 bool NotifyOrbEntityAdded(uint32_t handle) {
@@ -815,7 +913,8 @@ bool NotifyOrbEntityAdded(uint32_t handle) {
     if (!entity) return false;
     const std::string className = GetEntityClassName(entity);
     if (className.empty() && !IsSoulDesignerName(designerName)) return false;
-    if (className.find("ItemXP") == std::string::npos && !IsSoulDesignerName(designerName)) return true;
+    if (NormalizeEntityName(className).find("itemxp") == std::string::npos &&
+        !IsSoulDesignerName(designerName)) return true;
     Vector3 position{};
     GetXpOrbPosition(entity, position);
     std::lock_guard<std::mutex> lock(orbTargetsMutex);
@@ -845,18 +944,18 @@ void NotifyOrbEntityRemoved(uint32_t handle) {
 
 namespace {
 std::mutex pendingOrbEventsMutex;
-std::vector<uint32_t> pendingOrbAdds;
-std::vector<uint32_t> pendingOrbRemoves;
+struct PendingOrbEvent { uint32_t handle{}; bool added{}; };
+std::vector<PendingOrbEvent> pendingOrbEvents;
 }
 
 void QueueOrbEntityAdded(uint32_t handle) {
     std::lock_guard<std::mutex> lock(pendingOrbEventsMutex);
-    pendingOrbAdds.push_back(handle);
+    pendingOrbEvents.push_back({handle, true});
 }
 
 void QueueOrbEntityRemoved(uint32_t handle) {
     std::lock_guard<std::mutex> lock(pendingOrbEventsMutex);
-    pendingOrbRemoves.push_back(handle);
+    pendingOrbEvents.push_back({handle, false});
 }
 
 void RefreshFarmTargets() {
@@ -875,6 +974,10 @@ void RefreshFarmTargets() {
     if (!farmActive && !drawCreepEsp && !creepEspEnabled && !allyCreepEspEnabled && !neutralCreepEspEnabled &&
         !autoLastHitOrbs && !drawOrbEsp && !trooperChamsActive &&
         !trooperChamsWereActive && !worldEntityScanActive) {
+        {
+            std::lock_guard<std::mutex> eventLock(pendingOrbEventsMutex);
+            pendingOrbEvents.clear();
+        }
         std::lock_guard lock(farmTargetsMutex);
         farmTargets.clear();
         std::lock_guard orbLock(orbTargetsMutex);
@@ -885,19 +988,14 @@ void RefreshFarmTargets() {
     }
     // Flying souls can exist for less than a second.  A one-second scan
     // interval misses them entirely when ESP is enabled without auto-hit.
-    std::vector<uint32_t> addedEvents;
-    std::vector<uint32_t> removedEvents;
+    std::vector<PendingOrbEvent> lifecycleEvents;
     {
         std::lock_guard<std::mutex> lock(pendingOrbEventsMutex);
-        addedEvents.swap(pendingOrbAdds);
-        removedEvents.swap(pendingOrbRemoves);
+        lifecycleEvents.swap(pendingOrbEvents);
     }
-    for (const uint32_t handle : removedEvents) NotifyOrbEntityRemoved(handle);
-    for (const uint32_t handle : addedEvents) {
-        if (!NotifyOrbEntityAdded(handle)) {
-            std::lock_guard<std::mutex> lock(pendingOrbEventsMutex);
-            pendingOrbAdds.push_back(handle);
-        }
+    for (const PendingOrbEvent& event : lifecycleEvents) {
+        if (event.added) NotifyOrbEntityAdded(event.handle);
+        else NotifyOrbEntityRemoved(event.handle);
     }
 
     // The table scan remains the authoritative, stable discovery path.
@@ -907,20 +1005,17 @@ void RefreshFarmTargets() {
     std::vector<FarmTarget> found;
     std::vector<OrbTarget> foundOrbs;
     std::vector<WorldEspTarget> foundWorldTargets;
+    std::vector<OrbTarget> eventOrbs;
+    {
+        std::lock_guard<std::mutex> lock(orbTargetsMutex);
+        eventOrbs = orbTargets;
+    }
     uint32_t scannedEntities = 0;
     uint32_t npcClasses = 0;
     uint32_t trooperClasses = 0;
     uint32_t trooperWithSceneNode = 0;
     uint32_t trooperAlive = 0;
     std::unordered_set<std::string> observedNpcClasses;
-    struct OrbMotionState {
-        Vector3 visualPosition{};
-        Vector3 entityPosition{};
-        bool hasEntityPosition{};
-        ULONGLONG lastSeen{};
-        uint8_t stationarySamples{};
-    };
-    static std::unordered_map<uintptr_t, OrbMotionState> orbMotion;
     if (!clientBase) return;
     // NPC troopers are published through the primary identity table. Keeping
     // this scan on that table avoids starving farm target refreshes with
@@ -929,19 +1024,16 @@ void RefreshFarmTargets() {
     const uintptr_t tableOffset = Offsets::EntityChunks;
     std::unordered_set<uintptr_t> seen;
     if (root) {
-        const int reportedHighest = Read<int>(root + Offsets::HighestEntityIndex);
-        const uint32_t highestEntityIndex =
-            reportedHighest > 0 && reportedHighest <= static_cast<int>(Offsets::HandleIndexMask)
-                ? static_cast<uint32_t>(reportedHighest)
-                : Offsets::HandleIndexMask;
-        const uint32_t highestChunk = highestEntityIndex >> Offsets::HandleChunkShift;
+        // HighestEntityIndex is a volatile cache; during spawns it can lag
+        // behind a newly allocated handle.  Scan every allocated table chunk
+        // instead, otherwise a short-lived orb can be missed completely.
+        const uint32_t highestChunk =
+            Offsets::HandleIndexMask >> Offsets::HandleChunkShift;
         for (uint32_t chunkIndex = 0; chunkIndex <= highestChunk; ++chunkIndex) {
                 const uintptr_t chunk = Read<uintptr_t>(root + tableOffset +
                     Offsets::EntityChunkStride * chunkIndex);
                 if (!chunk) continue;
-                const uint32_t highestSlot = chunkIndex == highestChunk
-                    ? (highestEntityIndex & Offsets::HandleChunkMask)
-                    : Offsets::HandleChunkMask;
+                const uint32_t highestSlot = Offsets::HandleChunkMask;
                 for (uint32_t slot = 0; slot <= highestSlot; ++slot) {
                     const uintptr_t identity = chunk + Offsets::EntityStride * slot;
                     const uint32_t storedHandle = Read<uint32_t>(identity + Offsets::EntityHandleOffset);
@@ -965,11 +1057,17 @@ void RefreshFarmTargets() {
                     // more expensive than the class-name check. Only read it
                     // for classes that can plausibly be an orb; CItemXP is
                     // identified directly by its class name.
-                    const bool possibleOrbClass = className.find("Orb") != std::string::npos ||
-                        className.find("Gold") != std::string::npos ||
-                        className.find("Pickup") != std::string::npos ||
-                        className.find("XP") != std::string::npos ||
-                        className.find("Soul") != std::string::npos;
+                    std::string lowerClassName = className;
+                    std::transform(lowerClassName.begin(), lowerClassName.end(),
+                        lowerClassName.begin(), [](unsigned char c) {
+                            return static_cast<char>(std::tolower(c));
+                        });
+                    const bool possibleOrbClass =
+                        lowerClassName.find("orb") != std::string::npos ||
+                        lowerClassName.find("gold") != std::string::npos ||
+                        lowerClassName.find("pickup") != std::string::npos ||
+                        lowerClassName.find("xp") != std::string::npos ||
+                        lowerClassName.find("soul") != std::string::npos;
                     const bool possibleWorldClass = className.find("Power") != std::string::npos ||
                         className.find("Rune") != std::string::npos ||
                         className.find("Pickup") != std::string::npos ||
@@ -978,11 +1076,18 @@ void RefreshFarmTargets() {
                         className.find("GuidedArrow") != std::string::npos ||
                         className.find("Projectile") != std::string::npos ||
                         className.find("Ability") != std::string::npos;
+                    // Some soul-orbs use a generic client class and are
+                    // identifiable only by their designer name. Read that
+                    // name for every non-NPC object as well as known class
+                    // candidates, so those orbs are not skipped at spawn.
+                    const bool nonNpcObject =
+                        className.find("NPC") == std::string::npos;
                     // A number of world pickups use a generic entity class.
                     // In that case only the designer name identifies a rune or
                     // powerup, so do not discard the entity before reading it.
                     const std::string designerName =
-                        (possibleOrbClass || possibleWorldClass || worldEntityScanActive)
+                         (possibleOrbClass || possibleWorldClass || worldEntityScanActive ||
+                         nonNpcObject)
                         ? ReadIdentityDesignerName(identity) : std::string{};
                     if (possibleWorldClass || !designerName.empty()) {
                         std::string markerName = className + " " + designerName;
@@ -1021,67 +1126,20 @@ void RefreshFarmTargets() {
                     }
                     // CItemXP is the actual flying XP/gold orb. Pickup_* and
                     // *OrbSpawner are world helpers, not the shootable orb.
-                    const bool isOrb = className.find("ItemXP") != std::string::npos ||
+                    const std::string normalizedClassName = NormalizeEntityName(className);
+                    const bool isOrb = normalizedClassName.find("itemxp") != std::string::npos ||
                         IsSoulDesignerName(designerName);
                     if (isOrb) {
+                        if (IsExpiredXpOrb(entity)) continue;
                         Vector3 position{};
-                        // Keep discovery and ESP on the same stable position
-                        // source. RenderOrigin is a transient render cache and
-                        // can make the target list flicker between scans.
-                        bool hasPosition = GetEntityPosition(entity, position);
-                        if (!hasPosition) hasPosition = GetXpOrbPosition(entity, position);
+                        // Use the visual position first.  The lifetime guard
+                        // above filters retained identity-table entries after
+                        // their visible CItemXP has expired.
+                        bool hasPosition = GetXpOrbPosition(entity, position);
+                        if (!hasPosition) hasPosition = GetEntityPosition(entity, position);
                         if (!hasPosition) continue;
+                        if (!ShouldPublishXpOrb(storedHandle, entity, now)) continue;
 
-                        // RenderOrigin is the visual point used for drawing,
-                        // but it can remain unchanged while the networked
-                        // entity is still travelling. Use the entity origin
-                        // exclusively for the stopped-state test.
-                        Vector3 motionPosition{};
-                        const bool hasMotionPosition = GetEntityPosition(entity, motionPosition);
-                        if (!hasMotionPosition) motionPosition = position;
-
-                        // Networked orb coordinates can legitimately remain
-                        // unchanged for several worker scans. Requiring a few
-                        // stationary samples avoids flickering the target out
-                        // between snapshots while still pruning stale slots.
-                        // Entity pointers are recycled by the game. The
-                        // handle identifies the current orb lifetime, so a
-                        // newly spawned orb must not inherit the old orb's
-                        // stationary counter.
-                        const uintptr_t motionKey = storedHandle != 0
-                            ? static_cast<uintptr_t>(storedHandle) : entity;
-                        auto& motion = orbMotion[motionKey];
-                        const bool newEntity = motion.lastSeen == 0 ||
-                            now - motion.lastSeen > 1000;
-                        if (newEntity) {
-                            motion.visualPosition = position;
-                            motion.entityPosition = motionPosition;
-                            motion.hasEntityPosition = hasMotionPosition;
-                            motion.stationarySamples = 0;
-                        } else {
-                            const bool visualMoved = position.x != motion.visualPosition.x ||
-                                position.y != motion.visualPosition.y ||
-                                position.z != motion.visualPosition.z;
-                            const bool entityMoved = hasMotionPosition && motion.hasEntityPosition &&
-                                (motionPosition.x != motion.entityPosition.x ||
-                                 motionPosition.y != motion.entityPosition.y ||
-                                 motionPosition.z != motion.entityPosition.z);
-                            if (visualMoved || entityMoved) {
-                                motion.visualPosition = position;
-                                motion.entityPosition = motionPosition;
-                                motion.hasEntityPosition = hasMotionPosition;
-                                motion.stationarySamples = 0;
-                            } else if (motion.stationarySamples < UINT8_MAX) {
-                                ++motion.stationarySamples;
-                            }
-                        }
-                        motion.lastSeen = now;
-                        // A stationary coordinate is normal for an orb while it
-                        // is waiting to be collected.  The former two-sample
-                        // filter removed a valid CItemXP after roughly 16 ms,
-                        // so neither Orb ESP nor Orb Aim had a stable target.
-                        // Lifetime is validated by the entity handle in the
-                        // consumer and stale motion records are pruned below.
                         foundOrbs.push_back({ entity, position,
                             designerName.empty() ? className : designerName, storedHandle,
                             Read<uint8_t>(entity + Offsets::Team) });
@@ -1119,9 +1177,53 @@ void RefreshFarmTargets() {
                 }
         }
     }
-    for (auto it = orbMotion.begin(); it != orbMotion.end();) {
-        if (now - it->second.lastSeen > 2000) it = orbMotion.erase(it);
-        else ++it;
+    // Preserve a valid event-discovered orb if the identity scan briefly
+    // misses its slot or position during spawn. Exact handle validation and
+    // the lifetime check below still remove it immediately after destruction.
+    for (OrbTarget& orb : eventOrbs) {
+        if (!IsXpOrbAlive(orb.entity, orb.handle)) continue;
+        const bool alreadyFound = std::any_of(
+            foundOrbs.begin(), foundOrbs.end(), [&](const OrbTarget& foundOrb) {
+                return foundOrb.handle == orb.handle ||
+                       foundOrb.entity == orb.entity;
+            });
+        if (alreadyFound) continue;
+        Vector3 position{};
+        if (GetXpOrbPosition(orb.entity, position) ||
+            GetEntityPosition(orb.entity, position)) {
+            if (!ShouldPublishXpOrb(orb.handle, orb.entity, now)) continue;
+            orb.pos = position;
+            orb.team = Read<uint8_t>(orb.entity + Offsets::Team);
+            foundOrbs.push_back(std::move(orb));
+        }
+    }
+    // Include lifecycle events that arrived while the table was being
+    // enumerated; otherwise the final replacement below can erase a fresh,
+    // short-lived orb before the next worker pass.
+    {
+        std::vector<OrbTarget> lateEventOrbs;
+        {
+            std::lock_guard<std::mutex> orbLock(orbTargetsMutex);
+            lateEventOrbs = orbTargets;
+        }
+        for (OrbTarget& orb : lateEventOrbs) {
+            if (!IsXpOrbAlive(orb.entity, orb.handle)) continue;
+            const bool alreadyFound = std::any_of(
+                foundOrbs.begin(), foundOrbs.end(),
+                [&](const OrbTarget& foundOrb) {
+                    return foundOrb.handle == orb.handle ||
+                           foundOrb.entity == orb.entity;
+                });
+            if (alreadyFound) continue;
+            Vector3 position{};
+            if (GetXpOrbPosition(orb.entity, position) ||
+                GetEntityPosition(orb.entity, position)) {
+                if (!ShouldPublishXpOrb(orb.handle, orb.entity, now)) continue;
+                orb.pos = position;
+                orb.team = Read<uint8_t>(orb.entity + Offsets::Team);
+                foundOrbs.push_back(std::move(orb));
+            }
+        }
     }
     std::lock_guard lock(farmTargetsMutex);
     farmTargets = std::move(found);
@@ -1154,11 +1256,10 @@ DWORD WINAPI FarmTargetWorker(LPVOID) {
     while (!stopHeroDiscoveryEvent ||
            WaitForSingleObject(stopHeroDiscoveryEvent, 0) != WAIT_OBJECT_0) {
         RefreshFarmTargets();
-        // Entity additions/removals are delivered through the event queue;
-        // the table scan only needs to refresh positions and validate stale
-        // slots. Scanning it every 16 ms needlessly competes with rendering
-        // during teamfights, so leave a small CPU budget for the game.
-        Sleep(50);
+        // Orb lifetimes can be shorter than a 50 ms polling gap. Keep the
+        // worker aligned with the render cadence so each allocated handle is
+        // observed before it disappears.
+        Sleep(16);
     }
     return 0;
 }

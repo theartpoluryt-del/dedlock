@@ -1733,23 +1733,22 @@ void RenderESP(const std::vector<PlayerData>& players) {
             orbs = orbTargets;
         }
         for (const auto& orb : orbs) {
-            // Entity slots are recycled by the game. Never draw an old orb
-            // record after its handle resolves to a different entity.
-            if (orb.handle != 0 && ResolveEntity(orb.handle) != orb.entity) continue;
-            const std::string liveClass = GetEntityClassName(orb.entity);
-            if (!liveClass.empty() && liveClass.find("ItemXP") == std::string::npos) continue;
+            // Scanner, ESP and aim share one lifetime validator so an entity
+            // that has expired or whose slot was recycled cannot survive in
+            // one subsystem after disappearing from another.
+            if (!IsXpOrbAlive(orb.entity, orb.handle)) continue;
             Vector3 position = orb.pos;
             Vector2 screen{};
             bool projected = false;
             Vector3 candidate{};
-            // Use the networked/absolute entity origin first. RenderOrigin is
-            // a render-cache value and can be updated differently depending
-            // on which side of the entity the camera is viewing from.
-            if (GetEntityPosition(orb.entity, candidate)) {
+            // RenderOrigin is the visual coordinate tracked by the scanner.
+            // Keep it first here so the stale-coordinate detector, ESP and
+            // aim all operate on the same point.
+            if (GetXpOrbPosition(orb.entity, candidate)) {
                 projected = WorldToScreen(candidate, screen, currentViewMatrix);
                 if (projected) position = candidate;
             }
-            if (!projected && GetXpOrbPosition(orb.entity, candidate)) {
+            if (!projected && GetEntityPosition(orb.entity, candidate)) {
                 projected = WorldToScreen(candidate, screen, currentViewMatrix);
                 if (projected) position = candidate;
             }
@@ -1826,7 +1825,7 @@ void RenderESP(const std::vector<PlayerData>& players) {
             if (!std::isfinite(outlineRadius) || outlineRadius <= 0.0f) continue;
             outlineRadius = std::clamp(outlineRadius, 4.0f, 96.0f);
             const float fillRadius = outlineRadius * 0.64f;
-            if (IsXpOrbAttackable(orb.entity)) {
+            if (IsXpOrbAttackable(orb.entity, orb.handle)) {
                 drawList->AddCircleFilled(point, fillRadius, orbColor, 24);
             }
             drawList->AddCircle(point, outlineRadius, ImColor(255, 165, 45, 245), 24, 2.0f);
