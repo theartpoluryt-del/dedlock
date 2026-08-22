@@ -15,6 +15,7 @@
 #include <cwchar>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #pragma comment(lib, "d2d1.lib")
@@ -44,12 +45,21 @@ struct Renderer {
     UINT previewReadbackWidth = 0;
     UINT previewReadbackHeight = 0;
     Preview3DFrame preview3dFrame{};
+    std::unordered_map<int, Preview3DFrame> frozenPreviewFrames;
+    std::unordered_map<int, ComPtr<ID2D1Bitmap>> frozenPreviewBitmaps;
+    std::unordered_map<int, ComPtr<ID2D1Bitmap>> persistedFallbackBitmaps;
+    Preview3DFrame lastDisplayedPreviewFrame{};
+    std::unordered_set<int> persistedFallbackHeroes;
     std::vector<uint8_t> preview3dPixels;
     bool preview3dShared = false;
     bool preview3dActive = false;
+    bool previewUsesPersistedFallback = false;
     bool previewWasDragging = false;
     bool previewFreezeAfterDrag = false;
     uint64_t previewFreezeSerial = 0;
+    int lastDisplayedPreviewHeroId = 0;
+    int pendingFallbackHeroId = 0;
+    int pendingFallbackFrames = 0;
     ComPtr<ID2D1Bitmap> tabIcons[4];
     ComPtr<ID2D1Bitmap> previewAbilityIcons[4];
     ComPtr<ID2D1Bitmap> previewHeroPortraits[38];
@@ -1253,6 +1263,28 @@ bool LoadEmbeddedBitmap(UINT resourceId, ComPtr<ID2D1Bitmap>& output,
     return true;
 }
 
+bool LoadPanoramaFallbackBitmap(int heroId, ComPtr<ID2D1Bitmap>& output) {
+    if (output) return true;
+    if (!g.wicFactory || !g.target) return false;
+    const std::wstring path = PanoramaFallbackPath(heroId);
+    ComPtr<IWICBitmapDecoder> decoder;
+    ComPtr<IWICBitmapFrameDecode> frame;
+    ComPtr<IWICFormatConverter> converter;
+    if (FAILED(g.wicFactory->CreateDecoderFromFilename(
+            path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad,
+            decoder.GetAddressOf())) ||
+        FAILED(decoder->GetFrame(0, frame.GetAddressOf())) ||
+        FAILED(g.wicFactory->CreateFormatConverter(converter.GetAddressOf())) ||
+        FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)) ||
+        FAILED(g.target->CreateBitmapFromWicBitmap(converter.Get(), nullptr,
+            output.GetAddressOf()))) {
+        output.Reset();
+        return false;
+    }
+    return true;
+}
+
 void LoadEmbeddedAssets() {
     LoadEmbeddedBitmap(IDR_DEADLOCK_LOGO, g.logoBitmap);
     const UINT iconIds[4]{IDR_ICON_EYE, IDR_ICON_CROSSHAIR,
@@ -1375,6 +1407,18 @@ bool BindPreview3DFrame(const Preview3DFrame& frame,
         }
     }
     g.preview3dFrame = frame;
+    return true;
+}
+
+bool StoreFrozenPanoramaFrame(int heroId) {
+    if (!g.target || !g.preview3dBitmap ||
+        g.frozenPreviewBitmaps.find(heroId) != g.frozenPreviewBitmaps.end())
+        return false;
+    // Hold the exact D2D surface that was just drawn by Panorama. This is
+    // safer than copying the bitmap while the game owns its shared DXGI
+    // surface; when Panorama recreates its capture texture, this reference
+    // keeps the previous hero frame alive as the fallback.
+    g.frozenPreviewBitmaps.emplace(heroId, g.preview3dBitmap);
     return true;
 }
 
@@ -1577,12 +1621,21 @@ void ResetTarget() {
     g.previewReadbackWidth = 0;
     g.previewReadbackHeight = 0;
     g.preview3dFrame = {};
+    g.frozenPreviewFrames.clear();
+    g.frozenPreviewBitmaps.clear();
+    g.persistedFallbackBitmaps.clear();
+    g.lastDisplayedPreviewFrame = {};
+    g.persistedFallbackHeroes.clear();
     g.preview3dPixels.clear();
     g.preview3dShared = false;
     g.preview3dActive = false;
+    g.previewUsesPersistedFallback = false;
     g.previewWasDragging = false;
     g.previewFreezeAfterDrag = false;
     g.previewFreezeSerial = 0;
+    g.lastDisplayedPreviewHeroId = 0;
+    g.pendingFallbackHeroId = 0;
+    g.pendingFallbackFrames = 0;
     for (auto& icon : g.tabIcons) icon.Reset();
     for (auto& icon : g.previewAbilityIcons) icon.Reset();
     for (auto& portrait : g.previewHeroPortraits) portrait.Reset();
@@ -1872,15 +1925,52 @@ void RenderD2DMenu(std::size_t playerCount) {
     if (!freezePreview && g.tab == 0 && pDevice && pContext) {
         Preview3DFrame previewFrame{};
         SetPanoramaPreviewRole(g.visualTeam);
+        const int previewHeroId = GetPanoramaPreviewHero();
         ID3D11Texture2D* panoramaTexture = GetPanoramaPreviewTexture();
-        if (panoramaTexture) {
+        g.previewUsesPersistedFallback = false;
+        if (!panoramaTexture) {
+            // This is a D2D copy of a frame that was actually displayed by
+            // Panorama, rather than a speculative D3D capture during panel
+            // creation. It remains valid if Panorama destroys its surface.
+            const auto bitmap = g.frozenPreviewBitmaps.find(previewHeroId);
+            const auto frame = g.frozenPreviewFrames.find(previewHeroId);
+            if (g.preview3dBitmap &&
+                g.lastDisplayedPreviewHeroId == previewHeroId) {
+                // The source surface is retained by this bitmap. It is the
+                // immediate fallback even if the per-hero D2D copy has not
+                // finished yet.
+                g.preview3dFrame = g.lastDisplayedPreviewFrame;
+                g.preview3dActive = true;
+            } else if (bitmap != g.frozenPreviewBitmaps.end() &&
+                frame != g.frozenPreviewFrames.end()) {
+                g.preview3dBitmap = bitmap->second;
+                g.preview3dTexture.Reset();
+                g.preview3dShared = false;
+                g.preview3dFrame = frame->second;
+                g.preview3dActive = true;
+            } else {
+                auto& persisted = g.persistedFallbackBitmaps[previewHeroId];
+                Preview3DFrame persistedFrame{};
+                if (LoadPanoramaFallbackBitmap(previewHeroId, persisted) &&
+                    LoadPanoramaFallbackFrame(previewHeroId, persistedFrame)) {
+                    g.preview3dBitmap = persisted;
+                    g.preview3dTexture.Reset();
+                    g.preview3dShared = false;
+                    g.preview3dFrame = persistedFrame;
+                    g.preview3dActive = true;
+                    g.previewUsesPersistedFallback = true;
+                }
+            }
+        } else {
             previewFrame.texture = panoramaTexture;
             previewFrame.left = 0.0f;
             previewFrame.top = 0.0f;
             previewFrame.right = 1.0f;
             previewFrame.bottom = 1.0f;
+            bool skeletonReady = false;
             std::array<Preview3DPoint, 18> skeleton{};
             if (GetPanoramaPreviewSkeleton(skeleton.data(), skeleton.size())) {
+                skeletonReady = true;
                 previewFrame.skeleton = skeleton;
                 float left = 1.0f, top = 1.0f, right = 0.0f, bottom = 0.0f;
                 size_t visibleJoints = 0;
@@ -1903,7 +1993,33 @@ void RenderD2DMenu(std::size_t playerCount) {
                 }
             }
             g.preview3dActive = BindPreview3DFrame(previewFrame, pContext);
-            ReportPanoramaPreviewBinding(g.preview3dActive);
+            if (g.preview3dActive) {
+                g.lastDisplayedPreviewFrame = previewFrame;
+                g.lastDisplayedPreviewHeroId = previewHeroId;
+                g.frozenPreviewFrames[previewHeroId] = previewFrame;
+                if (skeletonReady) {
+                    StoreFrozenPanoramaFrame(previewHeroId);
+                    // The skeleton becomes visible one or two Presents before
+                    // the copied backbuffer reaches the same scene state.
+                    // Wait for that GPU pipeline delay before writing PNG.
+                    if (g.persistedFallbackHeroes.find(previewHeroId) ==
+                        g.persistedFallbackHeroes.end()) {
+                        if (g.pendingFallbackHeroId != previewHeroId) {
+                            g.pendingFallbackHeroId = previewHeroId;
+                            g.pendingFallbackFrames = 3;
+                        } else if (--g.pendingFallbackFrames <= 0) {
+                            if (PersistPanoramaFallbackFrame(
+                                    pDevice, pContext, previewHeroId, previewFrame)) {
+                                g.persistedFallbackHeroes.insert(previewHeroId);
+                                g.pendingFallbackHeroId = 0;
+                            } else {
+                                g.pendingFallbackFrames = 30;
+                            }
+                        }
+                    }
+                }
+                ReportPanoramaPreviewBinding(true);
+            }
         }
     }
     g.target->BeginDraw();

@@ -4,6 +4,7 @@
 
 #include <MinHook.h>
 #include <dxgi.h>
+#include <wincodec.h>
 #include <wrl/client.h>
 #include <algorithm>
 #include <atomic>
@@ -16,6 +17,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#pragma comment(lib, "windowscodecs.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -79,6 +82,8 @@ bool creepPreviewModelReady = false;
 
 ComPtr<ID3D11Texture2D> captureTexture;
 ComPtr<ID3D11Texture2D> resolveTexture;
+std::unordered_map<int, ComPtr<ID3D11Texture2D>> frozenCaptureTextures;
+std::unordered_set<int> persistedFallbackHeroes;
 UINT captureWidth = 0;
 UINT captureHeight = 0;
 DXGI_FORMAT captureFormat = DXGI_FORMAT_UNKNOWN;
@@ -90,6 +95,9 @@ float previousRight = -1.0f, previousBottom = -1.0f;
 std::atomic<int> settleFrames{0};
 uint64_t capturedGeneration = 0;
 std::atomic<uint64_t> captureSerial{0};
+// The capture resource is allocated before Panorama has drawn the model. Do
+// not expose its initial black clear to the menu while a hero is changing.
+std::atomic<bool> capturePixelsVisible{false};
 std::atomic<uint64_t> displayedSerial{0};
 std::atomic<uint64_t> failedBindingSerial{0};
 uintptr_t configuredPortraitCamera = 0;
@@ -759,6 +767,236 @@ bool EnsureCaptureTexture(ID3D11Device* device, UINT width, UINT height,
     return true;
 }
 
+bool StoreFrozenCaptureTexture(ID3D11Device* device, int heroId) {
+    if (!device || !captureTexture) return false;
+    if (frozenCaptureTextures.find(heroId) != frozenCaptureTextures.end())
+        return true;
+    D3D11_TEXTURE2D_DESC captureDesc{};
+    captureTexture->GetDesc(&captureDesc);
+    captureDesc.Usage = D3D11_USAGE_DEFAULT;
+    captureDesc.CPUAccessFlags = 0;
+    captureDesc.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> frozenTexture;
+    if (FAILED(device->CreateTexture2D(
+            &captureDesc, nullptr, frozenTexture.GetAddressOf()))) {
+        Log("PREVIEW_FAIL_FROZEN_CAPTURE_RESOURCE");
+        return false;
+    }
+    frozenCaptureTextures.emplace(heroId, std::move(frozenTexture));
+    return true;
+}
+
+bool HasVisibleCapturePixels(ID3D11Device* device,
+                             ID3D11DeviceContext* context) {
+    if (!device || !context || !captureTexture) return false;
+    const bool rgba = captureFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+        captureFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    const bool bgra = captureFormat == DXGI_FORMAT_B8G8R8A8_UNORM ||
+        captureFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    if (!rgba && !bgra) return false;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    captureTexture->GetDesc(&desc);
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(device->CreateTexture2D(&desc, nullptr,
+                                       staging.GetAddressOf()))) return false;
+    context->CopyResource(staging.Get(), captureTexture.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
+        return false;
+
+    bool visible = false;
+    for (UINT y = 0; y < desc.Height && !visible;
+         y += (std::max)(1u, desc.Height / 24)) {
+        const auto* row = static_cast<const uint8_t*>(mapped.pData) +
+            static_cast<size_t>(y) * mapped.RowPitch;
+        for (UINT x = 0; x < desc.Width; x += (std::max)(1u, desc.Width / 24)) {
+            const uint8_t* pixel = row + static_cast<size_t>(x) * 4;
+            const unsigned r = rgba ? pixel[0] : pixel[2];
+            const unsigned g = pixel[1];
+            const unsigned b = rgba ? pixel[2] : pixel[0];
+            if ((r * 54 + g * 183 + b * 19) / 256 > 20) {
+                visible = true;
+                break;
+            }
+        }
+    }
+    context->Unmap(staging.Get(), 0);
+    return visible;
+}
+
+std::wstring BuildPanoramaFallbackPath(int heroId) {
+    const wchar_t* name = L"unknown";
+    switch (heroId) {
+        case 1: name = L"infernus"; break; case 2: name = L"seven"; break;
+        case 3: name = L"vindicta"; break; case 4: name = L"lady_geist"; break;
+        case 6: name = L"abrams"; break; case 7: name = L"wraith"; break;
+        case 8: name = L"mcginnis"; break; case 10: name = L"paradox"; break;
+        case 11: name = L"dynamo"; break; case 12: name = L"kelvin"; break;
+        case 13: name = L"haze"; break; case 14: name = L"holliday"; break;
+        case 15: name = L"bebop"; break; case 16: name = L"calico"; break;
+        case 17: name = L"grey_talon"; break; case 18: name = L"mo_krill"; break;
+        case 19: name = L"shiv"; break; case 20: name = L"ivy"; break;
+        case 25: name = L"warden"; break; case 27: name = L"yamato"; break;
+        case 31: name = L"lash"; break; case 35: name = L"viscous"; break;
+        case 50: name = L"pocket"; break; case 52: name = L"mirage"; break;
+        case 58: name = L"vyper"; break; case 60: name = L"sinclair"; break;
+        case 63: name = L"mina"; break; case 64: name = L"drifter"; break;
+        case 65: name = L"venator"; break; case 66: name = L"victor"; break;
+        case 67: name = L"paige"; break; case 69: name = L"the_doorman"; break;
+        case 72: name = L"billy"; break; case 76: name = L"graves"; break;
+        case 77: name = L"apollo"; break; case 79: name = L"rem"; break;
+        case 80: name = L"silver"; break; case 81: name = L"celeste"; break;
+        case 55: name = L"trooper"; break;
+    }
+    wchar_t path[MAX_PATH]{};
+    std::swprintf(path, std::size(path),
+                  L"C:\\Users\\artpo\\source\\repos\\Dll6\\work\\merge-main-codex\\Dll6\\assets\\panorama_fallback\\%s.png",
+                  name);
+    return path;
+}
+
+std::wstring BuildPanoramaFallbackMetadataPath(int heroId) {
+    std::wstring path = BuildPanoramaFallbackPath(heroId);
+    const size_t extension = path.rfind(L'.');
+    if (extension != std::wstring::npos)
+        path.resize(extension);
+    return path + L".esp";
+}
+
+struct PersistedPreviewFrame {
+    uint32_t magic = 0x31505345; // "ESP1"
+    float left = 0.0f;
+    float top = 0.0f;
+    float right = 1.0f;
+    float bottom = 1.0f;
+    float skeleton[18][2]{};
+    uint8_t visible[18]{};
+};
+
+bool SavePanoramaFallbackFrame(int heroId, const Preview3DFrame& frame) {
+    PersistedPreviewFrame stored{};
+    stored.left = frame.left;
+    stored.top = frame.top;
+    stored.right = frame.right;
+    stored.bottom = frame.bottom;
+    for (size_t index = 0; index < frame.skeleton.size(); ++index) {
+        stored.skeleton[index][0] = frame.skeleton[index].x;
+        stored.skeleton[index][1] = frame.skeleton[index].y;
+        stored.visible[index] = frame.skeleton[index].visible ? 1 : 0;
+    }
+    std::ofstream stream(BuildPanoramaFallbackMetadataPath(heroId),
+                         std::ios::binary | std::ios::trunc);
+    stream.write(reinterpret_cast<const char*>(&stored), sizeof(stored));
+    return stream.good();
+}
+
+bool ReadPanoramaFallbackFrame(int heroId, Preview3DFrame& frame) {
+    PersistedPreviewFrame stored{};
+    std::ifstream stream(BuildPanoramaFallbackMetadataPath(heroId), std::ios::binary);
+    stream.read(reinterpret_cast<char*>(&stored), sizeof(stored));
+    if (!stream || stored.magic != 0x31505345 ||
+        stored.right <= stored.left || stored.bottom <= stored.top)
+        return false;
+    frame = {};
+    frame.left = stored.left;
+    frame.top = stored.top;
+    frame.right = stored.right;
+    frame.bottom = stored.bottom;
+    for (size_t index = 0; index < frame.skeleton.size(); ++index) {
+        frame.skeleton[index].x = stored.skeleton[index][0];
+        frame.skeleton[index].y = stored.skeleton[index][1];
+        frame.skeleton[index].visible = stored.visible[index] != 0;
+    }
+    return true;
+}
+
+bool SaveCaptureAsPng(ID3D11Device* device, ID3D11DeviceContext* context,
+                      int heroId) {
+    if (!device || !context || !captureTexture ||
+        persistedFallbackHeroes.find(heroId) != persistedFallbackHeroes.end())
+        return false;
+    const std::wstring output = BuildPanoramaFallbackPath(heroId);
+    if (GetFileAttributesW(output.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return true;
+    }
+    CreateDirectoryW(
+        L"C:\\Users\\artpo\\source\\repos\\Dll6\\work\\merge-main-codex\\Dll6\\assets\\panorama_fallback",
+        nullptr);
+    D3D11_TEXTURE2D_DESC desc{};
+    captureTexture->GetDesc(&desc);
+    const bool rgba = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+        desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    const bool bgra = desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+        desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    if (!rgba && !bgra) return false;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(device->CreateTexture2D(&desc, nullptr, staging.GetAddressOf())))
+        return false;
+    context->CopyResource(staging.Get(), captureTexture.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
+        return false;
+
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    ComPtr<IWICImagingFactory> factory;
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapEncoder> encoder;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    ComPtr<IPropertyBag2> properties;
+    // WIC's PNG encoder is fed a single BGRA layout. The game capture can
+    // be RGBA (the common DXGI format 28), so convert it explicitly instead
+    // of relying on the encoder to interpret the D3D memory layout.
+    const UINT pngStride = desc.Width * 4;
+    std::vector<BYTE> pngPixels(static_cast<size_t>(pngStride) * desc.Height);
+    for (UINT y = 0; y < desc.Height; ++y) {
+        const BYTE* source = static_cast<const BYTE*>(mapped.pData) +
+            static_cast<size_t>(y) * mapped.RowPitch;
+        BYTE* destination = pngPixels.data() + static_cast<size_t>(y) * pngStride;
+        if (bgra) {
+            std::memcpy(destination, source, pngStride);
+        } else {
+            for (UINT x = 0; x < desc.Width; ++x) {
+                destination[x * 4 + 0] = source[x * 4 + 2];
+                destination[x * 4 + 1] = source[x * 4 + 1];
+                destination[x * 4 + 2] = source[x * 4 + 0];
+                destination[x * 4 + 3] = source[x * 4 + 3];
+            }
+        }
+    }
+    GUID format = GUID_WICPixelFormat32bppBGRA;
+    const HRESULT result = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(factory.GetAddressOf()));
+    bool saved = false;
+    if (SUCCEEDED(result) &&
+        SUCCEEDED(factory->CreateStream(stream.GetAddressOf())) &&
+        SUCCEEDED(stream->InitializeFromFilename(output.c_str(), GENERIC_WRITE)) &&
+        SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr,
+                                         encoder.GetAddressOf())) &&
+        SUCCEEDED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)) &&
+        SUCCEEDED(encoder->CreateNewFrame(frame.GetAddressOf(),
+                                          properties.GetAddressOf())) &&
+        SUCCEEDED(frame->Initialize(properties.Get())) &&
+        SUCCEEDED(frame->SetSize(desc.Width, desc.Height)) &&
+        SUCCEEDED(frame->SetPixelFormat(&format)) &&
+        SUCCEEDED(frame->WritePixels(desc.Height, pngStride,
+                                     static_cast<UINT>(pngPixels.size()),
+                                     pngPixels.data())) &&
+        SUCCEEDED(frame->Commit()) && SUCCEEDED(encoder->Commit())) {
+        saved = true;
+    }
+    context->Unmap(staging.Get(), 0);
+    return saved;
+}
+
 bool EnsureResolveTexture(ID3D11Device* device,
                           const D3D11_TEXTURE2D_DESC& sourceDesc) {
     if (resolveTexture && resolveWidth == sourceDesc.Width &&
@@ -841,6 +1079,40 @@ void ProbeCapturedPixels(ID3D11Device* device, ID3D11DeviceContext* context) {
 }
 
 } // namespace
+
+std::wstring PanoramaFallbackPath(int heroId) {
+    return BuildPanoramaFallbackPath(heroId);
+}
+
+bool LoadPanoramaFallbackFrame(int heroId, Preview3DFrame& frame) {
+    return ReadPanoramaFallbackFrame(heroId, frame);
+}
+
+bool PersistPanoramaFallbackFrame(ID3D11Device* device,
+                                  ID3D11DeviceContext* context,
+                                  int heroId, const Preview3DFrame& frame) {
+    if (persistedFallbackHeroes.find(heroId) != persistedFallbackHeroes.end())
+        return true;
+    const std::wstring path = BuildPanoramaFallbackPath(heroId);
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES &&
+        !DeleteFileW(path.c_str())) {
+        Log("PREVIEW_WAIT_FALLBACK_PNG_RELEASE");
+        return false;
+    }
+    if (SaveCaptureAsPng(device, context, heroId)) {
+        if (!SavePanoramaFallbackFrame(heroId, frame)) {
+            DeleteFileW(path.c_str());
+            return false;
+        }
+        persistedFallbackHeroes.insert(heroId);
+        char message[144]{};
+        std::snprintf(message, sizeof(message),
+                      "[ESP_PREVIEW] FallbackPng=PASS hero=%d", heroId);
+        Log(message);
+        return true;
+    }
+    return false;
+}
 
 bool InitializePanoramaPreview() {
     if (initialized.load(std::memory_order_acquire)) return true;
@@ -974,6 +1246,7 @@ void UpdatePanoramaPreview(IDXGISwapChain* swapChain,
         captureFormat = resolveFormat = DXGI_FORMAT_UNKNOWN;
         capturedGeneration = 0;
         captureSerial.store(0, std::memory_order_release);
+        capturePixelsVisible.store(false, std::memory_order_release);
         displayedSerial.store(0, std::memory_order_release);
         failedBindingSerial.store(0, std::memory_order_release);
         Log("[ESP_PREVIEW] RenderResourcesInvalidated=PASS");
@@ -1027,9 +1300,11 @@ void UpdatePanoramaPreview(IDXGISwapChain* swapChain,
         lastUiDispatchAt = now;
         if (requestPending || contextChanged) return;
     }
+    // The scene panel begins producing frames before its renderer-ready flag
+    // is published. Do not gate capture on that late flag: otherwise the
+    // first real portrait frame can never reach the ESP card/fallback.
     if (!panelSpawned.load(std::memory_order_acquire) ||
-        !panelVisible.load(std::memory_order_acquire) ||
-        !rendererReady.load(std::memory_order_acquire)) return;
+        !panelVisible.load(std::memory_order_acquire)) return;
     ConfigurePortraitCamera(previewHeroPanel.load(std::memory_order_acquire));
     int remainingSettle = settleFrames.load(std::memory_order_acquire);
     if (remainingSettle > 0) {
@@ -1076,6 +1351,26 @@ void UpdatePanoramaPreview(IDXGISwapChain* swapChain,
     context->CopySubresourceRegion(captureTexture.Get(), 0, 0, 0, 0,
                                    copySource, 0, &box);
     const uint64_t generation = requestedGeneration.load(std::memory_order_acquire);
+    const int heroId = requestedHeroId.load(std::memory_order_acquire);
+    bool captureVisible = capturePixelsVisible.load(std::memory_order_acquire);
+    if (!captureVisible && HasVisibleCapturePixels(device, context)) {
+        capturePixelsVisible.store(true, std::memory_order_release);
+        captureVisible = true;
+    }
+    if (frozenCaptureTextures.find(heroId) == frozenCaptureTextures.end() &&
+        captureVisible &&
+        StoreFrozenCaptureTexture(device, heroId)) {
+        // Store the first rendered, non-empty panorama frame for this hero.
+        // The earlier resource-ready frame is usually the black clear before
+        // the portrait model has reached the scene.
+        context->CopyResource(frozenCaptureTextures[heroId].Get(),
+                              captureTexture.Get());
+        char message[144]{};
+        std::snprintf(message, sizeof(message),
+                      "[ESP_PREVIEW] FrozenCapture=PASS hero=%d generation=%llu",
+                      heroId, static_cast<unsigned long long>(generation));
+        Log(message);
+    }
     if (capturedGeneration != generation) {
         capturedGeneration = generation;
         const uint64_t serial = captureSerial.fetch_add(
@@ -1097,12 +1392,18 @@ void UpdatePanoramaPreview(IDXGISwapChain* swapChain,
 }
 
 ID3D11Texture2D* GetPanoramaPreviewTexture() {
-    // Retain the most recent valid frame while the source panel is hidden
-    // during a menu drag.  D2D can then move the preview smoothly without a
-    // delayed, duplicate Panorama panel being visible elsewhere.
-    return rendererReady.load(std::memory_order_acquire) &&
-        captureSerial.load(std::memory_order_acquire) != 0
+    // A valid capture surface can be available a few presents before
+    // rendererReady. Let D2D retain that live surface so it receives the
+    // portrait as soon as Panorama finishes its own initialization.
+    return capturePixelsVisible.load(std::memory_order_acquire) &&
+            captureSerial.load(std::memory_order_acquire) != 0
         ? captureTexture.Get() : nullptr;
+}
+
+ID3D11Texture2D* GetPanoramaPreviewFrozenTexture() {
+    const int requestedHero = requestedHeroId.load(std::memory_order_acquire);
+    const auto it = frozenCaptureTextures.find(requestedHero);
+    return it != frozenCaptureTextures.end() ? it->second.Get() : nullptr;
 }
 
 uint64_t GetPanoramaPreviewCaptureSerial() {
@@ -1276,6 +1577,7 @@ void SetPanoramaPreviewHero(int heroId) {
     }
     if (requestedHeroId.exchange(heroId, std::memory_order_acq_rel) == heroId)
         return;
+    capturePixelsVisible.store(false, std::memory_order_release);
     lastUiDispatchAt = 0;
     if (gameWindow)
         PostMessageW(gameWindow, PanoramaPreviewUiMessage, 0, 0);
@@ -1384,6 +1686,7 @@ var p=r.FindChildTraverse('Dll6_esp_preview');if(p)p.DeleteAsync(0);})();
     originalHeroPanelCreate = nullptr;
     captureTexture.Reset();
     resolveTexture.Reset();
+    frozenCaptureTextures.clear();
     captureWidth = captureHeight = 0;
     resolveWidth = resolveHeight = 0;
     captureFormat = DXGI_FORMAT_UNKNOWN;
@@ -1435,6 +1738,7 @@ var p=r.FindChildTraverse('Dll6_esp_preview');if(p)p.DeleteAsync(0);})();
     settleFrames.store(0, std::memory_order_release);
     capturedGeneration = 0;
     captureSerial.store(0, std::memory_order_release);
+    capturePixelsVisible.store(false, std::memory_order_release);
     displayedSerial.store(0, std::memory_order_release);
     failedBindingSerial.store(0, std::memory_order_release);
 }

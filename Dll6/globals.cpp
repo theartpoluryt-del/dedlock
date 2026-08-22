@@ -1,4 +1,5 @@
 #include "shared.h"
+#include "panorama_preview.h"
 bool freeCam=false;
 bool freeCamActive=false;
 bool movementDiagnostics=false;
@@ -160,6 +161,12 @@ void LoadConfig() {
     double number = 0.0;
     while (input >> key >> number) {
         const bool value = number != 0.0;
+        if (key == "previewEnemyHero")
+            SetPanoramaPreviewHeroForRole(0, static_cast<int>(number));
+        else if (key == "previewAllyHero")
+            SetPanoramaPreviewHeroForRole(1, static_cast<int>(number));
+        else if (key == "previewCreepHero")
+            SetPanoramaPreviewHeroForRole(2, static_cast<int>(number));
         if (key == "drawEsp") drawEsp = value;
         if (key == "enemyEspEnabled") enemyEspEnabled = value;
         else if (key == "allyEspEnabled") allyEspEnabled = value;
@@ -411,6 +418,9 @@ void SaveConfig() {
     std::ofstream output(ConfigPath(), std::ios::trunc);
     if (!output) return;
     output << "drawEsp " << drawEsp << '\n'
+           << "previewEnemyHero " << GetPanoramaPreviewHeroForRole(0) << '\n'
+           << "previewAllyHero " << GetPanoramaPreviewHeroForRole(1) << '\n'
+           << "previewCreepHero " << GetPanoramaPreviewHeroForRole(2) << '\n'
            << "enemyEspEnabled " << enemyEspEnabled << '\n'
            << "allyEspEnabled " << allyEspEnabled << '\n'
            << "enemyAbilitiesEnabled " << enemyAbilitiesEnabled << '\n'

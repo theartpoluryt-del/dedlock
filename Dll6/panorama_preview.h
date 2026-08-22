@@ -2,11 +2,13 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <string>
+#include "preview_3d.h"
 
 struct IDXGISwapChain;
 struct ID3D11DeviceContext;
+struct ID3D11Device;
 struct ID3D11Texture2D;
-struct Preview3DPoint;
 
 bool InitializePanoramaPreview();
 void UpdatePanoramaPreview(IDXGISwapChain* swapChain,
@@ -14,6 +16,11 @@ void UpdatePanoramaPreview(IDXGISwapChain* swapChain,
                            float left, float top, float right, float bottom,
                            bool visible);
 ID3D11Texture2D* GetPanoramaPreviewTexture();
+ID3D11Texture2D* GetPanoramaPreviewFrozenTexture();
+std::wstring PanoramaFallbackPath(int heroId);
+bool PersistPanoramaFallbackFrame(ID3D11Device*, ID3D11DeviceContext*, int heroId,
+                                  const Preview3DFrame& frame);
+bool LoadPanoramaFallbackFrame(int heroId, Preview3DFrame& frame);
 uint64_t GetPanoramaPreviewCaptureSerial();
 bool GetPanoramaPreviewSkeleton(Preview3DPoint* points, std::size_t count);
 void SetPanoramaPreviewHero(int heroId);
