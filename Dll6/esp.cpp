@@ -1756,6 +1756,16 @@ void RenderESP(const std::vector<PlayerData>& players) {
             if (!projected || !std::isfinite(position.x) || !std::isfinite(position.y) ||
                 !std::isfinite(position.z) || !std::isfinite(screen.x) ||
                 !std::isfinite(screen.y)) continue;
+            if (currentLocalPositionReady || currentCameraPositionReady) {
+                const Vector3 distanceOrigin = currentLocalPositionReady
+                    ? currentLocalPosition : currentCameraPosition;
+                const float orbDistance = std::sqrt(
+                    (position.x - distanceOrigin.x) * (position.x - distanceOrigin.x) +
+                    (position.y - distanceOrigin.y) * (position.y - distanceOrigin.y) +
+                    (position.z - distanceOrigin.z) * (position.z - distanceOrigin.z)) / 39.37f;
+                if (!std::isfinite(orbDistance) || orbDistance > orbEspMaxDistance)
+                    continue;
+            }
             const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
             // WorldToScreen can return a finite but enormous point for an
             // entity behind the camera. Never let an off-screen orb create a
@@ -1834,7 +1844,9 @@ void RenderESP(const std::vector<PlayerData>& players) {
         }
     }
 
-    if ((creepEspEnabled || allyCreepEspEnabled) && currentViewMatrixReady) {
+    // Ally creep ESP is an extension of the main creep ESP switch; it must
+    // never draw on its own when the parent feature is disabled.
+    if (creepEspEnabled && currentViewMatrixReady) {
         struct SmoothedCreepBox {
             float left{}, top{}, right{}, bottom{};
             ULONGLONG lastSeen{};

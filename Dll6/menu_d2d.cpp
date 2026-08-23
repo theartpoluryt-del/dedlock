@@ -237,7 +237,10 @@ float ColumnMaxScroll(float contentBottom) {
 }
 
 float ColumnViewportTop() {
-    return g.tab == 2 ? 174.0f : 234.0f;
+    // The clipped content region starts at the same card top on every page.
+    // Using the old 234px aim threshold made every control in the first rows
+    // visible but non-interactive (Aim assist, Target point, Creep aim, etc.).
+    return 120.0f;
 }
 
 bool ColumnVisible(float x, float y, float height) {
@@ -454,7 +457,8 @@ void DrawTabIcon(int index, float x, float y, bool selected) {
 
 void DrawToggle(const Layout& l, float x, float y, float width,
                 const wchar_t* label, const wchar_t* description,
-                bool* value, const float* colorValue = nullptr) {
+                bool* value, const float* colorValue = nullptr,
+                bool interactive = true) {
     const float baseY = y;
     NoteContent(x, baseY + 66.0f);
     y = ScrolledY(x, y);
@@ -462,10 +466,10 @@ void DrawToggle(const Layout& l, float x, float y, float width,
     const D2D1_RECT_F colorRect = colorValue
         ? Rect(x + width - 22, y + 10, x + width, y + 32)
         : Rect(0, 0, 0, 0);
-    const bool clickedColor = colorValue && Clicked(l, colorRect);
-    if (ColumnVisible(x, y, 66.0f) && Clicked(l, hit) && !clickedColor)
+    const bool clickedColor = interactive && colorValue && Clicked(l, colorRect);
+    if (interactive && ColumnVisible(x, y, 66.0f) && Clicked(l, hit) && !clickedColor)
         *value = !*value;
-    if (!g.colorPopup && Contains(hit, l.mouse)) {
+    if (interactive && !g.colorPopup && Contains(hit, l.mouse)) {
         FillRounded(Rect(x + 3, y + 2, x + width - 3, y + 42), 3,
                     Color(1, 1, 1, 0.025f));
     }
@@ -474,7 +478,8 @@ void DrawToggle(const Layout& l, float x, float y, float width,
     float& animation = toggleIt->second;
     animation += ((*value ? 1.0f : 0.0f) - animation) * 0.18f;
 
-    Text(label, Rect(x + 10, y + 8, x + width - 110, y + 34), g.regular.Get(), White());
+    Text(label, Rect(x + 10, y + 8, x + width - 110, y + 34), g.regular.Get(),
+         interactive ? White() : Muted());
 
     const float colorOffset = colorValue ? 34.0f : 0.0f;
     const D2D1_RECT_F track = Rect(x + width - 48 - colorOffset, y + 8,
@@ -510,10 +515,12 @@ void DrawSlider(const Layout& l, float x, float y, float width,
     const float trackStart = x + 2;
     const float trackEnd = x + width - 2;
     const D2D1_RECT_F sliderHit = Rect(trackStart - 4, y + 31, trackEnd + 4, y + 64);
-    if (ColumnVisible(x, y, 66.0f) && l.clicked && Contains(sliderHit, l.mouse))
+    const bool inputBlocked = g.colorPopup || g.openCombo;
+    if (!inputBlocked && ColumnVisible(x, y, 66.0f) &&
+        l.clicked && Contains(sliderHit, l.mouse))
         g.activeSlider = value;
-    if (!l.down && g.activeSlider == value) g.activeSlider = nullptr;
-    if (l.down && g.activeSlider == value) {
+    if ((!l.down || inputBlocked) && g.activeSlider == value) g.activeSlider = nullptr;
+    if (!inputBlocked && l.down && g.activeSlider == value) {
         const float f = std::clamp((l.mouse.x - trackStart) / (trackEnd - trackStart), 0.0f, 1.0f);
         *value = minimum + (maximum - minimum) * f;
     }
@@ -1138,11 +1145,12 @@ void DrawColumnScrollbar(const Layout& l, float x, float viewportTop,
     FillRounded(thumb, 4, Contains(thumb, l.mouse) || g.activeScrollColumn != 0
                              ? Color(0.82f, 0.10f, 0.18f, 0.90f)
                              : Color(0.50f, 0.52f, 0.58f, 0.75f));
-    if (l.clicked && Contains(thumb, l.mouse)) {
+    const bool inputBlocked = g.colorPopup || g.openCombo;
+    if (!inputBlocked && l.clicked && Contains(thumb, l.mouse)) {
         g.activeScrollColumn = x < 655.0f ? 1 : 2;
         g.scrollGrabOffset = l.mouse.y - thumbTop;
     }
-    if (g.activeScrollColumn == (x < 655.0f ? 1 : 2) && l.down) {
+    if (!inputBlocked && g.activeScrollColumn == (x < 655.0f ? 1 : 2) && l.down) {
         const float newTop = std::clamp(l.mouse.y - g.scrollGrabOffset,
                                         trackTop, trackBottom - thumbHeight);
         scroll = -((newTop - trackTop) / travel) * maxScroll;
@@ -1927,6 +1935,14 @@ void RenderD2DMenu(std::size_t playerCount) {
         SetPanoramaPreviewRole(g.visualTeam);
         const int previewHeroId = GetPanoramaPreviewHero();
         ID3D11Texture2D* panoramaTexture = GetPanoramaPreviewTexture();
+        // A non-black capture can still be the game backbuffer behind the
+        // Panorama panel while its portrait world is being recreated.  It is
+        // not a valid preview until the selected hero's pose is available.
+        std::array<Preview3DPoint, 18> liveSkeleton{};
+        const bool liveSkeletonReady = panoramaTexture &&
+            GetPanoramaPreviewSkeleton(liveSkeleton.data(), liveSkeleton.size());
+        if (!liveSkeletonReady)
+            panoramaTexture = nullptr;
         g.previewUsesPersistedFallback = false;
         if (!panoramaTexture) {
             // This is a D2D copy of a frame that was actually displayed by
@@ -1967,14 +1983,12 @@ void RenderD2DMenu(std::size_t playerCount) {
             previewFrame.top = 0.0f;
             previewFrame.right = 1.0f;
             previewFrame.bottom = 1.0f;
-            bool skeletonReady = false;
-            std::array<Preview3DPoint, 18> skeleton{};
-            if (GetPanoramaPreviewSkeleton(skeleton.data(), skeleton.size())) {
-                skeletonReady = true;
-                previewFrame.skeleton = skeleton;
+            const bool skeletonReady = true;
+            {
+                previewFrame.skeleton = liveSkeleton;
                 float left = 1.0f, top = 1.0f, right = 0.0f, bottom = 0.0f;
                 size_t visibleJoints = 0;
-                for (const Preview3DPoint& point : skeleton) {
+                for (const Preview3DPoint& point : liveSkeleton) {
                     if (!point.visible) continue;
                     left = (std::min)(left, point.x);
                     top = (std::min)(top, point.y);
@@ -2174,7 +2188,9 @@ void RenderD2DMenu(std::size_t playerCount) {
 
     const float cardTop = 120.0f;
 
-    const bool visualEditor = g.tab == 0;
+    // Creep ESP has no hero/Panorama preview.  It uses the ordinary two-column
+    // settings surface instead of reserving a large empty preview area.
+    const bool visualEditor = g.tab == 0 && g.visualTeam < 2;
     // All tabs share one bottom edge. Their top can differ (Aim has subtabs),
     // but the content cards must terminate at the same design-space Y.
     constexpr float contentPanelBottom = kContentPanelBottom;
@@ -2188,8 +2204,9 @@ void RenderD2DMenu(std::size_t playerCount) {
 
     // The page title in the header already identifies the active tab.  Do not
     // repeat it as an "Overlay" card title or draw a redundant divider here.
-    if (!visualEditor) Line(D2D1::Point2F(655, cardTop),
-                            D2D1::Point2F(655, contentPanelBottom - 28), Border());
+    if (!visualEditor && g.tab != 0)
+        Line(D2D1::Point2F(655, cardTop),
+             D2D1::Point2F(655, contentPanelBottom - 28), Border());
 
     const float leftX = visualEditor ? 350.0f : 330.0f;
     const float rightX = visualEditor ? 660.0f : 675.0f;
@@ -2265,26 +2282,26 @@ void RenderD2DMenu(std::size_t playerCount) {
                                  g.visualTeam == 1 ? &allyEspMaxDistance : &creepEspMaxDistance;
         float* teamBoxThickness = &boxThickness;
         float* teamCornerLength = &cornerBoxLength;
-        const int previewHeroIndex = g.visualTeam < 2
-            ? PreviewHeroIndex(GetPanoramaPreviewHeroForRole(g.visualTeam))
-            : -1;
-        const wchar_t* previewHeroName = previewHeroIndex >= 0
-            ? kPreviewHeroNames[previewHeroIndex] : L"Creep";
-        EnsurePreviewAbilityAssets(previewHeroIndex);
-        DrawHeroEspPreview(1020.0f, 0.0f, 410.0f, kDesignHeight,
-                           g.visualTeam == 0 ? L"Enemy preset" :
-                           g.visualTeam == 1 ? L"Ally preset" : L"Creep preset",
-                           previewHeroName,
-                           *teamEsp,
-                           *teamBoxes, *teamCornerBoxes, *teamBones,
-                           *teamHealth, *teamHealthValues, *teamNames,
-                           *teamPlayerNames, *teamDistance, *teamSnaplines, *teamAbilities,
-                           teamBoxColor, teamSkeletonColor, teamHealthColor,
-                           teamNameColor, teamPlayerColor, teamHealthValueColor,
-                           *teamBoxThickness, *teamCornerLength, l,
-                           teamEsp, teamBoxes, teamCornerBoxes, teamBones,
-                           teamHealth, teamHealthValues, teamNames, teamPlayerNames,
-                           teamDistance, teamSnaplines, teamAbilities);
+        if (g.visualTeam < 2) {
+            const int previewHeroIndex = PreviewHeroIndex(
+                GetPanoramaPreviewHeroForRole(g.visualTeam));
+            const wchar_t* previewHeroName = previewHeroIndex >= 0
+                ? kPreviewHeroNames[previewHeroIndex] : L"Hero";
+            EnsurePreviewAbilityAssets(previewHeroIndex);
+            DrawHeroEspPreview(1020.0f, 0.0f, 410.0f, kDesignHeight,
+                               g.visualTeam == 0 ? L"Enemy preset" : L"Ally preset",
+                               previewHeroName,
+                               *teamEsp,
+                               *teamBoxes, *teamCornerBoxes, *teamBones,
+                               *teamHealth, *teamHealthValues, *teamNames,
+                               *teamPlayerNames, *teamDistance, *teamSnaplines, *teamAbilities,
+                               teamBoxColor, teamSkeletonColor, teamHealthColor,
+                               teamNameColor, teamPlayerColor, teamHealthValueColor,
+                               *teamBoxThickness, *teamCornerLength, l,
+                               teamEsp, teamBoxes, teamCornerBoxes, teamBones,
+                               teamHealth, teamHealthValues, teamNames, teamPlayerNames,
+                               teamDistance, teamSnaplines, teamAbilities);
+        }
 
         // Boolean ESP controls live in the preview companion window. Keep the
         // old in-card layout disabled so controls cannot be duplicated.
@@ -2381,13 +2398,20 @@ void RenderD2DMenu(std::size_t playerCount) {
                 DrawSectionHeading(leftX, firstY + 18, fullWidth, L"General");
                 DrawToggle(l, leftX, firstY + 58, fullWidth,
                            L"Enable ESP", L"", teamEsp);
-                DrawSlider(l, leftX, firstY + 128, fullWidth,
-                           L"Max render distance", teamMaxDistance,
+                DrawToggle(l, leftX, firstY + 112, fullWidth,
+                           L"Ally", L"Show ESP on allied creeps", &allyCreepEspEnabled);
+                DrawToggle(l, leftX, firstY + 166, fullWidth,
+                           L"Orb ESP", L"Show active soul orbs", &drawOrbEsp);
+                DrawSlider(l, leftX, firstY + 224, fullWidth,
+                           L"Creep max distance", teamMaxDistance,
                            10.0f, 500.0f, L"%.0f m");
-                DrawSectionHeading(leftX, firstY + 210, fullWidth, L"Appearance");
-                DrawSlider(l, leftX, firstY + 250, fullWidth, L"Box thickness",
+                DrawSlider(l, leftX, firstY + 294, fullWidth,
+                           L"Orb max distance", &orbEspMaxDistance,
+                           10.0f, 500.0f, L"%.0f m");
+                DrawSectionHeading(leftX, firstY + 376, fullWidth, L"Appearance");
+                DrawSlider(l, leftX, firstY + 416, fullWidth, L"Box thickness",
                            teamBoxThickness, 0.5f, 4.0f, L"%.2f px");
-                DrawSlider(l, leftX, firstY + 320, fullWidth, L"Corner length",
+                DrawSlider(l, leftX, firstY + 486, fullWidth, L"Corner length",
                            teamCornerLength, 0.10f, 0.35f, L"%.2f");
             }
         }

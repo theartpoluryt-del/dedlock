@@ -110,7 +110,7 @@ float allyCreepBoxColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
 float allyCreepHealthColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
 float allyCreepHealthValueColor[4] = {0.70f, 0.85f, 1.00f, 1.00f};
 float enemyEspMaxDistance = 150.0f, allyEspMaxDistance = 150.0f,
-      creepEspMaxDistance = 80.0f;
+      creepEspMaxDistance = 80.0f, orbEspMaxDistance = 80.0f;
 bool powerupEspEnabled = false;
 bool enemyTrooperChams = false, allyTrooperChams = false,
      neutralChams = false;
@@ -217,6 +217,7 @@ void LoadConfig() {
         else if (key == "enemyEspMaxDistance") enemyEspMaxDistance = static_cast<float>(number);
         else if (key == "allyEspMaxDistance") allyEspMaxDistance = static_cast<float>(number);
         else if (key == "creepEspMaxDistance") creepEspMaxDistance = static_cast<float>(number);
+        else if (key == "orbEspMaxDistance") orbEspMaxDistance = static_cast<float>(number);
         else if (key == "powerupEspEnabled") powerupEspEnabled = value;
         // Migrate old Chams presets to the ordinary Creep ESP switches.
         else if (key == "enemyTrooperChams") creepEspEnabled = value;
@@ -470,6 +471,7 @@ void SaveConfig() {
            << "enemyEspMaxDistance " << enemyEspMaxDistance << '\n'
            << "allyEspMaxDistance " << allyEspMaxDistance << '\n'
            << "creepEspMaxDistance " << creepEspMaxDistance << '\n'
+           << "orbEspMaxDistance " << orbEspMaxDistance << '\n'
            << "powerupEspEnabled " << powerupEspEnabled << '\n'
            << "enemyTrooperChams " << enemyTrooperChams << '\n'
            << "allyTrooperChams " << allyTrooperChams << '\n'

@@ -115,7 +115,7 @@ extern bool allyCreepEspEnabled, allyCreepBoxesEnabled, allyCreepCornerBoxesEnab
 extern bool allyCreepHealthEnabled, allyCreepHealthValuesEnabled, allyCreepDistanceEnabled;
 extern float allyCreepBoxColor[4], allyCreepHealthColor[4], allyCreepHealthValueColor[4];
 extern float boxThickness, cornerBoxLength;
-extern float enemyEspMaxDistance, allyEspMaxDistance, creepEspMaxDistance;
+extern float enemyEspMaxDistance, allyEspMaxDistance, creepEspMaxDistance, orbEspMaxDistance;
 extern bool powerupEspEnabled;
 extern bool enemyTrooperChams, allyTrooperChams, neutralChams;
 extern float enemyTrooperChamsColor[4], allyTrooperChamsColor[4], neutralChamsColor[4];
