@@ -32,4 +32,5 @@ bool IsPanoramaPreviewNativeGlowActive();
 void ReportPanoramaPreviewGlowRegistration(bool success);
 void ReportPanoramaPreviewBinding(bool success);
 void ProcessPanoramaPreviewUiThread();
+void SetPanoramaRadarEnabled(bool enabled);
 void ShutdownPanoramaPreview();

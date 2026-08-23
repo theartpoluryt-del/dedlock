@@ -2478,25 +2478,31 @@ void RenderD2DMenu(std::size_t playerCount) {
                               L"Preview hero", &previewHero);
                 DrawToggle(l, leftX, firstY + 118, fullWidth,
                            L"Enable ESP", L"", teamEsp);
-                DrawSlider(l, leftX, firstY + 188, fullWidth,
+                const float radarOffset = g.visualTeam == 0 ? 50.0f : 0.0f;
+                if (g.visualTeam == 0) {
+                    DrawToggle(l, leftX, firstY + 168, fullWidth,
+                               L"Radar", L"Always show enemies on minimap",
+                               &enemyRadarEnabled);
+                }
+                DrawSlider(l, leftX, firstY + 188 + radarOffset, fullWidth,
                            L"Max render distance", teamMaxDistance,
                            10.0f, 500.0f, L"%.0f m");
-                DrawSectionHeading(leftX, firstY + 270, fullWidth, L"Appearance");
-                DrawToggle(l, leftX, firstY + 310, fullWidth,
+                DrawSectionHeading(leftX, firstY + 270 + radarOffset, fullWidth, L"Appearance");
+                DrawToggle(l, leftX, firstY + 310 + radarOffset, fullWidth,
                            L"Model glow", L"", teamGlowEnabled, teamGlowColor);
-                DrawToggle(l, leftX, firstY + 364, fullWidth,
+                DrawToggle(l, leftX, firstY + 364 + radarOffset, fullWidth,
                            L"Visible Chams", L"Visible model material",
                            teamChamsEnabled, teamChamsColor);
-                DrawToggle(l, leftX, firstY + 414, fullWidth,
+                DrawToggle(l, leftX, firstY + 414 + radarOffset, fullWidth,
                            L"Invisible Chams", L"Model through walls",
                            teamInvisibleChamsEnabled, teamInvisibleChamsColor);
                 const wchar_t* glowModes[] = {L"HP-based fill", L"Normal fill"};
                 int* teamGlowMode = g.visualTeam == 0 ? &enemyGlowMode : &allyGlowMode;
-                DrawCombo(l, 401, leftX, firstY + 470, fullWidth, L"Glow mode",
+                DrawCombo(l, 401, leftX, firstY + 470 + radarOffset, fullWidth, L"Glow mode",
                           teamGlowMode, glowModes, 2);
-                DrawSlider(l, leftX, firstY + 530, fullWidth, L"Box thickness",
+                DrawSlider(l, leftX, firstY + 530 + radarOffset, fullWidth, L"Box thickness",
                            teamBoxThickness, 0.5f, 4.0f, L"%.2f px");
-                DrawSlider(l, leftX, firstY + 590, fullWidth, L"Corner length",
+                DrawSlider(l, leftX, firstY + 590 + radarOffset, fullWidth, L"Corner length",
                            teamCornerLength, 0.10f, 0.35f, L"%.2f");
             } else {
                 DrawSectionHeading(leftX, firstY + 18, fullWidth, L"General");

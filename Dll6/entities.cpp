@@ -709,8 +709,8 @@ uintptr_t ResolveEntityIndex(uint32_t entityIndex) {
     if (!clientBase || index == 0) return 0;
 
     const uintptr_t roots[] = {
-        clientBase + Offsets::GameEntitySystem,
-        Read<uintptr_t>(clientBase + Offsets::GameEntitySystem)
+        Read<uintptr_t>(clientBase + Offsets::GameEntitySystem),
+        clientBase + Offsets::GameEntitySystem
     };
     const uintptr_t tableOffsets[] = { 0, 0x10, 0x110, 0x100, 0x20 };
     for (const uintptr_t root : roots) {
@@ -722,11 +722,539 @@ uintptr_t ResolveEntityIndex(uint32_t entityIndex) {
             if (!chunk) continue;
             const uintptr_t identity = chunk + Offsets::EntityStride *
                 (index & Offsets::HandleChunkMask);
+            const uint32_t storedHandle = Read<uint32_t>(
+                identity + Offsets::EntityHandleOffset);
+            if ((storedHandle & Offsets::HandleIndexMask) != index)
+                continue;
             const uintptr_t entity = Read<uintptr_t>(identity);
             if (entity) return entity;
         }
     }
     return 0;
+}
+
+namespace {
+const char* HeroRadarToken(uint32_t heroId) {
+    switch (heroId) {
+        case 1: return "infernus"; case 2: return "seven";
+        case 3: return "vindicta"; case 4: return "ladygeist";
+        case 6: return "abrams"; case 7: return "wraith";
+        case 8: return "mcginnis"; case 10: return "paradox";
+        case 11: return "dynamo"; case 12: return "kelvin";
+        case 13: return "haze"; case 14: return "holliday";
+        case 15: return "bebop"; case 16: return "calico";
+        case 17: return "greytalon"; case 18: return "mokrill";
+        case 19: return "shiv"; case 20: return "ivy";
+        case 25: return "warden"; case 27: return "yamato";
+        case 31: return "lash"; case 35: return "viscous";
+        case 50: return "pocket"; case 52: return "mirage";
+        case 58: return "vyper"; case 60: return "sinclair";
+        case 63: return "mina"; case 64: return "drifter";
+        case 65: return "venator"; case 66: return "victor";
+        case 67: return "paige"; case 69: return "thedoorman";
+        case 72: return "billy"; case 76: return "graves";
+        case 77: return "apollo"; case 79: return "rem";
+        case 80: return "silver"; case 81: return "celeste";
+        default: return "";
+    }
+}
+
+std::string ReadFowEntityName(uintptr_t entry) {
+    const uintptr_t text = Read<uintptr_t>(
+        entry + Offsets::TeamFOWEntityName);
+    if (!text) return {};
+    std::string result;
+    result.reserve(96);
+    for (size_t index = 0; index < 96; ++index) {
+        const char character = Read<char>(text + index);
+        if (!character) break;
+        const unsigned char value = static_cast<unsigned char>(character);
+        if (value < 0x20 || value > 0x7E) return {};
+        result.push_back(character);
+    }
+    return NormalizeEntityName(result);
+}
+
+uintptr_t FindLiveHeroPawnForFow(
+    int entryTeam, const std::string& normalizedFowName,
+    uint64_t key,
+    std::unordered_map<uint64_t, uint32_t>& controllerByFowEntry) {
+    if (normalizedFowName.empty()) return 0;
+    std::vector<uintptr_t> pawns;
+    {
+        std::lock_guard<std::mutex> lock(heroPawnsMutex);
+        pawns = heroPawns;
+    }
+    for (const uintptr_t pawn : pawns) {
+        if (!pawn || Read<uint8_t>(pawn + Offsets::Team) != entryTeam ||
+            Read<int>(pawn + Offsets::Health) <= 0 ||
+            Read<uint8_t>(pawn + Offsets::LifeState) != 0)
+            continue;
+        const uint32_t controllerHandle = Read<uint32_t>(
+            pawn + Offsets::PawnController);
+        const uintptr_t controller = ResolveEntity(controllerHandle);
+        std::string playerName;
+        if (controller) {
+            playerName.reserve(128);
+            for (size_t index = 0; index < 128; ++index) {
+                const char character = Read<char>(
+                    controller + Offsets::PlayerName + index);
+                if (!character) break;
+                const unsigned char value =
+                    static_cast<unsigned char>(character);
+                if (value < 0x20) break;
+                playerName.push_back(character);
+            }
+            playerName = NormalizeEntityName(playerName);
+        }
+        const bool playerNameMatches = !playerName.empty() &&
+            (normalizedFowName == playerName ||
+             normalizedFowName.find(playerName) != std::string::npos ||
+             playerName.find(normalizedFowName) != std::string::npos);
+
+        const uint32_t heroId = Read<uint32_t>(
+            pawn + Offsets::HeroComponent + Offsets::HeroSpawnedId);
+        const char* token = HeroRadarToken(heroId);
+        const bool heroNameMatches = token && *token &&
+            normalizedFowName.find(token) != std::string::npos;
+        if (!playerNameMatches && !heroNameMatches)
+            continue;
+        if (controller)
+            controllerByFowEntry[key] = controllerHandle;
+        return pawn;
+    }
+    return 0;
+}
+
+uintptr_t ResolveCurrentFowPawn(
+    uint32_t entityIndex, uint64_t key,
+    std::unordered_map<uint64_t, uint32_t>& controllerByFowEntry) {
+    // The controller survives death and owns the newly created pawn after a
+    // respawn. Prefer the cached controller because the FOW entity index can
+    // continue pointing at the pawn that died until the hero is seen again.
+    const auto cached = controllerByFowEntry.find(key);
+    if (cached != controllerByFowEntry.end()) {
+        const uintptr_t controller = ResolveEntity(cached->second);
+        if (controller) {
+            const uintptr_t currentPawn = ResolveEntity(Read<uint32_t>(
+                controller + Offsets::ControllerPawn));
+            if (currentPawn) return currentPawn;
+        } else {
+            controllerByFowEntry.erase(cached);
+        }
+    }
+
+    const uintptr_t entity = ResolveEntityIndex(entityIndex);
+    if (!entity) return 0;
+
+    const std::string className = GetEntityClassName(entity);
+    if (className.find("PlayerController") != std::string::npos) {
+        const uint32_t controllerHandle = FindEntityHandle(entity);
+        if (controllerHandle != 0xFFFFFFFFu)
+            controllerByFowEntry[key] = controllerHandle;
+        return ResolveEntity(Read<uint32_t>(
+            entity + Offsets::ControllerPawn));
+    }
+    if (className.find("PlayerPawn") == std::string::npos)
+        return 0;
+
+    // A FOW record can keep the entity index of the pawn which died. After
+    // respawn the controller may own a new pawn/serial, so follow the
+    // pawn -> controller -> current pawn chain before sampling the position.
+    const uint32_t controllerHandle = Read<uint32_t>(
+        entity + Offsets::PawnController);
+    const uintptr_t controller = ResolveEntity(controllerHandle);
+    if (controller) {
+        controllerByFowEntry[key] = controllerHandle;
+        const uintptr_t currentPawn = ResolveEntity(Read<uint32_t>(
+            controller + Offsets::ControllerPawn));
+        if (currentPawn) return currentPawn;
+    }
+    return entity;
+}
+
+bool SetEnemyFowVectorVisibility(uintptr_t data, int count, uintptr_t stride,
+                                 uintptr_t entityIndexOffset,
+                                 uintptr_t teamOffset,
+                                 uintptr_t classOffset,
+                                 uintptr_t visibleOffset,
+                                 uintptr_t tickHiddenOffset, int localTeam,
+                                 uintptr_t teamIdentity, bool forceVisible,
+                                 std::unordered_set<uint64_t>& sampledHeroes,
+                                 std::unordered_set<uint64_t>& forcedHiddenHeroes,
+                                 std::unordered_map<uint64_t, int>&
+                                     initialHiddenTickByHero,
+                                 std::unordered_map<uint64_t, int>&
+                                     lastHiddenTickByHero,
+                                 std::unordered_map<uint64_t, uint16_t>&
+                                     lastForcedPositionByHero,
+                                 std::unordered_set<uint64_t>&
+                                     visibleAgainAfterHidden,
+                                 std::unordered_map<uint64_t, uint32_t>&
+                                     controllerByFowEntry,
+                                 std::unordered_set<uint64_t>&
+                                     pendingRespawnRefresh,
+                                 const Vector3& minimapMins,
+                                 const Vector3& minimapMaxs,
+                                 bool haveMinimapBounds) {
+    for (int index = 0; index < count; ++index) {
+        const uintptr_t entry =
+            data + static_cast<uintptr_t>(index) * stride;
+        const int entryTeam = Read<int>(entry + teamOffset);
+        if ((entryTeam != 2 && entryTeam != 3) ||
+            entryTeam == localTeam)
+            continue;
+        const uint32_t entryClass = Read<uint32_t>(entry + classOffset);
+        // Class_T::CLASS_PLAYER / CLASS_PLAYER_ALLY. Unlike resolving the
+        // entity index, this classification remains populated in fog of war.
+        if (entryClass != 1 && entryClass != 2) continue;
+        const int entityIndex = Read<int>(entry + entityIndexOffset);
+        if (entityIndex <= 0 ||
+            entityIndex > static_cast<int>(Offsets::HandleIndexMask))
+            continue;
+        const uint64_t key =
+            static_cast<uint64_t>(teamIdentity) * 0x9E3779B185EBCA87ull ^
+            static_cast<uint32_t>(entityIndex);
+        if (forceVisible) {
+            const int currentHiddenTick = Read<int>(
+                entry + tickHiddenOffset);
+            const uint16_t observedPosition = static_cast<uint16_t>(
+                Read<uint8_t>(entry + Offsets::TeamFOWPositionX)) |
+                (static_cast<uint16_t>(Read<uint8_t>(
+                     entry + Offsets::TeamFOWPositionY)) << 8);
+            bool hiddenTransitionThisFrame = false;
+            const auto previousHiddenTick = lastHiddenTickByHero.find(key);
+            if (previousHiddenTick != lastHiddenTickByHero.end() &&
+                currentHiddenTick != previousHiddenTick->second) {
+                hiddenTransitionThisFrame = true;
+                visibleAgainAfterHidden.erase(key);
+            }
+            lastHiddenTickByHero[key] = currentHiddenTick;
+            const auto previousForcedPosition =
+                lastForcedPositionByHero.find(key);
+            if (!hiddenTransitionThisFrame && currentHiddenTick > 0 &&
+                previousForcedPosition != lastForcedPositionByHero.end() &&
+                observedPosition != previousForcedPosition->second) {
+                // Radar writes its own position every frame. A different
+                // value observed before our write can only be a fresh server
+                // FOW update, which means team vision revealed this hero
+                // again after the last hidden transition.
+                visibleAgainAfterHidden.insert(key);
+            }
+            // Capture the native state exactly once. Reading it again on a
+            // later Present would read our own true and lose the information
+            // needed to restore a hero that was originally in fog of war.
+            if (sampledHeroes.insert(key).second) {
+                initialHiddenTickByHero[key] = Read<int>(
+                    entry + tickHiddenOffset);
+                if (!Read<bool>(entry + visibleOffset))
+                    forcedHiddenHeroes.insert(key);
+            }
+            uintptr_t pawn = ResolveCurrentFowPawn(
+                static_cast<uint32_t>(entityIndex), key,
+                controllerByFowEntry);
+            int health = pawn
+                ? Read<int>(pawn + Offsets::Health) : 0;
+            uint8_t lifeState = pawn
+                ? Read<uint8_t>(pawn + Offsets::LifeState) : 1;
+            if (!pawn || health <= 0 || lifeState != 0) {
+                pawn = FindLiveHeroPawnForFow(
+                    entryTeam, ReadFowEntityName(entry), key,
+                    controllerByFowEntry);
+                health = pawn ? Read<int>(pawn + Offsets::Health) : 0;
+                lifeState = pawn
+                    ? Read<uint8_t>(pawn + Offsets::LifeState) : 1;
+            }
+            if (pawn && health > 0 && lifeState == 0) {
+                const uint8_t previousHealthPercent = Read<uint8_t>(
+                    entry + Offsets::TeamFOWHealthPercent);
+                const int maxHealth = Read<int>(pawn + Offsets::MaxHealth);
+                const int percent = maxHealth > 0
+                    ? std::clamp((health * 100 + maxHealth / 2) / maxHealth,
+                                 1, 100)
+                    : 100;
+                // Health is also the native dead/alive state consumed by the
+                // minimap. It must be refreshed even if map bounds were not
+                // resolved yet, otherwise a respawn remains a skull.
+                Write<uint8_t>(entry + Offsets::TeamFOWHealthPercent,
+                               static_cast<uint8_t>(percent));
+
+                if (haveMinimapBounds) {
+                    Vector3 position{};
+                    if (GetEntityPosition(pawn, position)) {
+                        const float rangeX = minimapMaxs.x - minimapMins.x;
+                        const float rangeY = minimapMaxs.y - minimapMins.y;
+                        const float normalizedX = std::clamp(
+                            (position.x - minimapMins.x) / rangeX,
+                            0.0f, 1.0f);
+                        const float normalizedY = std::clamp(
+                            (position.y - minimapMins.y) / rangeY,
+                            0.0f, 1.0f);
+                        Write<uint8_t>(entry + Offsets::TeamFOWPositionX,
+                                       static_cast<uint8_t>(std::lround(
+                                           normalizedX * 255.0f)));
+                        Write<uint8_t>(entry + Offsets::TeamFOWPositionY,
+                                       static_cast<uint8_t>(std::lround(
+                                           normalizedY * 255.0f)));
+                        lastForcedPositionByHero[key] =
+                            static_cast<uint16_t>(Read<uint8_t>(
+                                entry + Offsets::TeamFOWPositionX)) |
+                            (static_cast<uint16_t>(Read<uint8_t>(
+                                 entry + Offsets::TeamFOWPositionY)) << 8);
+                    }
+                }
+
+                // The minimap caches the death presentation. Directly
+                // changing m_nEntIndex corrupts the embedded network vector,
+                // so invalidate the icon through its supported visibility
+                // gate for one complete UI frame and recreate it alive on
+                // the next frame.
+                if (previousHealthPercent == 0 &&
+                    pendingRespawnRefresh.insert(key).second) {
+                    Write<bool>(entry + visibleOffset, false);
+                    continue;
+                }
+                pendingRespawnRefresh.erase(key);
+            }
+            Write<bool>(entry + visibleOffset, true);
+        } else {
+            // Preserve heroes that were already visible to the team when
+            // Radar started only until a newer hidden transition arrives.
+            // A positive tick can be historical, while a changed tick means
+            // the hero actually entered fog during this Radar session.
+            const int tickHidden = Read<int>(entry + tickHiddenOffset);
+            const auto initialTick = initialHiddenTickByHero.find(key);
+            const bool becameHiddenWhileRadarWasEnabled =
+                initialTick != initialHiddenTickByHero.end() &&
+                tickHidden > 0 && tickHidden != initialTick->second;
+            const bool wasNativelyVisibleWhenEnabled =
+                forcedHiddenHeroes.find(key) == forcedHiddenHeroes.end();
+            bool shouldRemainVisible = tickHidden <= 0 ||
+                (wasNativelyVisibleWhenEnabled &&
+                 !becameHiddenWhileRadarWasEnabled) ||
+                visibleAgainAfterHidden.find(key) !=
+                    visibleAgainAfterHidden.end();
+
+            // Towers and other allied NPCs reveal a hero on the minimap via a
+            // separate deadline on the pawn. Keep that native team reveal
+            // when Radar is switched off.
+            const uintptr_t pawn = ResolveCurrentFowPawn(
+                static_cast<uint32_t>(entityIndex), key,
+                controllerByFowEntry);
+            const float gameTime = GetClientGameTime();
+            const float npcRevealUntil = pawn
+                ? Read<float>(pawn + Offsets::TimeRevealedOnMinimapByNPC)
+                : 0.0f;
+            if (gameTime > 0.0f && std::isfinite(npcRevealUntil) &&
+                npcRevealUntil > gameTime)
+                shouldRemainVisible = true;
+
+            Write<bool>(entry + visibleOffset, shouldRemainVisible);
+        }
+    }
+    return true;
+}
+}
+
+void ApplyEnemyRadar(bool enabled) {
+    // Deadlock's native minimap consumes the per-team fog-of-war vector.  The
+    // client already receives the hidden entities and their quantized map
+    // positions; m_bVisibleOnMap is the final presentation gate.  This is the
+    // same path used by the public Andromeda UnlockMiniMap implementation.
+    static std::vector<uintptr_t> citadelTeams;
+    static uintptr_t gameRules = 0;
+    static ULONGLONG lastTeamScanAt = 0;
+    static bool wasEnabled = false;
+    static unsigned consecutiveInvalidVectors = 0;
+    static std::unordered_set<uint64_t> sampledHeroes;
+    static std::unordered_set<uint64_t> forcedHiddenHeroes;
+    static std::unordered_map<uint64_t, int> initialHiddenTickByHero;
+    static std::unordered_map<uint64_t, int> lastHiddenTickByHero;
+    static std::unordered_map<uint64_t, uint16_t> lastForcedPositionByHero;
+    static std::unordered_set<uint64_t> visibleAgainAfterHidden;
+    static std::unordered_map<uint64_t, uint32_t> controllerByFowEntry;
+    static std::unordered_set<uint64_t> pendingRespawnRefresh;
+
+    if (!enabled) {
+        // We wrote these client-side flags ourselves, so do not wait for each
+        // individual entry to receive another network delta. Clear the forced
+        // state once; entries that are genuinely visible are restored by the
+        // game's normal FOW update immediately afterwards.
+        const int localTeam = currentLocalPawn
+            ? static_cast<int>(Read<uint8_t>(currentLocalPawn + Offsets::Team))
+            : 0;
+        if (wasEnabled && clientBase &&
+            (localTeam == 2 || localTeam == 3)) {
+            const uintptr_t stride = Offsets::TeamFOWEntitySize;
+            if (stride >= 0x40 && stride <= 0x200 &&
+                Offsets::TeamFOWVisibleOnMap < stride) {
+                for (const uintptr_t team : citadelTeams) {
+                    const uintptr_t vector =
+                        team + Offsets::CitadelTeamFOWEntities;
+                    const int count = Read<int>(vector);
+                    const uintptr_t data = Read<uintptr_t>(vector + 0x08);
+                    if (!data || count <= 0 || count > 4096) continue;
+                    SetEnemyFowVectorVisibility(
+                        data, count, stride, Offsets::TeamFOWEntIndex,
+                        Offsets::TeamFOWTeam, Offsets::TeamFOWClass,
+                        Offsets::TeamFOWVisibleOnMap,
+                        Offsets::TeamFOWTickHidden, localTeam, team, false,
+                        sampledHeroes, forcedHiddenHeroes,
+                        initialHiddenTickByHero, lastHiddenTickByHero,
+                        lastForcedPositionByHero, visibleAgainAfterHidden,
+                        controllerByFowEntry, pendingRespawnRefresh,
+                        Vector3{}, Vector3{}, false);
+                }
+            }
+        }
+        wasEnabled = false;
+        consecutiveInvalidVectors = 0;
+        citadelTeams.clear();
+        gameRules = 0;
+        lastTeamScanAt = 0;
+        sampledHeroes.clear();
+        forcedHiddenHeroes.clear();
+        initialHiddenTickByHero.clear();
+        lastHiddenTickByHero.clear();
+        lastForcedPositionByHero.clear();
+        visibleAgainAfterHidden.clear();
+        controllerByFowEntry.clear();
+        pendingRespawnRefresh.clear();
+        return;
+    }
+    if (!clientBase) {
+        return;
+    }
+
+    const ULONGLONG now = GetTickCount64();
+    if (!wasEnabled) {
+        sampledHeroes.clear();
+        forcedHiddenHeroes.clear();
+        initialHiddenTickByHero.clear();
+        lastHiddenTickByHero.clear();
+        lastForcedPositionByHero.clear();
+        visibleAgainAfterHidden.clear();
+        controllerByFowEntry.clear();
+        pendingRespawnRefresh.clear();
+    }
+    if ((!wasEnabled || citadelTeams.empty()) &&
+        (lastTeamScanAt == 0 || now - lastTeamScanAt >= 500)) {
+        wasEnabled = true;
+        lastTeamScanAt = now;
+        gameRules = 0;
+        std::vector<uintptr_t> found;
+        std::unordered_set<uintptr_t> seen;
+        const uintptr_t roots[] = {
+            Read<uintptr_t>(clientBase + Offsets::GameEntitySystem),
+            clientBase + Offsets::GameEntitySystem
+        };
+        const uintptr_t tableOffsets[] = {
+            Offsets::EntityChunks, 0, 0x110, 0x100, 0x20
+        };
+
+        for (const uintptr_t root : roots) {
+            if (!root) continue;
+            for (const uintptr_t tableOffset : tableOffsets) {
+                for (uint32_t chunkIndex = 0;
+                     chunkIndex <=
+                         (Offsets::MaxEntityIndex >> Offsets::HandleChunkShift);
+                     ++chunkIndex) {
+                    const uintptr_t chunk = Read<uintptr_t>(
+                        root + tableOffset +
+                        Offsets::EntityChunkStride * chunkIndex);
+                    if (!chunk) continue;
+                    for (uint32_t slot = 0;
+                         slot <= Offsets::HandleChunkMask; ++slot) {
+                        const uintptr_t entity = Read<uintptr_t>(
+                            chunk + Offsets::EntityStride * slot);
+                        if (!entity || !seen.insert(entity).second) continue;
+                        const std::string className = GetEntityClassName(entity);
+                        if (className.find("C_CitadelTeam") !=
+                            std::string::npos)
+                            found.push_back(entity);
+                        else if (className.find("C_CitadelGameRulesProxy") !=
+                                 std::string::npos)
+                            gameRules = Read<uintptr_t>(
+                                entity + Offsets::GameRulesProxyRules);
+                    }
+                }
+            }
+        }
+
+        std::sort(found.begin(), found.end());
+        found.erase(std::unique(found.begin(), found.end()), found.end());
+        citadelTeams = std::move(found);
+        printf("[RADAR] C_CitadelTeam entities: %zu, vector=0x%llX, "
+               "visible=0x%llX, stride=0x%llX\n",
+               citadelTeams.size(),
+               static_cast<unsigned long long>(Offsets::CitadelTeamFOWEntities),
+               static_cast<unsigned long long>(Offsets::TeamFOWVisibleOnMap),
+               static_cast<unsigned long long>(Offsets::TeamFOWEntitySize));
+    }
+
+    const uintptr_t stride = Offsets::TeamFOWEntitySize;
+    if (stride < 0x40 || stride > 0x200 ||
+        Offsets::TeamFOWTeam + sizeof(int) > stride ||
+        Offsets::TeamFOWEntIndex + sizeof(int) > stride ||
+        Offsets::TeamFOWClass + sizeof(uint32_t) > stride ||
+        Offsets::TeamFOWTickHidden + sizeof(int) > stride ||
+        Offsets::TeamFOWVisibleOnMap >= stride ||
+        Offsets::TeamFOWEntityName + sizeof(uintptr_t) > stride ||
+        Offsets::TeamFOWHealthPercent >= stride ||
+        Offsets::TeamFOWPositionX >= stride ||
+        Offsets::TeamFOWPositionY >= stride)
+        return;
+    const int localTeam = currentLocalPawn
+        ? static_cast<int>(Read<uint8_t>(currentLocalPawn + Offsets::Team))
+        : 0;
+    if (localTeam != 2 && localTeam != 3) return;
+    const Vector3 minimapMins = gameRules
+        ? Read<Vector3>(gameRules + Offsets::GameRulesMinimapMins)
+        : Vector3{};
+    const Vector3 minimapMaxs = gameRules
+        ? Read<Vector3>(gameRules + Offsets::GameRulesMinimapMaxs)
+        : Vector3{};
+    const bool haveMinimapBounds =
+        std::isfinite(minimapMins.x) && std::isfinite(minimapMins.y) &&
+        std::isfinite(minimapMaxs.x) && std::isfinite(minimapMaxs.y) &&
+        minimapMaxs.x - minimapMins.x > 100.0f &&
+        minimapMaxs.y - minimapMins.y > 100.0f;
+
+    bool foundValidVector = false;
+    for (const uintptr_t team : citadelTeams) {
+        if (!team) continue;
+        const uintptr_t vector = team + Offsets::CitadelTeamFOWEntities;
+        const int count = Read<int>(vector);
+        const uintptr_t data = Read<uintptr_t>(vector + 0x08);
+        if (!data || count <= 0 || count > 4096) continue;
+        foundValidVector = true;
+
+        if (!SetEnemyFowVectorVisibility(
+                data, count, stride, Offsets::TeamFOWEntIndex,
+                Offsets::TeamFOWTeam, Offsets::TeamFOWClass,
+                Offsets::TeamFOWVisibleOnMap,
+                Offsets::TeamFOWTickHidden, localTeam, team, true,
+                sampledHeroes, forcedHiddenHeroes, initialHiddenTickByHero,
+                lastHiddenTickByHero, lastForcedPositionByHero,
+                visibleAgainAfterHidden, controllerByFowEntry,
+                pendingRespawnRefresh, minimapMins, minimapMaxs,
+                haveMinimapBounds)) {
+            // The embedded vector may be reallocated by a network update.
+            // Drop the cache and reacquire the team/vector on the next frame.
+            citadelTeams.clear();
+            lastTeamScanAt = 0;
+            break;
+        }
+    }
+    if (foundValidVector) {
+        consecutiveInvalidVectors = 0;
+    } else if (!citadelTeams.empty() && ++consecutiveInvalidVectors >= 30) {
+        // Match/HUD transitions replace the team objects. Reacquire them,
+        // but never perform a full entity scan every rendered frame.
+        citadelTeams.clear();
+        gameRules = 0;
+        consecutiveInvalidVectors = 0;
+    }
 }
 
 float GetClientGameTime() {

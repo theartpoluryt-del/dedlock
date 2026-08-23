@@ -3660,6 +3660,8 @@ void RenderMenu(size_t playerCount) {
 
         if (activeTab == 0) {
             Toggle("Enable ESP", &drawEsp, nullptr);
+            if (visualTeam == 0)
+                Toggle("Radar", &enemyRadarEnabled, nullptr);
             Toggle("Bounding boxes", &drawBoxes, visualTeam == 0 ? enemyBoxColor : teammateBoxColor);
             Slider("Box thickness", &boxThickness, 0.5f, 4.0f, "%.2f px");
             Toggle("Corner boxes", &cornerBoxes, enemyHealthColor);

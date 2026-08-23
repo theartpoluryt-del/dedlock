@@ -21,6 +21,7 @@ struct SchemaField {
 struct SchemaBinding {
     const char* name() const { return Read<const char*>(reinterpret_cast<uintptr_t>(this) + 0x08); }
     const char* moduleName() const { return Read<const char*>(reinterpret_cast<uintptr_t>(this) + 0x10); }
+    int size() const { return Read<int>(reinterpret_cast<uintptr_t>(this) + 0x18); }
     uint16_t fieldCount() const { return Read<uint16_t>(reinterpret_cast<uintptr_t>(this) + 0x1C); }
     SchemaField* fields() const { return Read<SchemaField*>(reinterpret_cast<uintptr_t>(this) + 0x28); }
     SchemaBinding* base() const {
@@ -270,6 +271,54 @@ uintptr_t FindSchemaOffset(const char* className, const char* fieldName) {
     return 0;
 }
 
+uintptr_t FindSchemaClassSize(const char* className) {
+    HMODULE schemaModule = GetModuleHandleA("schemasystem.dll");
+    if (!schemaModule) return 0;
+    auto factory = reinterpret_cast<CreateInterfaceFn>(
+        GetProcAddress(schemaModule, "CreateInterface"));
+    if (!factory) return 0;
+    void* schemaSystem = factory("SchemaSystem_001", nullptr);
+    if (!schemaSystem) return 0;
+
+    const uintptr_t scopePattern = FindModulePattern(
+        schemaModule, "48 8B 05 ? ? ? ? 48 8B D6 0F B7 CB 48 8B 3C C8");
+    if (!scopePattern) return 0;
+    const int32_t displacement = Read<int32_t>(scopePattern + 3);
+    const uintptr_t scopeArrayAddress = scopePattern + 7 + displacement;
+    auto scopes = Read<SchemaTypeScope**>(scopeArrayAddress);
+    const uint16_t scopeCount = Read<uint16_t>(scopeArrayAddress - 8);
+    if (!scopes || scopeCount == 0 || scopeCount > 256) return 0;
+
+    for (uint16_t scopeIndex = 0; scopeIndex < scopeCount; ++scopeIndex) {
+        SchemaTypeScope* scope = Read<SchemaTypeScope*>(
+            reinterpret_cast<uintptr_t>(scopes) +
+            scopeIndex * sizeof(uintptr_t));
+        if (!scope) continue;
+        const uintptr_t container = scope->classContainer();
+        const int blockCount = Read<int>(container - 0x10);
+        if (blockCount <= 0 || blockCount > 1000000) continue;
+        int visited = 0;
+        for (int blockIndex = 0; blockIndex < 256; ++blockIndex) {
+            const uintptr_t blockContainer =
+                container + static_cast<uintptr_t>(blockIndex) * 0x18;
+            for (SchemaBlock* block = Read<SchemaBlock*>(blockContainer + 0x10);
+                 block && visited < blockCount;
+                 block = block->next(), ++visited) {
+                SchemaBinding* binding = block->binding();
+                if (!binding ||
+                    !SafeStringEquals(
+                        reinterpret_cast<uintptr_t>(binding->name()), className) ||
+                    !SafeStringEquals(
+                        reinterpret_cast<uintptr_t>(binding->moduleName()), "client"))
+                    continue;
+                const int size = binding->size();
+                return size > 0 ? static_cast<uintptr_t>(size) : 0;
+            }
+        }
+    }
+    return 0;
+}
+
 bool SetRuntimeField(const char* className, const char* fieldName, uintptr_t& destination) {
     const uintptr_t value = FindSchemaOffset(className, fieldName);
     if (!value) return false;
@@ -323,6 +372,37 @@ bool InitializeLiveSchemaOffsets(size_t& loaded, size_t required) {
     loaded += SetRuntimeField("C_CitadelPlayerPawn", "m_CCitadelAbilityComponent", Offsets::AbilityComponent);
     loaded += SetRuntimeField("CCitadelAbilityComponent", "m_vecAbilities", Offsets::AbilityVector);
     loaded += SetRuntimeField("C_CitadelPlayerPawn", "m_CCitadelHeroComponent", Offsets::HeroComponent);
+    SetRuntimeField("C_CitadelPlayerPawn", "m_timeRevealedOnMinimapByNPC",
+                    Offsets::TimeRevealedOnMinimapByNPC);
+    SetRuntimeField("C_CitadelTeam", "m_vecFOWEntities",
+                    Offsets::CitadelTeamFOWEntities);
+    SetRuntimeField("STeamFOWEntity", "m_bVisibleOnMap",
+                    Offsets::TeamFOWVisibleOnMap);
+    SetRuntimeField("STeamFOWEntity", "m_nTeam",
+                    Offsets::TeamFOWTeam);
+    SetRuntimeField("STeamFOWEntity", "m_nEntIndex",
+                    Offsets::TeamFOWEntIndex);
+    SetRuntimeField("STeamFOWEntity", "m_eClass",
+                    Offsets::TeamFOWClass);
+    SetRuntimeField("STeamFOWEntity", "m_nTickHidden",
+                    Offsets::TeamFOWTickHidden);
+    SetRuntimeField("STeamFOWEntity", "m_strEntityName",
+                    Offsets::TeamFOWEntityName);
+    SetRuntimeField("STeamFOWEntity", "m_nHealthPercent",
+                    Offsets::TeamFOWHealthPercent);
+    SetRuntimeField("STeamFOWEntity", "m_nPositionX",
+                    Offsets::TeamFOWPositionX);
+    SetRuntimeField("STeamFOWEntity", "m_nPositionY",
+                    Offsets::TeamFOWPositionY);
+    SetRuntimeField("C_CitadelGameRulesProxy", "m_pGameRules",
+                    Offsets::GameRulesProxyRules);
+    SetRuntimeField("C_CitadelGameRules", "m_vMinimapMins",
+                    Offsets::GameRulesMinimapMins);
+    SetRuntimeField("C_CitadelGameRules", "m_vMinimapMaxs",
+                    Offsets::GameRulesMinimapMaxs);
+    const uintptr_t fowEntitySize = FindSchemaClassSize("STeamFOWEntity");
+    if (fowEntitySize >= 0x40 && fowEntitySize <= 0x200)
+        Offsets::TeamFOWEntitySize = fowEntitySize;
     const uintptr_t spawnedHero = FindSchemaOffset(
         "CCitadelHeroComponent", "m_spawnedHero");
     const uintptr_t spawnedHeroId = FindSchemaOffset(

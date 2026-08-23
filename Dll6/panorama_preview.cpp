@@ -1,6 +1,7 @@
 #include "shared.h"
 #include "panorama_preview.h"
 #include "preview_3d.h"
+#include "resource.h"
 
 #include <MinHook.h>
 #include <dxgi.h>
@@ -12,6 +13,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -68,6 +70,12 @@ std::atomic<int> previewRole{0};
 std::atomic<uintptr_t> previewGlowUnit{0};
 std::atomic<bool> previewGlowRegistrationQueued{false};
 std::atomic<bool> previewNativeGlowActive{false};
+std::atomic<int> requestedRadarState{0};
+// Unknown until the first HUD-thread pass.  Starting at 0 left a Panorama
+// loop from a previous manual-map injection alive when Radar was already off.
+std::atomic<int> appliedRadarState{-1};
+std::atomic<bool> radarUiRequestQueued{false};
+bool radarStyleResourcesReady = false;
 ULONGLONG lastInitializeAttemptAt = 0;
 ULONGLONG lastSpawnAttemptAt = 0;
 ULONGLONG spawnIssuedAt = 0;
@@ -108,6 +116,85 @@ std::string logPath =
 
 void ProcessPendingUiWork(uintptr_t engine, uintptr_t contextPanel);
 void Log(const char* message);
+
+bool DeployRadarStyleResources() {
+    HRSRC resource = FindResourceW(moduleHandle,
+                                   MAKEINTRESOURCEW(IDR_RADAR_MINIMAP_STYLE),
+                                   RT_RCDATA);
+    HGLOBAL loaded = resource ? LoadResource(moduleHandle, resource) : nullptr;
+    const DWORD size = resource ? SizeofResource(moduleHandle, resource) : 0;
+    const auto* bytes = loaded
+        ? static_cast<const uint8_t*>(LockResource(loaded)) : nullptr;
+    if (!bytes || !size) {
+        Log("[RADAR] embedded minimap stylesheet is missing");
+        return false;
+    }
+
+    wchar_t clientPath[MAX_PATH]{};
+    const HMODULE client = GetModuleHandleW(L"client.dll");
+    if (!client || !GetModuleFileNameW(client, clientPath, MAX_PATH)) {
+        Log("[RADAR] client.dll path is unavailable");
+        return false;
+    }
+    std::filesystem::path citadel =
+        std::filesystem::path(clientPath).parent_path().parent_path().parent_path();
+    const std::filesystem::path styles = citadel / L"panorama" / L"styles";
+    std::error_code error;
+    std::filesystem::create_directories(styles, error);
+    if (error) {
+        Log("[RADAR] could not create Panorama styles directory");
+        return false;
+    }
+
+    std::vector<uint8_t> off(bytes, bytes + size);
+    std::vector<uint8_t> on = off;
+    constexpr char needle[] =
+        ".map_button{width: 7%;height: 7%;opacity: 0.0;";
+    auto opacity = std::search(on.begin(), on.end(),
+                               needle, needle + sizeof(needle) - 1);
+    if (opacity == on.end()) {
+        Log("[RADAR] current minimap opacity rule was not found");
+        return false;
+    }
+    opacity[sizeof(needle) - 3] = static_cast<uint8_t>('2');
+
+    const auto writeStyle = [](const std::filesystem::path& path,
+                               const std::vector<uint8_t>& data) {
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        if (!output) return false;
+        output.write(reinterpret_cast<const char*>(data.data()),
+                     static_cast<std::streamsize>(data.size()));
+        return output.good();
+    };
+    if (!writeStyle(styles / L"dll6_radar_off.vcss_c", off) ||
+        !writeStyle(styles / L"dll6_radar_on.vcss_c", on)) {
+        Log("[RADAR] could not deploy Panorama stylesheets");
+        return false;
+    }
+    Log("[RADAR] native minimap stylesheets deployed");
+    return true;
+}
+
+bool ActivateRadarMinimapStyle(bool enabled) {
+    wchar_t clientPath[MAX_PATH]{};
+    const HMODULE client = GetModuleHandleW(L"client.dll");
+    if (!client || !GetModuleFileNameW(client, clientPath, MAX_PATH))
+        return false;
+    const std::filesystem::path citadel =
+        std::filesystem::path(clientPath).parent_path().parent_path().parent_path();
+    const std::filesystem::path styles = citadel / L"panorama" / L"styles";
+    const std::filesystem::path source = styles /
+        (enabled ? L"dll6_radar_on.vcss_c" : L"dll6_radar_off.vcss_c");
+    const std::filesystem::path active = styles / L"hud_minimap.vcss_c";
+    std::error_code error;
+    std::filesystem::copy_file(
+        source, active, std::filesystem::copy_options::overwrite_existing, error);
+    if (error) {
+        Log("[RADAR] could not activate global hud_minimap stylesheet");
+        return false;
+    }
+    return true;
+}
 
 void UpdatePortraitNativeGlow(uintptr_t unit) {
     if (!unit) return;
@@ -635,6 +722,10 @@ void InvalidatePanelState(uintptr_t engine, uintptr_t contextPanel) {
     previewGlowUnit.store(0, std::memory_order_release);
     previewGlowRegistrationQueued.store(false, std::memory_order_release);
     previewNativeGlowActive.store(false, std::memory_order_release);
+    // Always run one synchronization pass for a new Panorama context.  In
+    // particular, Radar OFF must cancel a scheduled loop left by an older
+    // injected image; that loop lives in Panorama, not in this DLL.
+    appliedRadarState.store(-1, std::memory_order_release);
     settleFrames.store(0, std::memory_order_release);
     captureReleasePending.store(true, std::memory_order_release);
     Log("Panorama context changed; preview state invalidated");
@@ -644,6 +735,15 @@ void ProcessPendingUiWork(uintptr_t engine, uintptr_t contextPanel) {
     if (engine != activeCuiEngine.load(std::memory_order_acquire) ||
         contextPanel != activeContextPanel.load(std::memory_order_acquire)) {
         InvalidatePanelState(engine, contextPanel);
+    }
+
+    const int radarState = requestedRadarState.load(std::memory_order_acquire);
+    if (radarState != appliedRadarState.load(std::memory_order_acquire)) {
+        // Never reload an existing native HudMinimap panel. Source 2 owns its
+        // custom element and rebuilding the layout in place invalidates live
+        // engine pointers. Radar is handled by the FOW path in entities.cpp.
+        appliedRadarState.store(radarState, std::memory_order_release);
+        radarUiRequestQueued.store(false, std::memory_order_release);
     }
     const uint64_t generation = requestedGeneration.load(std::memory_order_acquire);
     const bool visible = requestedVisible.load(std::memory_order_acquire);
@@ -1125,6 +1225,8 @@ bool InitializePanoramaPreview() {
         Log("client.dll or panorama.dll is not loaded");
         return false;
     }
+    if (!radarStyleResourcesReady)
+        radarStyleResourcesReady = DeployRadarStyleResources();
     panoramaBase = reinterpret_cast<uintptr_t>(panorama);
     const uintptr_t runScript = FindPattern(
         panorama, "48 89 5C 24 18 4C 89 4C 24 20 48 89 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 80 48 81 EC 80 01 00 00");
@@ -1658,6 +1760,23 @@ void ProcessPanoramaPreviewUiThread() {
     ProcessPendingUiWork(engine, panel);
 }
 
+void SetPanoramaRadarEnabled(bool enabled) {
+    const int requested = enabled ? 1 : 0;
+    requestedRadarState.store(requested, std::memory_order_release);
+    if (!initialized.load(std::memory_order_acquire) ||
+        appliedRadarState.load(std::memory_order_acquire) == requested ||
+        radarUiRequestQueued.exchange(true, std::memory_order_acq_rel))
+        return;
+    if (!ActivateRadarMinimapStyle(enabled)) {
+        radarUiRequestQueued.store(false, std::memory_order_release);
+        return;
+    }
+    if (gameWindow)
+        PostMessageW(gameWindow, PanoramaPreviewUiMessage, 0, 0);
+    else
+        radarUiRequestQueued.store(false, std::memory_order_release);
+}
+
 void ShutdownPanoramaPreview() {
     // The Panorama source is an independent game panel.  Remove it while the
     // RunScript hook is still live; otherwise it can outlast an unload as a
@@ -1704,6 +1823,9 @@ var p=r.FindChildTraverse('Dll6_esp_preview');if(p)p.DeleteAsync(0);})();
     previewGlowUnit.store(0, std::memory_order_release);
     previewGlowRegistrationQueued.store(false, std::memory_order_release);
     previewNativeGlowActive.store(false, std::memory_order_release);
+    requestedRadarState.store(0, std::memory_order_release);
+    appliedRadarState.store(0, std::memory_order_release);
+    radarUiRequestQueued.store(false, std::memory_order_release);
     appliedHeroId.store(0, std::memory_order_release);
     enemyHeroId.store(1, std::memory_order_release);
     allyHeroId.store(1, std::memory_order_release);

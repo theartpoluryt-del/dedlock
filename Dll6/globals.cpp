@@ -89,6 +89,7 @@ float teammateHealthValueColor[4] = {0.70f, 0.85f, 1.00f, 1.00f};
 float enemyGlowColor[4] = {0.10f, 1.00f, 0.18f, 1.00f};
 float teammateGlowColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
 bool enemyGlowEnabled = true, allyGlowEnabled = false;
+bool enemyRadarEnabled = false;
 int enemyGlowMode = 0, allyGlowMode = 0;
 bool enemyChamsEnabled = false, allyChamsEnabled = false;
 float enemyChamsColor[4] = {1.00f, 0.35f, 0.75f, 1.00f};
@@ -312,6 +313,7 @@ void LoadConfig() {
         else if (key == "teammateGlowA") teammateGlowColor[3] = static_cast<float>(number);
         else if (key == "enemyGlowEnabled") enemyGlowEnabled = value;
         else if (key == "allyGlowEnabled") allyGlowEnabled = value;
+        else if (key == "enemyRadarEnabled") enemyRadarEnabled = value;
         else if (key == "enemyChamsEnabled") enemyChamsEnabled = value;
         else if (key == "allyChamsEnabled") allyChamsEnabled = value;
         else if (key == "enemyInvisibleChamsEnabled") enemyInvisibleChamsEnabled = value;
@@ -569,6 +571,7 @@ void SaveConfig() {
            << "teammateGlowA " << teammateGlowColor[3] << '\n'
            << "enemyGlowEnabled " << enemyGlowEnabled << '\n'
            << "allyGlowEnabled " << allyGlowEnabled << '\n'
+           << "enemyRadarEnabled " << enemyRadarEnabled << '\n'
            << "enemyChamsEnabled " << enemyChamsEnabled << '\n'
            << "allyChamsEnabled " << allyChamsEnabled << '\n'
            << "enemyChamsR " << enemyChamsColor[0] << '\n'

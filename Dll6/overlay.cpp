@@ -352,6 +352,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     UpdatePanoramaPreview(pSwapChain, pContext,
                           previewLeft, previewTop, previewRight, previewBottom,
                           previewVisible);
+    ApplyEnemyRadar(enemyRadarEnabled);
     std::size_t sessionPlayerCount = 0;
     {
         std::lock_guard<std::mutex> lock(heroPawnsMutex);
