@@ -10,11 +10,15 @@ namespace {
 
 using DrawModelFn = void**(__fastcall*)(
     __int64, __int64, __int64*, int, __int64, __int64, __int64);
+using GeneratePrimitivesFn = void(__fastcall*)(
+    uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 using PlayerOutlineFn = __int64(__fastcall*)(
     __int64, uint32_t*, float*);
 using OutlineHealthFractionFn = float(__fastcall*)(__int64);
 using PlayerHealthGlowRenderFn = void(__fastcall*)(
     void*, void*, void*, void*);
+using GlowCompositeFn = void(__fastcall*)(
+    void*, int, int, int, int, int, int, int);
 using DrawIndexedFn = void(STDMETHODCALLTYPE*)(
     ID3D11DeviceContext*, UINT, UINT, INT);
 using DrawFn = void(STDMETHODCALLTYPE*)(
@@ -29,11 +33,27 @@ using DrawInstancedIndirectFn = void(STDMETHODCALLTYPE*)(
     ID3D11DeviceContext*, ID3D11Buffer*, UINT);
 using CreateDeferredContextFn = HRESULT(STDMETHODCALLTYPE*)(
     ID3D11Device*, UINT, ID3D11DeviceContext**);
+using RenderDepthStateFn = void(__fastcall*)(uintptr_t, void*, uint32_t);
+using CreateInterfaceFn = void*(__cdecl*)(const char*, int*);
+struct KeyValues3Storage {
+    alignas(16) std::array<uint8_t, 0x20> bytes{};
+};
+struct KV3ID {
+    const char* name;
+    uint64_t key1;
+    uint64_t key2;
+};
+using LoadKV3Fn = bool(__fastcall*)(
+    KeyValues3Storage*, void*, const char*, const KV3ID&, const char*, uint32_t);
+using CreateMaterialFn = void(__fastcall*)(
+    void*, void*, const char*, KeyValues3Storage*, int, unsigned char);
 
 DrawModelFn originalDrawModel = nullptr;
+GeneratePrimitivesFn originalGeneratePrimitives = nullptr;
 PlayerOutlineFn originalPlayerOutline = nullptr;
 OutlineHealthFractionFn originalOutlineHealthFraction = nullptr;
 PlayerHealthGlowRenderFn originalPlayerHealthGlowRender = nullptr;
+GlowCompositeFn originalGlowComposite = nullptr;
 DrawIndexedFn originalDrawIndexed = nullptr;
 DrawFn originalDraw = nullptr;
 DrawIndexedInstancedFn originalDrawIndexedInstanced = nullptr;
@@ -41,11 +61,14 @@ DrawInstancedFn originalDrawInstanced = nullptr;
 DrawIndexedInstancedIndirectFn originalDrawIndexedInstancedIndirect = nullptr;
 DrawInstancedIndirectFn originalDrawInstancedIndirect = nullptr;
 CreateDeferredContextFn originalCreateDeferredContext = nullptr;
+RenderDepthStateFn originalRenderDepthState = nullptr;
 
 void* drawModelTarget = nullptr;
+void* generatePrimitivesTarget = nullptr;
 void* playerOutlineTarget = nullptr;
 void* outlineHealthFractionTarget = nullptr;
 void* playerHealthGlowRenderTarget = nullptr;
+void* glowCompositeTarget = nullptr;
 void* drawIndexedTarget = nullptr;
 void* drawTarget = nullptr;
 void* drawIndexedInstancedTarget = nullptr;
@@ -53,12 +76,16 @@ void* drawInstancedTarget = nullptr;
 void* drawIndexedInstancedIndirectTarget = nullptr;
 void* drawInstancedIndirectTarget = nullptr;
 void* createDeferredContextTarget = nullptr;
+void* renderDepthStateTarget = nullptr;
 
 ID3D11PixelShader* glowPixelShader = nullptr;
 ID3D11Buffer* glowColorBuffer = nullptr;
 ID3D11DepthStencilState* glowDepthState = nullptr;
+ID3D11DepthStencilState* invisibleChamsDepthState = nullptr;
 ID3D11BlendState* glowBlendState = nullptr;
 ID3D11RasterizerState* glowRasterizerState = nullptr;
+void* flatChamsMaterial = nullptr;
+void* invisibleChamsMaterial = nullptr;
 
 // DrawModel can submit work from one render worker while the D3D context
 // executes it on another. A thread_local marker therefore made the second
@@ -68,6 +95,16 @@ std::atomic_int renderGlowTeam = -1;
 std::atomic_bool resourcesReady = false;
 std::atomic_bool firstEnemyPassLogged = false;
 std::atomic_bool drawModelLayoutLogged = false;
+std::atomic_bool renderDepthProbeLogged = false;
+std::atomic_bool renderDepthHookInstalling = false;
+std::atomic_int nativeGlowRenderPassCount = 0;
+std::atomic_bool glowCompositeHookInstalling = false;
+thread_local bool nativeGlowCompositeActive = false;
+std::atomic_uintptr_t renderInvisibleChamsContext = 0;
+std::atomic_uintptr_t invisiblePassOriginalDepth = 0;
+std::atomic_uint32_t invisiblePassOriginalStencilRef = 0;
+std::atomic_bool invisiblePassDepthCaptured = false;
+std::mutex invisiblePassMutex;
 std::atomic_uint64_t drawCallCount = 0;
 std::atomic_uint64_t glowDrawCallCount = 0;
 std::atomic_uint64_t glowPipelineCount = 0;
@@ -75,6 +112,8 @@ std::atomic_uint64_t enemyBatchCount = 0;
 
 constexpr char DrawModelPattern[] =
     "48 8B C4 53 57 41 54 48 81 EC D0 00 00";
+constexpr char GeneratePrimitivesVtablePattern[] =
+    "48 8D 05 ? ? ? ? 48 89 07 48 8B 7C 24 48";
 constexpr char PlayerOutlinePattern[] =
     "4C 89 44 24 ? 48 89 54 24 ? 55 53 56 57 41 56 41 57 "
     "48 8D AC 24";
@@ -85,6 +124,8 @@ constexpr char PlayerHealthGlowRenderPattern[] =
     "48 81 EC 20 06 00 00";
 constexpr size_t MeshEntryStride = 0x68;
 constexpr size_t MeshSceneObject = 0x18;
+constexpr size_t MeshMaterial = 0x20;
+constexpr size_t MeshColor = 0x50;
 constexpr size_t SceneObjectOwner = 0xC0;
 constexpr size_t MeshMaterialDescriptor = 0x08;
 constexpr size_t MaterialDescriptorSize = 0x108;
@@ -96,9 +137,6 @@ struct alignas(8) MeshEntryCopy {
 struct alignas(8) MaterialDescriptorCopy {
     std::array<uint8_t, MaterialDescriptorSize> bytes;
 };
-// The engine's CPlayerHealthGlowRenderer handles the existing HP-based path.
-// Keep the old experimental DrawModel duplicate pass out of the render path.
-constexpr bool EnableExperimentalModelGlowPass = false;
 
 void LogGlowHook(const char* message) {
     std::ofstream log(
@@ -116,7 +154,101 @@ void LogGlowCounters() {
     LogGlowHook(stream.str().c_str());
 }
 
+bool CreateFlatChamsMaterial() {
+    if (flatChamsMaterial && invisibleChamsMaterial) return true;
+
+    HMODULE materialModule = GetModuleHandleA("materialsystem2.dll");
+    HMODULE tier0Module = GetModuleHandleA("tier0.dll");
+    if (!materialModule || !tier0Module) {
+        LogGlowHook("chams material modules unavailable");
+        return false;
+    }
+
+    const auto createInterface = reinterpret_cast<CreateInterfaceFn>(
+        GetProcAddress(materialModule, "CreateInterface"));
+    const auto loadKV3 = reinterpret_cast<LoadKV3Fn>(GetProcAddress(
+        tier0Module,
+        "?LoadKV3@@YA_NPEAVKeyValues3@@PEAVCUtlString@@PEBDAEBUKV3ID_t@@2I@Z"));
+    void* materialSystem = createInterface
+        ? createInterface("VMaterialSystem2_001", nullptr) : nullptr;
+    if (!materialSystem || !loadKV3) {
+        LogGlowHook("material interface or LoadKV3 unavailable");
+        return false;
+    }
+
+    // Current generic KV3 format id used by Source 2 material loaders.
+    constexpr KV3ID genericFormat{
+        "generic", 0x41B818518343427Eull, 0xB5F447C23C0CDF8Cull};
+    constexpr char materialText[] = R"kv3(<!-- kv3 encoding:text:version{e21c7f3c-8a33-41c5-9977-a76d3a32aa0d} format:generic:version{7412167c-06e9-4698-aff2-e63eb59037e7} -->
+{
+shader = "pbr.vfx"
+F_UNLIT = 1
+F_RENDER_BACKFACES = 1
+g_nTextureColorTintMode1 = 1
+g_bMaskColorTint1 = 1
+g_vColorTint1 = [1.0, 1.0, 1.0]
+g_tColor = resource:"materials/default/default_color_tga_22e6f7.vtex"
+g_tNormalRoughness = resource:"materials/default/default_normal_tga_7be61377.vtex"
+g_tTintMask = resource:"materials/default/default_mask_tga_344101f8.vtex"
+g_tSelfIllumMask = resource:"materials/default/default_mask_tga_344101f8.vtex"
+g_tAmbientOcclusion = resource:"materials/default/default_ao_tga_559f1ac6.vtex"
+})kv3";
+    constexpr char invisibleMaterialText[] = R"kv3(<!-- kv3 encoding:text:version{e21c7f3c-8a33-41c5-9977-a76d3a32aa0d} format:generic:version{7412167c-06e9-4698-aff2-e63eb59037e7} -->
+{
+shader = "pbr.vfx"
+F_UNLIT = 1
+F_RENDER_BACKFACES = 0
+F_DISABLE_Z_BUFFERING = 1
+g_nTextureColorTintMode1 = 1
+g_bMaskColorTint1 = 1
+g_vColorTint1 = [1.0, 1.0, 1.0]
+g_tColor = resource:"materials/default/default_color_tga_22e6f7.vtex"
+g_tNormalRoughness = resource:"materials/default/default_normal_tga_7be61377.vtex"
+g_tTintMask = resource:"materials/default/default_mask_tga_344101f8.vtex"
+g_tSelfIllumMask = resource:"materials/default/default_mask_tga_344101f8.vtex"
+g_tAmbientOcclusion = resource:"materials/default/default_ao_tga_559f1ac6.vtex"
+})kv3";
+
+    // Leave headroom around the opaque node exactly as the engine-side KV3
+    // loaders do; LoadKV3 initializes the 0x20-byte node itself.
+    alignas(16) std::array<uint8_t, 0x1000> kvStorage{};
+    auto* kv3 = reinterpret_cast<KeyValues3Storage*>(kvStorage.data() + 0x100);
+    if (!loadKV3(kv3, nullptr, materialText, genericFormat,
+                 "axiom_flat_chams.vmat", 0)) {
+        LogGlowHook("flat chams KV3 parsing failed");
+        return false;
+    }
+
+    void** vtable = *reinterpret_cast<void***>(materialSystem);
+    if (!vtable || !vtable[29]) {
+        LogGlowHook("CreateMaterial vtable entry unavailable");
+        return false;
+    }
+    const auto createMaterial = reinterpret_cast<CreateMaterialFn>(vtable[29]);
+    void** handle = nullptr;
+    createMaterial(nullptr, &handle, "materials/axiom_flat_chams_2.vmat",
+                   kv3, 0, 1);
+    flatChamsMaterial = handle ? *handle : nullptr;
+    alignas(16) std::array<uint8_t, 0x1000> invisibleKvStorage{};
+    auto* invisibleKv3 = reinterpret_cast<KeyValues3Storage*>(
+        invisibleKvStorage.data() + 0x100);
+    if (loadKV3(invisibleKv3, nullptr, invisibleMaterialText, genericFormat,
+                "axiom_invisible_chams.vmat", 0)) {
+        void** invisibleHandle = nullptr;
+        createMaterial(
+            nullptr, &invisibleHandle,
+            "materials/axiom_invisible_chams_1.vmat",
+            invisibleKv3, 0, 1);
+        invisibleChamsMaterial = invisibleHandle ? *invisibleHandle : nullptr;
+    }
+    LogGlowHook(flatChamsMaterial && invisibleChamsMaterial
+        ? "visible and invisible opaque pbr chams materials created"
+        : "one or more pbr chams materials failed");
+    return flatChamsMaterial != nullptr && invisibleChamsMaterial != nullptr;
+}
+
 bool InstallDrawHooksOnContext(ID3D11DeviceContext* context);
+bool CreateGlowResources();
 
 HRESULT STDMETHODCALLTYPE HookCreateDeferredContext(
     ID3D11Device* device, UINT flags, ID3D11DeviceContext** context) {
@@ -167,6 +299,25 @@ uintptr_t FindPattern(HMODULE module, const char* pattern) {
         found = reinterpret_cast<uintptr_t>(image + i);
     }
     return found;
+}
+
+uintptr_t FindGeneratePrimitivesTarget(HMODULE sceneModule) {
+    const uintptr_t constructor = FindPattern(
+        sceneModule, GeneratePrimitivesVtablePattern);
+    if (!constructor) return 0;
+
+    const int32_t displacement = Read<int32_t>(constructor + 3);
+    const uintptr_t vtable = constructor + 7 + displacement;
+    const uintptr_t candidate = Read<uintptr_t>(vtable + 0x20);
+    if (!candidate) return 0;
+
+    MODULEINFO info{};
+    if (!GetModuleInformation(
+            GetCurrentProcess(), sceneModule, &info, sizeof(info)))
+        return 0;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(info.lpBaseOfDll);
+    const uintptr_t end = begin + info.SizeOfImage;
+    return candidate >= begin && candidate < end ? candidate : 0;
 }
 
 uintptr_t GetEnemyHeroMeshPawn(uintptr_t entry) {
@@ -239,6 +390,32 @@ bool IsGlowEnabledForPawn(uintptr_t pawn) {
     return teamEspEnabled && (ally ? allyGlowEnabled : enemyGlowEnabled);
 }
 
+bool IsChamsEnabledForPawn(uintptr_t pawn) {
+    if (!pawn || pawn == currentLocalPawn || !currentLocalPawn) return false;
+    const uint8_t localTeam = Read<uint8_t>(currentLocalPawn + Offsets::Team);
+    const uint8_t pawnTeam = Read<uint8_t>(pawn + Offsets::Team);
+    if ((localTeam != 2 && localTeam != 3) ||
+        (pawnTeam != 2 && pawnTeam != 3)) return false;
+    const bool ally = pawnTeam == localTeam;
+    const bool enabled = ally
+        ? (allyChamsEnabled || allyInvisibleChamsEnabled)
+        : (enemyChamsEnabled || enemyInvisibleChamsEnabled);
+    if (!enabled) return false;
+    if (currentLocalPositionReady) {
+        Vector3 position{};
+        if (GetEntityPosition(pawn, position)) {
+            const float dx = position.x - currentLocalPosition.x;
+            const float dy = position.y - currentLocalPosition.y;
+            const float dz = position.z - currentLocalPosition.z;
+            const float distance = std::sqrt(dx * dx + dy * dy + dz * dz) / 39.37f;
+            const float maxDistance = ally ? allyEspMaxDistance : enemyEspMaxDistance;
+            if (!std::isfinite(distance) || distance > maxDistance) return false;
+        }
+    }
+    return Read<int>(pawn + Offsets::Health) > 0 &&
+           Read<uint8_t>(pawn + Offsets::LifeState) == 0;
+}
+
 // PlayerOutlineRenderer never consumes CGlowProperty for NPC_Trooper.  Apply
 // their chams in the model submission path instead, where every animated
 // trooper mesh is available together with its owning entity.
@@ -307,6 +484,93 @@ static uint32_t GlowPackedColor(const float color[4]) {
     return (a << 24) | (b << 16) | (g << 8) | r;
 }
 
+void __fastcall HookGeneratePrimitives(
+    uintptr_t thisptr, uintptr_t sceneObject, uintptr_t sceneView,
+    uintptr_t primitiveBuffer) {
+    if (!originalGeneratePrimitives) return;
+
+    const bool chamsActive = enemyChamsEnabled || allyChamsEnabled;
+    if (!chamsActive || !flatChamsMaterial || !sceneObject ||
+        !primitiveBuffer || !currentLocalPawn) {
+        originalGeneratePrimitives(
+            thisptr, sceneObject, sceneView, primitiveBuffer);
+        return;
+    }
+
+    struct CachedOwner {
+        uint32_t handle{0xFFFFFFFFu};
+        uintptr_t pawn{};
+        bool hero{};
+    };
+    thread_local std::array<CachedOwner, 128> ownerCache{};
+
+    const uint32_t ownerHandle = Read<uint32_t>(
+        sceneObject + SceneObjectOwner);
+    auto& cached = ownerCache[ownerHandle % ownerCache.size()];
+    if (cached.handle != ownerHandle) {
+        cached.handle = ownerHandle;
+        cached.pawn = ResolveEntity(ownerHandle);
+        cached.hero = false;
+    }
+    if (cached.pawn && cached.pawn != currentLocalPawn && !cached.hero) {
+        std::lock_guard<std::mutex> lock(heroPawnsMutex);
+        cached.hero = std::find(
+            heroPawns.begin(), heroPawns.end(), cached.pawn) !=
+            heroPawns.end();
+    }
+    const uintptr_t pawn = cached.pawn;
+    if (!pawn || pawn == currentLocalPawn) {
+        originalGeneratePrimitives(
+            thisptr, sceneObject, sceneView, primitiveBuffer);
+        return;
+    }
+
+    // Reject the overwhelming majority of scene objects before taking the
+    // hero-list lock or performing any distance/health work.
+    const uint8_t pawnTeam = Read<uint8_t>(pawn + Offsets::Team);
+    if (pawnTeam != 2 && pawnTeam != 3) {
+        originalGeneratePrimitives(
+            thisptr, sceneObject, sceneView, primitiveBuffer);
+        return;
+    }
+
+    if (!cached.hero || !IsChamsEnabledForPawn(pawn)) {
+        originalGeneratePrimitives(
+            thisptr, sceneObject, sceneView, primitiveBuffer);
+        return;
+    }
+
+    const int previousCount = Read<int>(primitiveBuffer + 0xC);
+    originalGeneratePrimitives(thisptr, sceneObject, sceneView, primitiveBuffer);
+
+    const int primitiveCount = Read<int>(primitiveBuffer + 0xC);
+    const uintptr_t primitives = Read<uintptr_t>(primitiveBuffer);
+    if (!primitives || previousCount < 0 || primitiveCount < previousCount ||
+        primitiveCount - previousCount > 256)
+        return;
+
+    const uint8_t localTeam =
+        Read<uint8_t>(currentLocalPawn + Offsets::Team);
+    const bool ally = localTeam >= 2 && localTeam <= 3 &&
+                      pawnTeam == localTeam;
+    const float* sourceColor = ally ? allyChamsColor : enemyChamsColor;
+    const float colorComponents[4] = {
+        sourceColor[0], sourceColor[1], sourceColor[2], 1.0f};
+    const uint32_t color = GlowPackedColor(colorComponents);
+
+    for (int i = previousCount; i < primitiveCount; ++i) {
+        const uintptr_t primitive =
+            primitives + static_cast<uintptr_t>(i) * 0x68;
+        Write<uintptr_t>(primitive + 0x20,
+                         reinterpret_cast<uintptr_t>(flatChamsMaterial));
+        Write<uint32_t>(primitive + 0x50, color);
+    }
+
+    if (primitiveCount > previousCount &&
+        !firstEnemyPassLogged.exchange(true))
+        LogGlowHook("first GeneratePrimitives chams override applied");
+}
+
 __int64 __fastcall HookPlayerOutline(
     __int64 pawn, uint32_t* color, float* width) {
     const __int64 originalResult = originalPlayerOutline
@@ -320,6 +584,8 @@ __int64 __fastcall HookPlayerOutline(
         const bool ally = localTeam >= 2 && localTeam <= 3 && pawnTeam == localTeam;
         const bool teamEspEnabled = ally ? allyEspEnabled : enemyEspEnabled;
         const bool teamGlowEnabled = ally ? allyGlowEnabled : enemyGlowEnabled;
+        const bool teamInvisibleChamsEnabled = ally
+            ? allyInvisibleChamsEnabled : enemyInvisibleChamsEnabled;
         const float maxDistance = ally ? allyEspMaxDistance : enemyEspMaxDistance;
         bool withinDistance = true;
         if (currentLocalPositionReady) {
@@ -333,14 +599,36 @@ __int64 __fastcall HookPlayerOutline(
             }
         }
         if (!validTeam) return originalResult;
-        if (!teamEspEnabled || !teamGlowEnabled || !withinDistance)
+        if (!teamEspEnabled ||
+            (!teamGlowEnabled && !teamInvisibleChamsEnabled) ||
+            !withinDistance)
             return 0;
-        const float* glowColor = ally ? teammateGlowColor : enemyGlowColor;
+        const float* glowColor = teamInvisibleChamsEnabled
+            ? (ally ? allyInvisibleChamsColor : enemyInvisibleChamsColor)
+            : (ally ? teammateGlowColor : enemyGlowColor);
 
         float adjusted[4] = {
             glowColor[0], glowColor[1], glowColor[2], glowColor[3]};
+        if (teamInvisibleChamsEnabled) {
+            constexpr float saturationBoost = 1.25f;
+            const float average =
+                (glowColor[0] + glowColor[1] + glowColor[2]) / 3.0f;
+            adjusted[0] = std::clamp(
+                average + (glowColor[0] - average) * saturationBoost,
+                0.0f, 1.0f);
+            adjusted[1] = std::clamp(
+                average + (glowColor[1] - average) * saturationBoost,
+                0.0f, 1.0f);
+            adjusted[2] = std::clamp(
+                average + (glowColor[2] - average) * saturationBoost,
+                0.0f, 1.0f);
+            adjusted[3] = 1.0f;
+        }
         if (color) *color = GlowPackedColor(adjusted);
-        if (width) *width = 4.0f;
+        // Repeating the native fill to reach opaque coverage must not also
+        // accumulate its temporally-jittered edge blur. Invisible Chams use
+        // the solid interior mask only; ordinary Glow keeps its outline.
+        if (width) *width = teamInvisibleChamsEnabled ? 0.0f : 4.0f;
 
         // Preserve the existing HP-based mode. Normal fill now follows the
         // get_outline_mode hook contract supplied for the full outline: mode 2.
@@ -359,11 +647,65 @@ float __fastcall HookOutlineHealthFraction(__int64 pawn) {
     return IsNormalFillPawn(static_cast<uintptr_t>(pawn)) ? 1.0f : fraction;
 }
 
-// Keep the native health renderer untouched; it owns the working HP fill.
+void __fastcall HookGlowComposite(
+    void* context, int a2, int a3, int a4,
+    int a5, int a6, int a7, int a8) {
+    if (!originalGlowComposite) return;
+    const int passCount = nativeGlowCompositeActive ? 10 : 1;
+    for (int pass = 0; pass < passCount; ++pass)
+        originalGlowComposite(context, a2, a3, a4, a5, a6, a7, a8);
+}
+
+void EnsureGlowCompositeHook(void* renderContext) {
+    if (!renderContext || glowCompositeTarget ||
+        glowCompositeHookInstalling.exchange(true, std::memory_order_acq_rel))
+        return;
+    void* candidate = nullptr;
+    __try {
+        void** vtable = *reinterpret_cast<void***>(renderContext);
+        candidate = vtable ? vtable[93] : nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        candidate = nullptr;
+    }
+    if (candidate) {
+        const MH_STATUS created = MH_CreateHook(
+            candidate, reinterpret_cast<void*>(&HookGlowComposite),
+            reinterpret_cast<void**>(&originalGlowComposite));
+        if (created == MH_OK) {
+            const MH_STATUS enabled = MH_EnableHook(candidate);
+            if (enabled == MH_OK || enabled == MH_ERROR_ENABLED) {
+                glowCompositeTarget = candidate;
+                LogGlowHook("native glow final composite hook installed");
+            } else {
+                MH_RemoveHook(candidate);
+                originalGlowComposite = nullptr;
+                LogGlowHook("native glow final composite hook enable failed");
+            }
+        } else {
+            originalGlowComposite = nullptr;
+            LogGlowHook("native glow final composite hook creation failed");
+        }
+    }
+    glowCompositeHookInstalling.store(false, std::memory_order_release);
+}
+
+// Build the native mask once; opacity accumulation happens only in its final
+// render-context composite so temporal model sampling is not repeated.
 void __fastcall HookPlayerHealthGlowRender(
     void* renderer, void* arg1, void* arg2, void* arg3) {
-    if (originalPlayerHealthGlowRender)
+    if (originalPlayerHealthGlowRender) {
+        const bool useOpaqueGlowPass = enemyInvisibleChamsEnabled ||
+                                       allyInvisibleChamsEnabled;
+        EnsureGlowCompositeHook(arg2);
+        if (useOpaqueGlowPass)
+            nativeGlowRenderPassCount.fetch_add(1, std::memory_order_acq_rel);
+        nativeGlowCompositeActive = useOpaqueGlowPass &&
+                                    glowCompositeTarget != nullptr;
         originalPlayerHealthGlowRender(renderer, arg1, arg2, arg3);
+        nativeGlowCompositeActive = false;
+        if (useOpaqueGlowPass)
+            nativeGlowRenderPassCount.fetch_sub(1, std::memory_order_acq_rel);
+    }
 }
 
 struct SavedPipelineState {
@@ -378,7 +720,8 @@ struct SavedPipelineState {
 };
 
 bool BeginGlowPipeline(
-    ID3D11DeviceContext* context, SavedPipelineState& saved) {
+    ID3D11DeviceContext* context, SavedPipelineState& saved,
+    int explicitMode = -100) {
     if (!context || !resourcesReady.load(std::memory_order_acquire))
         return false;
 
@@ -398,11 +741,12 @@ bool BeginGlowPipeline(
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (SUCCEEDED(context->Map(glowColorBuffer, 0, D3D11_MAP_WRITE_DISCARD,
                                0, &mapped))) {
-        const int mode = renderGlowTeam.load(std::memory_order_acquire);
+        const int mode = explicitMode == -100
+            ? renderGlowTeam.load(std::memory_order_acquire) : explicitMode;
         float modulationColor[4] = {};
-        const float* glowColor = enemyGlowColor;
+        const float* glowColor = enemyChamsColor;
         if (mode == 1) {
-            glowColor = teammateGlowColor;
+            glowColor = allyChamsColor;
         } else if (mode == 2) {
             // World/sky geometry is submitted without an entity owner.
             modulationColor[0] = disableSkybox ? 0.0f : skyboxColor[0] * skyboxBrightness * lightColor[0] * lightBrightness;
@@ -577,9 +921,132 @@ void STDMETHODCALLTYPE HookDrawInstancedIndirect(
     if (overridden) EndGlowPipeline(context, saved);
 }
 
+// Current rendersystemdx11 slot 43 ABI (verified from the installed binary):
+//   void SetDepthStencilState(RenderContext*, StateWrapper*, uint32 stencilRef)
+// StateWrapper::m_pDx11State is at +0x10.  Replacing only that pointer keeps
+// the engine's normal state cache and command recording intact.
+void __fastcall HookRenderDepthState(
+    uintptr_t context, void* stateWrapper, uint32_t stencilRef) {
+    if (!originalRenderDepthState) return;
+    if (context != renderInvisibleChamsContext.load(std::memory_order_acquire) ||
+        !invisibleChamsDepthState || !stateWrapper) {
+        originalRenderDepthState(context, stateWrapper, stencilRef);
+        return;
+    }
+
+    struct alignas(8) DepthStateWrapperView {
+        std::array<uint8_t, 0x10> prefix{};
+        ID3D11DepthStencilState* state{};
+    } replacement{};
+    __try {
+        std::memcpy(replacement.prefix.data(), stateWrapper, 0x10);
+        bool expected = false;
+        if (invisiblePassDepthCaptured.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            invisiblePassOriginalDepth.store(
+                reinterpret_cast<uintptr_t>(
+                    *reinterpret_cast<ID3D11DepthStencilState**>(
+                        reinterpret_cast<uintptr_t>(stateWrapper) + 0x10)),
+                std::memory_order_release);
+            invisiblePassOriginalStencilRef.store(
+                stencilRef, std::memory_order_release);
+        }
+        replacement.state = invisibleChamsDepthState;
+        originalRenderDepthState(context, &replacement, stencilRef);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        originalRenderDepthState(context, stateWrapper, stencilRef);
+    }
+}
+
+void RestoreInvisiblePassDepthState() {
+    const uintptr_t context =
+        renderInvisibleChamsContext.load(std::memory_order_acquire);
+    if (!originalRenderDepthState ||
+        !invisiblePassDepthCaptured.load(std::memory_order_acquire) || !context)
+        return;
+    struct alignas(8) DepthStateWrapperView {
+        std::array<uint8_t, 0x10> prefix{};
+        ID3D11DepthStencilState* state{};
+    } restore{};
+    restore.state = reinterpret_cast<ID3D11DepthStencilState*>(
+        invisiblePassOriginalDepth.load(std::memory_order_acquire));
+    originalRenderDepthState(
+        context, &restore,
+        invisiblePassOriginalStencilRef.load(std::memory_order_acquire));
+    invisiblePassDepthCaptured.store(false, std::memory_order_release);
+    invisiblePassOriginalDepth.store(0, std::memory_order_release);
+    invisiblePassOriginalStencilRef.store(0, std::memory_order_release);
+}
+
+void EnsureRenderDepthHook(uintptr_t renderContext) {
+    if (!renderContext || renderDepthStateTarget ||
+        renderDepthHookInstalling.exchange(true, std::memory_order_acq_rel))
+        return;
+
+    void* candidate = nullptr;
+    __try {
+        void** vtable = *reinterpret_cast<void***>(renderContext);
+        candidate = vtable ? vtable[43] : nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        candidate = nullptr;
+    }
+
+    if (candidate) {
+        const MH_STATUS created = MH_CreateHook(
+            candidate, reinterpret_cast<void*>(&HookRenderDepthState),
+            reinterpret_cast<void**>(&originalRenderDepthState));
+        if (created == MH_OK) {
+            const MH_STATUS enabled = MH_EnableHook(candidate);
+            if (enabled == MH_OK || enabled == MH_ERROR_ENABLED) {
+                renderDepthStateTarget = candidate;
+                LogGlowHook("verified RenderSystem depth-state hook installed");
+            } else {
+                MH_RemoveHook(candidate);
+                originalRenderDepthState = nullptr;
+                LogGlowHook("RenderSystem depth-state hook enable failed");
+            }
+        } else {
+            originalRenderDepthState = nullptr;
+            LogGlowHook("RenderSystem depth-state hook creation failed");
+        }
+    }
+    renderDepthHookInstalling.store(false, std::memory_order_release);
+}
+
+void ProbeRenderDepthMethod(uintptr_t renderContext) {
+    if (!renderContext || renderDepthProbeLogged.exchange(
+            true, std::memory_order_acq_rel))
+        return;
+    char message[1024]{};
+    __try {
+        void** vtable = *reinterpret_cast<void***>(renderContext);
+        void* candidate = vtable ? vtable[43] : nullptr;
+        HMODULE module = GetModuleHandleA("rendersystemdx11.dll");
+        const uintptr_t base = reinterpret_cast<uintptr_t>(module);
+        const uintptr_t address = reinterpret_cast<uintptr_t>(candidate);
+        int used = sprintf_s(
+            message, "render depth probe context=%p vtable=%p slot43=%p rva=0x%llx bytes=",
+            reinterpret_cast<void*>(renderContext), vtable, candidate,
+            static_cast<unsigned long long>(base && address >= base
+                ? address - base : 0));
+        if (used > 0 && candidate) {
+            const auto* bytes = reinterpret_cast<const uint8_t*>(candidate);
+            for (int i = 0; i < 32 && used < 980; ++i) {
+                used += sprintf_s(
+                    message + used, sizeof(message) - used,
+                    "%02X", bytes[i]);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        strcpy_s(message, "render depth probe failed while reading context");
+    }
+    LogGlowHook(message);
+}
+
 void** __fastcall HookDrawModel(
     __int64 sceneObjectDesc, __int64 dx11, __int64* meshDraws,
     int meshCount, __int64 sceneView, __int64 sceneLayer, __int64 a7) {
+    ProbeRenderDepthMethod(static_cast<uintptr_t>(dx11));
     std::vector<MeshEntryCopy> worldMeshes;
     std::vector<MaterialDescriptorCopy> worldDescriptors;
     __int64* submittedMeshes = meshDraws;
@@ -669,141 +1136,161 @@ void** __fastcall HookDrawModel(
             LooksLikeD3D11Context(reinterpret_cast<void*>(dx11))
         ? reinterpret_cast<ID3D11DeviceContext*>(dx11) : nullptr;
     SavedPipelineState modulationSaved{};
-    if (modulationContext) {
-        renderGlowTeam.store(hasOwnedMesh ? 3 : 2, std::memory_order_release);
-    }
     const bool modulationOverridden = modulationContext &&
-        BeginGlowPipeline(modulationContext, modulationSaved);
-    if (modulationContext && !modulationOverridden) {
-        renderGlowTeam.store(-1, std::memory_order_release);
+        BeginGlowPipeline(modulationContext, modulationSaved,
+                          hasOwnedMesh ? 3 : 2);
+
+    struct SavedChamsMesh {
+        uintptr_t entry{};
+        uintptr_t material{};
+        uint32_t color{};
+        uint32_t visibleColor{};
+        uint32_t invisibleColor{};
+        bool visible{};
+        bool invisible{};
+    };
+    struct CachedDrawOwner {
+        uint32_t handle{0xFFFFFFFFu};
+        uintptr_t pawn{};
+        bool hero{};
+        ULONGLONG nextHeroCheck{};
+    };
+    thread_local std::array<CachedDrawOwner, 128> ownerCache{};
+    thread_local std::array<SavedChamsMesh, 256> savedChams{};
+    size_t savedChamsCount = 0;
+
+    const bool anyVisibleChams = enemyChamsEnabled || allyChamsEnabled;
+    const bool anyInvisibleChams = enemyInvisibleChamsEnabled ||
+                                   allyInvisibleChamsEnabled;
+    if ((anyVisibleChams || anyInvisibleChams) && flatChamsMaterial &&
+        invisibleChamsMaterial &&
+        submittedMeshes && meshCount > 0 && meshCount <= 256) {
+        const uintptr_t source = reinterpret_cast<uintptr_t>(submittedMeshes);
+        uint32_t evaluatedHandle = 0xFFFFFFFFu;
+        bool evaluatedVisible = false;
+        bool evaluatedInvisible = false;
+        uint32_t evaluatedVisibleColor = 0xFFFFFFFFu;
+        uint32_t evaluatedInvisibleColor = 0xFFFFFFFFu;
+
+        for (int i = 0; i < meshCount; ++i) {
+            const uintptr_t entry =
+                source + static_cast<uintptr_t>(i) * MeshEntryStride;
+            const uintptr_t sceneObject =
+                Read<uintptr_t>(entry + MeshSceneObject);
+            if (!sceneObject) continue;
+            const uint32_t ownerHandle =
+                Read<uint32_t>(sceneObject + SceneObjectOwner);
+
+            if (ownerHandle != evaluatedHandle) {
+                evaluatedHandle = ownerHandle;
+                evaluatedVisible = false;
+                evaluatedInvisible = false;
+
+                auto& cached = ownerCache[ownerHandle % ownerCache.size()];
+                if (cached.handle != ownerHandle) {
+                    cached.handle = ownerHandle;
+                    cached.pawn = ResolveEntity(ownerHandle);
+                    cached.hero = false;
+                    cached.nextHeroCheck = 0;
+                }
+
+                const ULONGLONG now = GetTickCount64();
+                if (cached.pawn && !cached.hero && now >= cached.nextHeroCheck) {
+                    cached.nextHeroCheck = now + 1000;
+                    std::unique_lock<std::mutex> lock(
+                        heroPawnsMutex, std::try_to_lock);
+                    if (lock.owns_lock()) {
+                        cached.hero = std::find(
+                            heroPawns.begin(), heroPawns.end(), cached.pawn) !=
+                            heroPawns.end();
+                    }
+                }
+
+                if (cached.hero && IsChamsEnabledForPawn(cached.pawn)) {
+                    const uint8_t localTeam = Read<uint8_t>(
+                        currentLocalPawn + Offsets::Team);
+                    const uint8_t pawnTeam = Read<uint8_t>(
+                        cached.pawn + Offsets::Team);
+                    const bool ally = pawnTeam == localTeam;
+                    evaluatedVisible = ally
+                        ? allyChamsEnabled : enemyChamsEnabled;
+                    evaluatedInvisible = ally
+                        ? allyInvisibleChamsEnabled
+                        : enemyInvisibleChamsEnabled;
+                    const float* visibleColor =
+                        ally ? allyChamsColor : enemyChamsColor;
+                    const float* invisibleColor = ally
+                        ? allyInvisibleChamsColor
+                        : enemyInvisibleChamsColor;
+                    const float visibleComponents[4] = {
+                        visibleColor[0], visibleColor[1], visibleColor[2], 1.0f};
+                    const float invisibleComponents[4] = {
+                        invisibleColor[0], invisibleColor[1],
+                        invisibleColor[2], 1.0f};
+                    evaluatedVisibleColor = GlowPackedColor(visibleComponents);
+                    evaluatedInvisibleColor = GlowPackedColor(invisibleComponents);
+                }
+            }
+
+            if (!evaluatedVisible && !evaluatedInvisible) continue;
+            savedChams[savedChamsCount++] = {
+                entry,
+                Read<uintptr_t>(entry + MeshMaterial),
+                Read<uint32_t>(entry + MeshColor),
+                evaluatedVisibleColor,
+                evaluatedInvisibleColor,
+                evaluatedVisible,
+                evaluatedInvisible};
+        }
+    }
+
+    // Native PlayerHealthGlowRenderer already owns a stable through-wall
+    // render target and visibility mask.  During that pass replace only hero
+    // meshes with the opaque PBR material; do not touch the scene depth state.
+    if (savedChamsCount && anyInvisibleChams &&
+        nativeGlowRenderPassCount.load(std::memory_order_acquire) > 0) {
+        for (size_t i = 0; i < savedChamsCount; ++i) {
+            const auto& saved = savedChams[i];
+            if (!saved.invisible) continue;
+            Write<uintptr_t>(saved.entry + MeshMaterial,
+                             reinterpret_cast<uintptr_t>(
+                                 invisibleChamsMaterial));
+            Write<uint32_t>(saved.entry + MeshColor, saved.invisibleColor);
+        }
+        void** result = originalDrawModel(
+            sceneObjectDesc, dx11, submittedMeshes, meshCount,
+            sceneView, sceneLayer, a7);
+        for (size_t i = 0; i < savedChamsCount; ++i) {
+            const auto& saved = savedChams[i];
+            Write<uintptr_t>(saved.entry + MeshMaterial, saved.material);
+            Write<uint32_t>(saved.entry + MeshColor, saved.color);
+        }
+        if (modulationOverridden)
+            EndGlowPipeline(modulationContext, modulationSaved);
+        return result;
+    }
+
+    for (size_t i = 0; i < savedChamsCount; ++i) {
+        const auto& saved = savedChams[i];
+        if (saved.visible) {
+            Write<uintptr_t>(saved.entry + MeshMaterial,
+                             reinterpret_cast<uintptr_t>(flatChamsMaterial));
+            Write<uint32_t>(saved.entry + MeshColor, saved.visibleColor);
+        } else {
+            Write<uintptr_t>(saved.entry + MeshMaterial, saved.material);
+            Write<uint32_t>(saved.entry + MeshColor, saved.color);
+        }
     }
     void** result = originalDrawModel(
         sceneObjectDesc, dx11, submittedMeshes, meshCount,
         sceneView, sceneLayer, a7);
+    for (size_t i = 0; i < savedChamsCount; ++i) {
+        const auto& saved = savedChams[i];
+        Write<uintptr_t>(saved.entry + MeshMaterial, saved.material);
+        Write<uint32_t>(saved.entry + MeshColor, saved.color);
+    }
     if (modulationOverridden) {
         EndGlowPipeline(modulationContext, modulationSaved);
-        renderGlowTeam.store(-1, std::memory_order_release);
-    }
-
-    if (!EnableExperimentalModelGlowPass ||
-        enemyGlowMode != 1 && allyGlowMode != 1 || !meshDraws || meshCount <= 0 ||
-        !resourcesReady.load(std::memory_order_acquire)) {
-        return result;
-    }
-
-    const int safeCount = meshCount < 256 ? meshCount : 256;
-    std::vector<MeshEntryCopy> enemyMeshes;
-    std::vector<MaterialDescriptorCopy> glowDescriptors;
-    int batchTeam = -1;
-    enemyMeshes.reserve(static_cast<size_t>(safeCount));
-    glowDescriptors.reserve(static_cast<size_t>(safeCount));
-
-    const uintptr_t source = reinterpret_cast<uintptr_t>(meshDraws);
-    for (int i = 0; i < safeCount; ++i) {
-        const uintptr_t entry =
-            source + static_cast<uintptr_t>(i) * MeshEntryStride;
-        const uintptr_t pawn = GetGlowHeroMeshPawn(entry);
-        if (!pawn || !IsGlowEnabledForPawn(pawn)) continue;
-        const uint8_t localTeam = currentLocalPawn
-            ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
-        const uint8_t pawnTeam = Read<uint8_t>(pawn + Offsets::Team);
-        const bool ally = localTeam >= 2 && localTeam <= 3 && pawnTeam == localTeam;
-        if (batchTeam < 0) batchTeam = ally ? 1 : 0;
-        MeshEntryCopy copy{};
-        if (!CopyReadableBytes(copy.bytes.data(),
-                               reinterpret_cast<const void*>(entry), MeshEntryStride))
-            continue;
-        const uintptr_t descriptor = Read<uintptr_t>(entry + MeshMaterialDescriptor);
-        if (!descriptor || !CopyReadableBytes(
-                glowDescriptors.emplace_back().bytes.data(),
-                reinterpret_cast<const void*>(descriptor), MaterialDescriptorSize)) {
-            if (!glowDescriptors.empty()) glowDescriptors.pop_back();
-            continue;
-        }
-        SetGlowDescriptorTint(
-            glowDescriptors.back().bytes,
-            ally ? teammateGlowColor : enemyGlowColor);
-        const uintptr_t descriptorCopy = reinterpret_cast<uintptr_t>(
-            glowDescriptors.back().bytes.data());
-        std::memcpy(copy.bytes.data() + MeshMaterialDescriptor,
-                    &descriptorCopy, sizeof(descriptorCopy));
-        enemyMeshes.push_back(copy);
-    }
-
-    if (!enemyMeshes.empty()) {
-        enemyBatchCount.fetch_add(1, std::memory_order_relaxed);
-        if (!firstEnemyPassLogged.exchange(true))
-            LogGlowHook("first enemy model glow pass submitted with descriptor tint override");
-        if (!drawModelLayoutLogged.exchange(true)) {
-            std::ostringstream layout;
-            layout << "DrawModel args dx11=0x" << std::hex
-                   << static_cast<uintptr_t>(dx11)
-                   << " sceneObject=0x" << static_cast<uintptr_t>(sceneObjectDesc)
-                   << " meshDraws=0x" << reinterpret_cast<uintptr_t>(meshDraws)
-                   << " count=" << std::dec << meshCount;
-            LogGlowHook(layout.str().c_str());
-            const uintptr_t entry = reinterpret_cast<uintptr_t>(meshDraws);
-            for (size_t offset = 0; offset < MeshEntryStride; offset += 8) {
-                std::ostringstream value;
-                value << "mesh[0]+0x" << std::hex << offset << "=0x"
-                      << Read<uintptr_t>(entry + offset);
-                LogGlowHook(value.str().c_str());
-            }
-            constexpr size_t pointerOffsets[] = {
-                0x00, 0x08, 0x18, 0x20, 0x30, 0x40, 0x48};
-            constexpr size_t objectOffsets[] = {
-                0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38,
-                0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x80,
-                0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x100,
-                0x108, 0x110};
-            for (const size_t meshOffset : pointerOffsets) {
-                const uintptr_t object = Read<uintptr_t>(entry + meshOffset);
-                if (!object) continue;
-                std::ostringstream header;
-                header << "object mesh+0x" << std::hex << meshOffset
-                       << " ptr=0x" << object;
-                LogGlowHook(header.str().c_str());
-                for (const size_t objectOffset : objectOffsets) {
-                    std::ostringstream value;
-                    value << "  +0x" << std::hex << objectOffset << "=0x"
-                          << Read<uintptr_t>(object + objectOffset);
-                    LogGlowHook(value.str().c_str());
-                }
-            }
-            if (sceneObjectDesc) {
-                for (size_t offset = 0xA0; offset <= 0xE0; offset += 8) {
-                    std::ostringstream value;
-                    value << "scene+0x" << std::hex << offset << "=0x"
-                          << Read<uintptr_t>(static_cast<uintptr_t>(sceneObjectDesc) + offset);
-                    LogGlowHook(value.str().c_str());
-                }
-            }
-        }
-        SavedPipelineState saved{};
-        auto* submittedContext = LooksLikeD3D11Context(
-            reinterpret_cast<void*>(dx11))
-            ? reinterpret_cast<ID3D11DeviceContext*>(dx11) : nullptr;
-        if (drawModelLayoutLogged.load(std::memory_order_acquire)) {
-            static std::atomic_bool contextLogged = false;
-            if (!contextLogged.exchange(true))
-                LogGlowHook(submittedContext
-                    ? "DrawModel dx11 is a D3D11 context"
-                    : "DrawModel dx11 is not a D3D11 context");
-        }
-        const bool overridden = submittedContext &&
-            BeginGlowPipeline(submittedContext, saved);
-
-        renderGlowTeam.store(batchTeam, std::memory_order_release);
-        renderGlowPass.store(!submittedContext, std::memory_order_release);
-        originalDrawModel(
-            sceneObjectDesc, dx11,
-            reinterpret_cast<__int64*>(enemyMeshes.data()),
-            static_cast<int>(enemyMeshes.size()),
-            sceneView, sceneLayer, a7);
-        renderGlowPass.store(false, std::memory_order_release);
-        renderGlowTeam.store(-1, std::memory_order_release);
-
-        if (overridden) EndGlowPipeline(submittedContext, saved);
     }
     return result;
 }
@@ -856,6 +1343,20 @@ bool CreateGlowResources() {
     result = pDevice->CreateDepthStencilState(&depth, &glowDepthState);
     if (FAILED(result) || !glowDepthState) {
         LogGlowHook("glow depth state creation failed");
+        return false;
+    }
+
+    // Opaque through-wall pass: accept every fragment without modifying the
+    // scene depth buffer.  The normal visible pass is submitted immediately
+    // afterwards and retains the engine's original depth/write behaviour.
+    D3D11_DEPTH_STENCIL_DESC invisibleDepth{};
+    invisibleDepth.DepthEnable = TRUE;
+    invisibleDepth.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    invisibleDepth.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    result = pDevice->CreateDepthStencilState(
+        &invisibleDepth, &invisibleChamsDepthState);
+    if (FAILED(result) || !invisibleChamsDepthState) {
+        LogGlowHook("invisible chams depth state creation failed");
         return false;
     }
 
@@ -969,6 +1470,10 @@ bool InstallModelGlowHook() {
         return false;
     }
 
+    // Material creation stays on the initialization/UI path. The render hook
+    // below only swaps already-created pointers in copied mesh entries.
+    CreateFlatChamsMaterial();
+
     if (!playerOutlineTarget) {
         HMODULE client = GetModuleHandleA("client.dll");
         const uintptr_t candidate = client
@@ -1028,10 +1533,15 @@ bool InstallModelGlowHook() {
         }
     }
 
-    if (pContext && InstallDrawHooks())
-        LogGlowHook("D3D model glow draw hooks installed");
+    // Chams now operate entirely on the SceneSystem DrawModel mesh array. Do
+    // not hook ID3D11DeviceContext::Draw* here: those callbacks run for every
+    // draw in the frame and the former atomic bookkeeping alone caused a
+    // severe CPU/render-thread bottleneck.  World modulation only needs the
+    // pipeline resources and applies them directly from HookDrawModel.
+    if (pContext && CreateGlowResources())
+        LogGlowHook("D3D glow resources created without Draw hooks");
     else
-        LogGlowHook("D3D model glow draw hooks unavailable");
+        LogGlowHook("D3D glow resources unavailable");
 
     if (!playerHealthGlowRenderTarget) {
         HMODULE client = GetModuleHandleA("client.dll");
@@ -1052,16 +1562,20 @@ bool InstallModelGlowHook() {
 
 void RemoveModelGlowHook() {
     resourcesReady.store(false, std::memory_order_release);
+    renderInvisibleChamsContext.store(0, std::memory_order_release);
+    RemoveHookTarget(renderDepthStateTarget);
     RemoveHookTarget(drawInstancedTarget);
     RemoveHookTarget(drawInstancedIndirectTarget);
     RemoveHookTarget(drawIndexedInstancedIndirectTarget);
     RemoveHookTarget(drawIndexedInstancedTarget);
     RemoveHookTarget(drawTarget);
     RemoveHookTarget(drawIndexedTarget);
+    RemoveHookTarget(generatePrimitivesTarget);
     RemoveHookTarget(drawModelTarget);
     RemoveHookTarget(createDeferredContextTarget);
     RemoveHookTarget(playerOutlineTarget);
     RemoveHookTarget(outlineHealthFractionTarget);
+    RemoveHookTarget(glowCompositeTarget);
     RemoveHookTarget(playerHealthGlowRenderTarget);
 
     originalDrawInstanced = nullptr;
@@ -1070,20 +1584,25 @@ void RemoveModelGlowHook() {
     originalDrawIndexedInstanced = nullptr;
     originalDraw = nullptr;
     originalDrawIndexed = nullptr;
+    originalGeneratePrimitives = nullptr;
     originalDrawModel = nullptr;
     originalCreateDeferredContext = nullptr;
+    originalRenderDepthState = nullptr;
     originalPlayerOutline = nullptr;
     originalOutlineHealthFraction = nullptr;
+    originalGlowComposite = nullptr;
     originalPlayerHealthGlowRender = nullptr;
 
     if (glowRasterizerState) glowRasterizerState->Release();
     if (glowBlendState) glowBlendState->Release();
     if (glowDepthState) glowDepthState->Release();
+    if (invisibleChamsDepthState) invisibleChamsDepthState->Release();
     if (glowPixelShader) glowPixelShader->Release();
     if (glowColorBuffer) glowColorBuffer->Release();
     glowRasterizerState = nullptr;
     glowBlendState = nullptr;
     glowDepthState = nullptr;
+    invisibleChamsDepthState = nullptr;
     glowPixelShader = nullptr;
     glowColorBuffer = nullptr;
 }

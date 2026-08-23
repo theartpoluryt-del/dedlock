@@ -90,6 +90,12 @@ float enemyGlowColor[4] = {0.10f, 1.00f, 0.18f, 1.00f};
 float teammateGlowColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
 bool enemyGlowEnabled = true, allyGlowEnabled = false;
 int enemyGlowMode = 0, allyGlowMode = 0;
+bool enemyChamsEnabled = false, allyChamsEnabled = false;
+float enemyChamsColor[4] = {1.00f, 0.35f, 0.75f, 1.00f};
+float allyChamsColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
+bool enemyInvisibleChamsEnabled = false, allyInvisibleChamsEnabled = false;
+float enemyInvisibleChamsColor[4] = {0.72f, 0.18f, 0.95f, 1.00f};
+float allyInvisibleChamsColor[4] = {0.12f, 0.42f, 0.95f, 1.00f};
 float enemyNameColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
 float teammateNameColor[4] = {0.35f, 0.75f, 1.00f, 1.00f};
 float enemySkeletonColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
@@ -306,6 +312,26 @@ void LoadConfig() {
         else if (key == "teammateGlowA") teammateGlowColor[3] = static_cast<float>(number);
         else if (key == "enemyGlowEnabled") enemyGlowEnabled = value;
         else if (key == "allyGlowEnabled") allyGlowEnabled = value;
+        else if (key == "enemyChamsEnabled") enemyChamsEnabled = value;
+        else if (key == "allyChamsEnabled") allyChamsEnabled = value;
+        else if (key == "enemyInvisibleChamsEnabled") enemyInvisibleChamsEnabled = value;
+        else if (key == "allyInvisibleChamsEnabled") allyInvisibleChamsEnabled = value;
+        else if (key == "enemyChamsR") enemyChamsColor[0] = static_cast<float>(number);
+        else if (key == "enemyChamsG") enemyChamsColor[1] = static_cast<float>(number);
+        else if (key == "enemyChamsB") enemyChamsColor[2] = static_cast<float>(number);
+        else if (key == "enemyChamsA") enemyChamsColor[3] = static_cast<float>(number);
+        else if (key == "allyChamsR") allyChamsColor[0] = static_cast<float>(number);
+        else if (key == "allyChamsG") allyChamsColor[1] = static_cast<float>(number);
+        else if (key == "allyChamsB") allyChamsColor[2] = static_cast<float>(number);
+        else if (key == "allyChamsA") allyChamsColor[3] = static_cast<float>(number);
+        else if (key == "enemyInvisibleChamsR") enemyInvisibleChamsColor[0] = static_cast<float>(number);
+        else if (key == "enemyInvisibleChamsG") enemyInvisibleChamsColor[1] = static_cast<float>(number);
+        else if (key == "enemyInvisibleChamsB") enemyInvisibleChamsColor[2] = static_cast<float>(number);
+        else if (key == "enemyInvisibleChamsA") enemyInvisibleChamsColor[3] = static_cast<float>(number);
+        else if (key == "allyInvisibleChamsR") allyInvisibleChamsColor[0] = static_cast<float>(number);
+        else if (key == "allyInvisibleChamsG") allyInvisibleChamsColor[1] = static_cast<float>(number);
+        else if (key == "allyInvisibleChamsB") allyInvisibleChamsColor[2] = static_cast<float>(number);
+        else if (key == "allyInvisibleChamsA") allyInvisibleChamsColor[3] = static_cast<float>(number);
         if (key == "creepBoxR") creepBoxColor[0] = static_cast<float>(number);
         else if (key == "creepBoxG") creepBoxColor[1] = static_cast<float>(number);
         else if (key == "creepBoxB") creepBoxColor[2] = static_cast<float>(number);
@@ -543,6 +569,26 @@ void SaveConfig() {
            << "teammateGlowA " << teammateGlowColor[3] << '\n'
            << "enemyGlowEnabled " << enemyGlowEnabled << '\n'
            << "allyGlowEnabled " << allyGlowEnabled << '\n'
+           << "enemyChamsEnabled " << enemyChamsEnabled << '\n'
+           << "allyChamsEnabled " << allyChamsEnabled << '\n'
+           << "enemyChamsR " << enemyChamsColor[0] << '\n'
+           << "enemyChamsG " << enemyChamsColor[1] << '\n'
+           << "enemyChamsB " << enemyChamsColor[2] << '\n'
+           << "enemyChamsA " << enemyChamsColor[3] << '\n'
+           << "allyChamsR " << allyChamsColor[0] << '\n'
+           << "allyChamsG " << allyChamsColor[1] << '\n'
+           << "allyChamsB " << allyChamsColor[2] << '\n'
+           << "allyChamsA " << allyChamsColor[3] << '\n'
+           << "enemyInvisibleChamsEnabled " << enemyInvisibleChamsEnabled << '\n'
+           << "allyInvisibleChamsEnabled " << allyInvisibleChamsEnabled << '\n'
+           << "enemyInvisibleChamsR " << enemyInvisibleChamsColor[0] << '\n'
+           << "enemyInvisibleChamsG " << enemyInvisibleChamsColor[1] << '\n'
+           << "enemyInvisibleChamsB " << enemyInvisibleChamsColor[2] << '\n'
+           << "enemyInvisibleChamsA " << enemyInvisibleChamsColor[3] << '\n'
+           << "allyInvisibleChamsR " << allyInvisibleChamsColor[0] << '\n'
+           << "allyInvisibleChamsG " << allyInvisibleChamsColor[1] << '\n'
+           << "allyInvisibleChamsB " << allyInvisibleChamsColor[2] << '\n'
+           << "allyInvisibleChamsA " << allyInvisibleChamsColor[3] << '\n'
            << "enemyHealthBarR " << enemyHealthBarColor[0] << '\n'
            << "enemyHealthBarG " << enemyHealthBarColor[1] << '\n'
            << "enemyHealthBarB " << enemyHealthBarColor[2] << '\n'

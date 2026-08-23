@@ -72,6 +72,55 @@ void ShutdownOverlay() {
     SaveConfig();
     freeCam = false;
     freeCamActive = false;
+
+    // Stop every worker before removing hooks or releasing data they can
+    // still access.  The previous order let the old instance continue to
+    // register glow objects while MinHook was already being torn down.
+    if (stopHeroDiscoveryEvent) SetEvent(stopHeroDiscoveryEvent);
+    if (heroDiscoveryThread) {
+        WaitForSingleObject(heroDiscoveryThread, 3000);
+        CloseHandle(heroDiscoveryThread);
+        heroDiscoveryThread = nullptr;
+    }
+    if (farmTargetThread) {
+        WaitForSingleObject(farmTargetThread, 3000);
+        CloseHandle(farmTargetThread);
+        farmTargetThread = nullptr;
+    }
+    if (glowApplyThread) {
+        WaitForSingleObject(glowApplyThread, 3000);
+        CloseHandle(glowApplyThread);
+        glowApplyThread = nullptr;
+    }
+
+    // Do not leave renderer-owned glow entries active for the next injected
+    // instance.  The engine may retain the registration list, but disabled
+    // properties are skipped and can be safely registered again later.
+    std::vector<uintptr_t> glowEntities;
+    {
+        std::lock_guard<std::mutex> lock(heroPawnsMutex);
+        glowEntities = heroPawns;
+    }
+    {
+        std::lock_guard<std::mutex> lock(glowMutex);
+        glowEntities.insert(glowEntities.end(), registeredGlows.begin(),
+                            registeredGlows.end());
+        registeredGlows.clear();
+        queuedGlows.clear();
+    }
+    std::sort(glowEntities.begin(), glowEntities.end());
+    glowEntities.erase(
+        std::unique(glowEntities.begin(), glowEntities.end()),
+        glowEntities.end());
+    for (const uintptr_t entity : glowEntities) {
+        if (!entity) continue;
+        const uintptr_t glow = entity + Offsets::Glow;
+        Write<bool>(glow + Offsets::GlowEligible, false);
+        Write<bool>(glow + Offsets::IsGlowing, false);
+        Write<int>(glow + Offsets::GlowType, 0);
+        Write<float>(entity + Offsets::GlowBackfaceMult, 1.0f);
+    }
+
     RemoveUserCmdHook();
     RemoveInputLockHooks();
     RemoveSoundEventHook();
@@ -84,22 +133,6 @@ void ShutdownOverlay() {
     // All project hooks have been disabled and removed above. Reset MinHook
     // itself so a later reinjection cannot retain trampolines into this DLL.
     MH_Uninitialize();
-    if (stopHeroDiscoveryEvent) SetEvent(stopHeroDiscoveryEvent);
-    if (heroDiscoveryThread) {
-        WaitForSingleObject(heroDiscoveryThread, 2000);
-        CloseHandle(heroDiscoveryThread);
-        heroDiscoveryThread = nullptr;
-    }
-    if (farmTargetThread) {
-        WaitForSingleObject(farmTargetThread, 2000);
-        CloseHandle(farmTargetThread);
-        farmTargetThread = nullptr;
-    }
-    if (glowApplyThread) {
-        WaitForSingleObject(glowApplyThread, 2000);
-        CloseHandle(glowApplyThread);
-        glowApplyThread = nullptr;
-    }
     if (stopHeroDiscoveryEvent) {
         CloseHandle(stopHeroDiscoveryEvent);
         stopHeroDiscoveryEvent = nullptr;
@@ -146,13 +179,14 @@ void ShutdownOverlay() {
 }
 
 DWORD WINAPI UnloadThread(LPVOID) {
-    // The graphics driver may still be unwinding Present on one or more
-    // render-worker threads after the VMT/WndProc were restored. Releasing the
-    // image here races those return addresses and was the source of the Del
-    // crash. The module is already fully inert after ShutdownOverlay(); leave
-    // its image resident for the current game session and retire this helper
-    // thread safely. A fresh game session then loads the next build normally.
-    Sleep(500);
+    // ShutdownOverlay has disabled every entry point. Give the Present and
+    // render-worker stacks time to return through their already-running
+    // detours, then actually remove this image so reinjection starts with one
+    // clean set of globals, materials and trampolines.
+    Sleep(2000);
+    HMODULE self = moduleHandle;
+    moduleHandle = nullptr;
+    if (self) FreeLibraryAndExitThread(self, 0);
     ExitThread(0);
 }
 
@@ -264,7 +298,6 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     }
 
     if (!imguiInitialized) return oPresent(pSwapChain, SyncInterval, Flags);
-
     if (!pRenderTargetView) {
         ID3D11Texture2D* pBackBuffer = nullptr;
         if (FAILED(pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&pBackBuffer)) || !pBackBuffer) {

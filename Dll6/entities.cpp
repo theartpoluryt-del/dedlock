@@ -441,6 +441,9 @@ void ApplyHeroGlow(uintptr_t entity) {
     const uint8_t entityTeam = Read<uint8_t>(entity + Offsets::Team);
     const bool ally = localTeam >= 2 && localTeam <= 3 && entityTeam == localTeam;
     const int teamGlowMode = ally ? allyGlowMode : enemyGlowMode;
+    const bool teamInvisibleChamsEnabled = ally
+        ? allyInvisibleChamsEnabled : enemyInvisibleChamsEnabled;
+    const int rendererMode = teamInvisibleChamsEnabled ? 2 : teamGlowMode;
 
     // The client can reset m_iGlowType after a network update even though the
     // property object remains alive. Re-register whenever the complete-model
@@ -449,28 +452,30 @@ void ApplyHeroGlow(uintptr_t entity) {
         std::lock_guard lock(glowMutex);
         // Keep CGlowProperty in sync with the outline-manager contract:
         // type 1 is health-clipped, type 2 is the complete model fill.
-        const int targetGlowType = teamGlowMode == 1 ? 2 : 1;
+        const int targetGlowType = rendererMode != 0 ? 2 : 1;
         const int currentType = Read<int>(glow + Offsets::GlowType);
         const auto modeIt = registeredGlowMode.find(entity);
         const bool modeChanged = modeIt == registeredGlowMode.end() ||
-            modeIt->second != teamGlowMode;
+            modeIt->second != rendererMode;
         if ((currentType != targetGlowType || modeChanged) &&
             queuedGlows.insert(entity).second) {
             shouldNotify = true;
         }
-        if (shouldNotify) registeredGlowMode[entity] = teamGlowMode;
+        if (shouldNotify) registeredGlowMode[entity] = rendererMode;
     }
 
-    const float* glowColor = ally ? teammateGlowColor : enemyGlowColor;
+    const float* glowColor = teamInvisibleChamsEnabled
+        ? (ally ? allyInvisibleChamsColor : enemyInvisibleChamsColor)
+        : (ally ? teammateGlowColor : enemyGlowColor);
     const int health = Read<int>(entity + Offsets::Health);
     const int maxHealth = Read<int>(entity + Offsets::MaxHealth);
     const float healthAlpha = maxHealth > 0
         ? std::clamp(static_cast<float>(health) / maxHealth, 0.0f, 1.0f) : 0.0f;
-    const float glowAlpha = teamGlowMode == 0
+    const float glowAlpha = rendererMode == 0
         ? glowColor[3] * healthAlpha : 1.0f;
     Write<Vector3>(glow + Offsets::GlowColor,
                    { glowColor[0], glowColor[1], glowColor[2] });
-    Write<int>(glow + Offsets::GlowType, teamGlowMode == 1 ? 2 : 1);
+    Write<int>(glow + Offsets::GlowType, rendererMode != 0 ? 2 : 1);
     Write<int>(glow + Offsets::GlowTeam, -1);
     Write<int>(glow + Offsets::GlowRange, 0);
     Write<int>(glow + Offsets::GlowRangeMin, 0);
@@ -480,7 +485,7 @@ void ApplyHeroGlow(uintptr_t entity) {
                        static_cast<uint8_t>(std::clamp(glowColor[2], 0.0f, 1.0f) * 255.0f),
                        static_cast<uint8_t>(std::clamp(glowAlpha, 0.0f, 1.0f) * 255.0f) });
     Write<bool>(glow + Offsets::GlowFlashing, false);
-    Write<float>(glow + Offsets::GlowTime, teamGlowMode == 1 ? 0.0f : 1.0f);
+    Write<float>(glow + Offsets::GlowTime, rendererMode != 0 ? 0.0f : 1.0f);
     Write<float>(glow + Offsets::GlowStartTime, 0.0f);
     Write<bool>(glow + Offsets::GlowEligible, true);
     Write<bool>(glow + Offsets::IsGlowing, true);
@@ -1301,6 +1306,8 @@ DWORD WINAPI GlowApplyWorker(LPVOID) {
                 // still enabled.
                 const bool teamEspEnabled = ally ? allyEspEnabled : enemyEspEnabled;
                 const bool teamGlowEnabled = ally ? allyGlowEnabled : enemyGlowEnabled;
+                const bool teamInvisibleChamsEnabled = ally
+                    ? allyInvisibleChamsEnabled : enemyInvisibleChamsEnabled;
                 const float maxDistance = ally ? allyEspMaxDistance : enemyEspMaxDistance;
                 bool withinDistance = true;
                 if (currentLocalPositionReady) {
@@ -1313,12 +1320,15 @@ DWORD WINAPI GlowApplyWorker(LPVOID) {
                         withinDistance = std::isfinite(distance) && distance <= maxDistance;
                     }
                 }
-                if (glowEnabled && teamEspEnabled && teamGlowEnabled && withinDistance) {
+                if (teamEspEnabled && withinDistance &&
+                    ((glowEnabled && teamGlowEnabled) ||
+                     teamInvisibleChamsEnabled)) {
                     ApplyHeroGlow(pawn);
                 } else {
                     Write<bool>(pawn + Offsets::Glow + Offsets::GlowEligible, false);
                     Write<bool>(pawn + Offsets::Glow + Offsets::IsGlowing, false);
                     Write<int>(pawn + Offsets::Glow + Offsets::GlowType, 0);
+                    Write<float>(pawn + Offsets::GlowBackfaceMult, 1.0f);
                     std::lock_guard lock(glowMutex);
                     registeredGlowMode.erase(pawn);
                     registeredGlows.erase(pawn);

@@ -249,10 +249,15 @@ bool ColumnVisible(float x, float y, float height) {
 
 D2D1_RECT_F ActiveColorPopupRect() {
     if (!g.colorPopup) return Rect(0, 0, 0, 0);
-    return Rect(g.colorPopupAnchor.left - 132,
-                g.colorPopupAnchor.bottom + 8,
-                g.colorPopupAnchor.right + 8,
-                g.colorPopupAnchor.bottom + 104);
+    constexpr float popupWidth = 264.0f;
+    constexpr float popupHeight = 282.0f;
+    float left = g.colorPopupAnchor.right - popupWidth;
+    float top = g.colorPopupAnchor.bottom + 8.0f;
+    if (top + popupHeight > kDesignHeight)
+        top = g.colorPopupAnchor.top - popupHeight - 8.0f;
+    left = std::clamp(left, 8.0f, kDesignWidth - popupWidth - 8.0f);
+    top = std::clamp(top, 8.0f, kDesignHeight - popupHeight - 8.0f);
+    return Rect(left, top, left + popupWidth, top + popupHeight);
 }
 
 void SetBrush(const D2D1_COLOR_F& color) {
@@ -1103,24 +1108,111 @@ void DrawPopup(const Layout& l) {
     GlowRounded(r, 7, Color(0, 0, 0, 0.55f), 4, 2.0f);
     FillRounded(r, 7, Color(0.045f, 0.047f, 0.058f, 0.99f));
     StrokeRounded(r, 7, Border());
-    static const float palette[][3] = {
-        {1.0f, 0.08f, 0.12f}, {1.0f, 0.82f, 0.04f}, {0.20f, 1.0f, 0.18f},
-        {0.05f, 0.75f, 1.0f}, {0.35f, 0.25f, 1.0f}, {1.0f, 0.15f, 0.75f},
-        {1.0f, 1.0f, 1.0f}, {0.55f, 0.58f, 0.66f}
-    };
-    for (int i = 0; i < 8; ++i) {
-        const float px = r.left + 12 + (i % 4) * 28.0f;
-        const float py = r.top + 12 + (i / 4) * 32.0f;
-        const D2D1_RECT_F swatch = Rect(px, py, px + 20, py + 20);
-        FillRect(swatch, Color(palette[i][0], palette[i][1], palette[i][2]));
-        StrokeRounded(swatch, 3, Border());
-            if (l.clicked && Contains(swatch, l.mouse)) {
-                g.colorPopup[0] = palette[i][0];
-            g.colorPopup[1] = palette[i][1];
-            g.colorPopup[2] = palette[i][2];
-            g.colorPopup[3] = 1.0f;
-            g.colorPopup = nullptr;
+    Text(L"Color palette", Rect(r.left + 12, r.top + 6,
+                                  r.right - 12, r.top + 30),
+         g.regular.Get(), Muted());
+
+    float hue{}, saturation{}, value{};
+    RGBtoHSV(g.colorPopup[0], g.colorPopup[1], g.colorPopup[2],
+             hue, saturation, value);
+    const D2D1_RECT_F palette = Rect(
+        r.left + 12, r.top + 34, r.left + 212, r.top + 234);
+    const D2D1_RECT_F saturationBar = Rect(
+        r.left + 226, r.top + 34, r.left + 250, r.top + 234);
+    constexpr int paletteSteps = 64;
+    for (int py = 0; py < paletteSteps; ++py) {
+        const float brightness =
+            1.0f - static_cast<float>(py) / (paletteSteps - 1);
+        for (int px = 0; px < paletteSteps; ++px) {
+            const float colorHue =
+                static_cast<float>(px) / (paletteSteps - 1);
+            float red{}, green{}, blue{};
+            HSVtoRGB(colorHue, saturation, brightness,
+                     red, green, blue);
+            const float x0 = palette.left +
+                px * (palette.right - palette.left) / paletteSteps;
+            const float y0 = palette.top +
+                py * (palette.bottom - palette.top) / paletteSteps;
+            const float x1 = palette.left +
+                (px + 1) * (palette.right - palette.left) / paletteSteps;
+            const float y1 = palette.top +
+                (py + 1) * (palette.bottom - palette.top) / paletteSteps;
+            FillRect(Rect(x0 - 0.25f, y0 - 0.25f,
+                          x1 + 0.75f, y1 + 0.75f),
+                     Color(red, green, blue));
         }
+    }
+    for (int i = 0; i < paletteSteps; ++i) {
+        const float sat =
+            1.0f - static_cast<float>(i) / (paletteSteps - 1);
+        float red{}, green{}, blue{};
+        HSVtoRGB(hue, sat, value, red, green, blue);
+        const float y0 = saturationBar.top +
+            i * (saturationBar.bottom - saturationBar.top) / paletteSteps;
+        const float y1 = saturationBar.top +
+            (i + 1) * (saturationBar.bottom - saturationBar.top) /
+                paletteSteps;
+        FillRect(Rect(saturationBar.left - 0.25f, y0 - 0.25f,
+                      saturationBar.right + 0.25f, y1 + 0.75f),
+                 Color(red, green, blue));
+    }
+    StrokeRounded(palette, 4, Border(), 1.0f);
+    StrokeRounded(saturationBar, 4, Border(), 1.0f);
+
+    const float markerX = palette.left +
+        hue * (palette.right - palette.left);
+    const float markerY = palette.top +
+        (1.0f - value) * (palette.bottom - palette.top);
+    SetBrush(White());
+    g.target->DrawEllipse(
+        D2D1::Ellipse(D2D1::Point2F(markerX, markerY), 6, 6),
+        g.brush.Get(), 1.5f);
+    const float saturationY = saturationBar.top +
+        (1.0f - saturation) *
+            (saturationBar.bottom - saturationBar.top);
+    Line(D2D1::Point2F(saturationBar.left - 3, saturationY),
+         D2D1::Point2F(saturationBar.right + 3, saturationY),
+         White(), 2.0f);
+
+    bool changed = false;
+    if (l.down && Contains(palette, l.mouse)) {
+        hue = std::clamp(
+            (l.mouse.x - palette.left) /
+                (palette.right - palette.left),
+            0.0f, 1.0f);
+        value = std::clamp(
+            1.0f - (l.mouse.y - palette.top) /
+                (palette.bottom - palette.top),
+            0.0f, 1.0f);
+        changed = true;
+    } else if (l.down && Contains(saturationBar, l.mouse)) {
+        saturation = std::clamp(
+            1.0f - (l.mouse.y - saturationBar.top) /
+                (saturationBar.bottom - saturationBar.top),
+            0.0f, 1.0f);
+        changed = true;
+    }
+    if (changed) {
+        HSVtoRGB(hue, saturation, value,
+                 g.colorPopup[0], g.colorPopup[1], g.colorPopup[2]);
+    }
+
+    wchar_t hex[16]{};
+    std::swprintf(hex, 16, L"#%02X%02X%02X",
+                  static_cast<int>(g.colorPopup[0] * 255.0f),
+                  static_cast<int>(g.colorPopup[1] * 255.0f),
+                  static_cast<int>(g.colorPopup[2] * 255.0f));
+    const D2D1_RECT_F hexRow = Rect(
+        r.left + 12, r.top + 244, r.right - 14, r.top + 272);
+    FillRounded(hexRow, 3, Color(1, 1, 1, 0.035f));
+    StrokeRounded(hexRow, 3, Border(), 0.8f);
+    Text(hex, hexRow, g.centered.Get(), White());
+
+    static bool popupColorDirty = false;
+    popupColorDirty = popupColorDirty || changed;
+    if (popupColorDirty && !l.down) {
+        SaveConfig();
+        popupColorDirty = false;
     }
 }
 
@@ -2278,6 +2370,12 @@ void RenderD2DMenu(std::size_t playerCount) {
         float* teamHealthValueColor = g.visualTeam == 0 ? enemyHealthValueColor : teammateHealthValueColor;
         float* teamGlowColor = g.visualTeam == 0 ? enemyGlowColor : teammateGlowColor;
         bool* teamGlowEnabled = g.visualTeam == 0 ? &enemyGlowEnabled : &allyGlowEnabled;
+        float* teamChamsColor = g.visualTeam == 0 ? enemyChamsColor : allyChamsColor;
+        bool* teamChamsEnabled = g.visualTeam == 0 ? &enemyChamsEnabled : &allyChamsEnabled;
+        float* teamInvisibleChamsColor = g.visualTeam == 0
+            ? enemyInvisibleChamsColor : allyInvisibleChamsColor;
+        bool* teamInvisibleChamsEnabled = g.visualTeam == 0
+            ? &enemyInvisibleChamsEnabled : &allyInvisibleChamsEnabled;
         float* teamMaxDistance = g.visualTeam == 0 ? &enemyEspMaxDistance :
                                  g.visualTeam == 1 ? &allyEspMaxDistance : &creepEspMaxDistance;
         float* teamBoxThickness = &boxThickness;
@@ -2385,14 +2483,20 @@ void RenderD2DMenu(std::size_t playerCount) {
                            10.0f, 500.0f, L"%.0f m");
                 DrawSectionHeading(leftX, firstY + 270, fullWidth, L"Appearance");
                 DrawToggle(l, leftX, firstY + 310, fullWidth,
-                           L"Model glow", L"", teamGlowEnabled);
+                           L"Model glow", L"", teamGlowEnabled, teamGlowColor);
+                DrawToggle(l, leftX, firstY + 364, fullWidth,
+                           L"Visible Chams", L"Visible model material",
+                           teamChamsEnabled, teamChamsColor);
+                DrawToggle(l, leftX, firstY + 414, fullWidth,
+                           L"Invisible Chams", L"Model through walls",
+                           teamInvisibleChamsEnabled, teamInvisibleChamsColor);
                 const wchar_t* glowModes[] = {L"HP-based fill", L"Normal fill"};
                 int* teamGlowMode = g.visualTeam == 0 ? &enemyGlowMode : &allyGlowMode;
-                DrawCombo(l, 401, leftX, firstY + 380, fullWidth, L"Glow mode",
+                DrawCombo(l, 401, leftX, firstY + 470, fullWidth, L"Glow mode",
                           teamGlowMode, glowModes, 2);
-                DrawSlider(l, leftX, firstY + 450, fullWidth, L"Box thickness",
+                DrawSlider(l, leftX, firstY + 530, fullWidth, L"Box thickness",
                            teamBoxThickness, 0.5f, 4.0f, L"%.2f px");
-                DrawSlider(l, leftX, firstY + 520, fullWidth, L"Corner length",
+                DrawSlider(l, leftX, firstY + 590, fullWidth, L"Corner length",
                            teamCornerLength, 0.10f, 0.35f, L"%.2f");
             } else {
                 DrawSectionHeading(leftX, firstY + 18, fullWidth, L"General");
