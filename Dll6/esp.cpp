@@ -1245,18 +1245,6 @@ std::vector<PlayerData> GetPlayers() {
         PlayerData player;
         player.entity = entity;
         player.pos = pos;
-        // Prefer the engine's instantaneous velocity for aim prediction.
-        // Position deltas are delayed/interpolated and noticeably under-lead
-        // during the first frames after a target starts running.
-        player.velocity = Read<Vector3>(entity + Offsets::Velocity);
-        if (!std::isfinite(player.velocity.x) ||
-            !std::isfinite(player.velocity.y) ||
-            !std::isfinite(player.velocity.z) ||
-            player.velocity.x * player.velocity.x +
-                player.velocity.y * player.velocity.y +
-                player.velocity.z * player.velocity.z > 2500.0f * 2500.0f) {
-            player.velocity = {};
-        }
         // Keep the rendered transform as the bone/aim anchor, but place the
         // ESP capsule at AbsOrigin.  The latter is the source used by the
         // jitter-free c3d7f8ff build and is published slightly ahead of
@@ -1413,7 +1401,7 @@ std::vector<PlayerData> GetPlayers() {
 
         // AbsOrigin and the camera matrix are sampled in this fenced Present.
         // This matches the proven c3 ESP path without adding screen-space
-        // smoothing or prediction, so starts/stops remain exact and stable.
+        // smoothing, so starts/stops remain exact and stable.
         if (currentViewMatrixReady && GetEntityScreenBounds(
                 entity, pos, viewMatrix,
                 player.boxLeft, player.boxTop,
@@ -2581,9 +2569,20 @@ static void RenderMenuLegacy(size_t playerCount) {
         if (ImGui::CollapsingHeader("Aim", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Checkbox("Aim assist", &aimAssist);
             ImGui::SameLine();
-            if (ImGui::RadioButton("Normal##AimMode", !aimSilentMode)) aimSilentMode = false;
+            if (ImGui::RadioButton("Normal##AimMode", !aimSilentMode && !aimMixedMode)) {
+                aimSilentMode = false;
+                aimMixedMode = false;
+            }
             ImGui::SameLine();
-            if (ImGui::RadioButton("Silent##AimMode", aimSilentMode)) aimSilentMode = true;
+            if (ImGui::RadioButton("Silent##AimMode", aimSilentMode && !aimMixedMode)) {
+                aimSilentMode = true;
+                aimMixedMode = false;
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Mixed##AimMode", aimMixedMode)) {
+                aimSilentMode = false;
+                aimMixedMode = true;
+            }
             if (ImGui::Button(aimKeyCapture ? "Press aim key..." : AimKeyName(aimAssistKey))) {
                 aimKeyCapture = true;
             }
@@ -2791,9 +2790,6 @@ static void RenderMenuV1(size_t playerCount) {
         ImGui::Checkbox("Only Yaw", &aimOnlyYaw);
         ImGui::Checkbox("Lock Target", &aimLockTarget);
         ImGui::SliderFloat("Hitchance", &aimHitchance, 0.0f, 100.0f, "%.0f%%");
-        ImGui::Checkbox("Backtrack", &aimBacktrack);
-        if (aimBacktrack)
-            ImGui::SliderFloat("Backtrack time", &aimBacktrackMs, 1.0f, 1000.0f, "%.0f ms");
         ImGui::Spacing();
         if (ImGui::Button(aimKeyCapture ? "Press a key..." : AimKeyName(aimAssistKey), ImVec2(170, 0)))
             aimKeyCapture = true;
@@ -3152,10 +3148,11 @@ static void RenderMenuV2(size_t playerCount) {
             BeginPanel("##aim_general", "General", "Main targeting behavior", 490);
             Toggle("Aim assist", "Enable player targeting", &aimAssist);
             Toggle("Visibility check", "Ignore occluded targets", &aimVisibilityCheck);
-            int aimMode = aimSilentMode ? 1 : 0;
-            const char* aimModes[] = { "Normal", "Silent" };
-            Combo("Aim mode", &aimMode, aimModes, 2);
+            int aimMode = aimMixedMode ? 2 : (aimSilentMode ? 1 : 0);
+            const char* aimModes[] = { "Normal", "pSilent", "Mixed" };
+            Combo("Aim mode", &aimMode, aimModes, 3);
             aimSilentMode = aimMode == 1;
+            aimMixedMode = aimMode == 2;
             int bindMode = aimToggleMode ? 1 : 0;
             const char* bindModes[] = { "Hold", "Toggle" };
             Combo("Activation", &bindMode, bindModes, 2);
@@ -3672,10 +3669,11 @@ void RenderMenu(size_t playerCount) {
         } else if (activeTab == 1) {
             Toggle("Enable aim assist", &aimAssist, nullptr);
             Toggle("Visibility check", &aimVisibilityCheck, nullptr);
-            int aimMode = aimSilentMode ? 1 : 0;
-            const char* aimModes[] = { "Normal", "Silent" };
-            Combo("Aim mode", &aimMode, aimModes, 2);
+            int aimMode = aimMixedMode ? 2 : (aimSilentMode ? 1 : 0);
+            const char* aimModes[] = { "Normal", "pSilent", "Mixed" };
+            Combo("Aim mode", &aimMode, aimModes, 3);
             aimSilentMode = aimMode == 1;
+            aimMixedMode = aimMode == 2;
             int bindMode = aimToggleMode ? 1 : 0;
             const char* bindModes[] = { "Hold", "Toggle" };
             Combo("Activation", &bindMode, bindModes, 2);

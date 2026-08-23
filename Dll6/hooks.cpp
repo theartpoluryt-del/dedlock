@@ -265,6 +265,7 @@ FreeCameraUpdateFn originalFreeCameraUpdate = nullptr;
 void* freeCameraUpdateTarget = nullptr;
 GameplayCameraUpdateFn originalGameplayCameraUpdate = nullptr;
 void* gameplayCameraUpdateTarget = nullptr;
+std::atomic<ULONGLONG> lastGameplayCameraHookAt{0};
 using GetRenderFovFn = float(__fastcall*)(uintptr_t);
 GetRenderFovFn originalGetRenderFov = nullptr;
 void* getRenderFovTarget = nullptr;
@@ -559,12 +560,17 @@ void __fastcall hkFreeCameraUpdate(uintptr_t camera) {
 }
 
 void __fastcall hkGameplayCameraUpdate(uintptr_t camera) {
+    lastGameplayCameraHookAt.store(GetTickCount64(), std::memory_order_release);
     // Apply once at the beginning of the complete per-frame camera update.
     // The stock update then consumes the angles and publishes a coherent
     // render transform during the same camera frame.
     FlushCurrentCameraAimInternal(camera);
     if (originalGameplayCameraUpdate)
         originalGameplayCameraUpdate(camera);
+    // Re-apply the same Normal/Mixed camera target after the stock update.
+    // During firing the pitch path is immediate, so recoil added inside the
+    // stock callback cannot survive into the next camera state.
+    FlushCurrentCameraAimInternal(camera);
 }
 
 bool EnsureFreeCameraUpdateHook(uintptr_t camera) {
@@ -1402,7 +1408,8 @@ void UpdateFreeCameraCommand(uintptr_t userCmd) {
 
 void ApplyVisibleAimInput(uintptr_t input) {
     if (!input || menuOpen || !IsGameFocused() ||
-        (!aimNormalActive && !aimMixedMode)) return;
+        (!aimNormalActive && !aimMixedMode) ||
+        (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) return;
 
     std::lock_guard<std::mutex> lock(humanSilentMutex);
     if (!pendingHumanReady) return;
@@ -1413,12 +1420,48 @@ void ApplyVisibleAimInput(uintptr_t input) {
     if (!std::isfinite(current.x) || !std::isfinite(current.y) ||
         !std::isfinite(target.x) || !std::isfinite(target.y)) return;
 
-    const float pitchSmooth = (std::max)(1.0f, aimPitchSmooth);
-    const float yawSmooth = (std::max)(1.0f, aimYawSmooth);
-    if (!aimOnlyYaw)
-        current.x += NormalizeCameraAngle(target.x - current.x) / pitchSmooth;
-    current.y += NormalizeCameraAngle(target.y - current.y) / yawSmooth;
+    // This is command input, not the render camera. Keep yaw controlled by
+    // the regular Normal/Mixed path and replace only the recoil-affected
+    // pitch with the exact selected target pitch before CreateMove builds the
+    // shot command.
+    current.x = target.x;
     Write<Vector3>(input + InputViewAnglesOffset, current);
+}
+
+void ApplyVisibleAimRecoilCommand(uintptr_t userCmd) {
+    if (!userCmd || menuOpen || !IsGameFocused() ||
+        (!aimNormalActive && !aimMixedMode) ||
+        (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0)
+        return;
+
+    Vector3 target{};
+    {
+        std::lock_guard<std::mutex> lock(humanSilentMutex);
+        if (!pendingHumanReady)
+            return;
+        target = pendingHumanAngles;
+    }
+    if (!std::isfinite(target.x))
+        return;
+
+    auto* command = reinterpret_cast<CUserCmd*>(userCmd);
+    if (!command->cmd.has_ang_camera_angles())
+        return;
+    auto* viewAngles = command->cmd.mutable_ang_camera_angles();
+    if (!viewAngles)
+        return;
+
+    Vector3 commandAngles{
+        target.x, viewAngles->y(), viewAngles->z()};
+    if (!std::isfinite(commandAngles.y) ||
+        !std::isfinite(commandAngles.z))
+        return;
+    viewAngles->set_x(commandAngles.x);
+    command->cmd.clear_view_delta_x();
+    // Every subtick shot carries its own view-angle history. Patch it together
+    // with the top-level command or later shots in a held burst can still use
+    // the recoil pitch even though the visible crosshair is level.
+    PatchInputHistory(userCmd, commandAngles);
 }
 
 std::mutex currentCameraAimMutex;
@@ -1432,10 +1475,24 @@ void ApplyCurrentCameraAimInternal(const Vector3& worldTarget) {
         !std::isfinite(worldTarget.z))
         return;
 
-    std::lock_guard<std::mutex> lock(currentCameraAimMutex);
-    queuedCameraAimTarget = worldTarget;
-    queuedCameraAimReady = true;
-    queuedCameraAimAt = GetTickCount64();
+    const ULONGLONG now = GetTickCount64();
+    {
+        std::lock_guard<std::mutex> lock(currentCameraAimMutex);
+        queuedCameraAimTarget = worldTarget;
+        queuedCameraAimReady = true;
+        queuedCameraAimAt = now;
+    }
+
+    // Normal and the visible half of Mixed must not become inert when the
+    // gameplay-camera virtual callback is unavailable (for example while its
+    // hook is being re-established after injection/camera recreation). Apply
+    // the same queued target once from Present only while no callback has
+    // actually arrived recently. As soon as the native callback is alive it
+    // remains the sole writer, so the two paths never fight or add jitter.
+    const ULONGLONG hookAt = lastGameplayCameraHookAt.load(
+        std::memory_order_acquire);
+    if (hookAt == 0 || now - hookAt > 100)
+        FlushCurrentCameraAimInternal();
 }
 
 void FlushCurrentCameraAimInternal(uintptr_t camera) {
@@ -1490,8 +1547,19 @@ void FlushCurrentCameraAimInternal(uintptr_t camera) {
     float pitchDelta = NormalizeCameraAngle(targetPitch - pitch);
     float yawDelta = NormalizeCameraAngle(targetYaw - yaw);
 
-    const bool instantPitch = aimPitchSmooth <= 1.001f;
+    // Use the exact Normal aim camera path as recoil compensation. While the
+    // attack button is held, pitch follows the selected world point without
+    // smoothing, so a recoil kick cannot outrun the correction and lift the
+    // crosshair above the target. Yaw keeps the user's normal smoothing.
+    const bool firingVisibleAim =
+        aimAssist && (aimNormalActive || aimMixedMode) &&
+        (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    const bool instantPitch =
+        aimPitchSmooth <= 1.001f || firingVisibleAim;
     const bool instantYaw = aimYawSmooth <= 1.001f;
+    // "Only Yaw" limits target acquisition, but it must not disable recoil
+    // compensation while firing or the crosshair can still climb vertically.
+    const bool writePitch = !aimOnlyYaw || firingVisibleAim;
 
     // Stop writing once the crosshair has converged. Reapplying tiny deltas
     // from consecutive camera states creates a feedback oscillation that also
@@ -1501,7 +1569,7 @@ void FlushCurrentCameraAimInternal(uintptr_t camera) {
         pitchDelta = 0.0f;
     if (!instantYaw && std::fabs(yawDelta) < angularDeadzone)
         yawDelta = 0.0f;
-    if ((aimOnlyYaw || pitchDelta == 0.0f) && yawDelta == 0.0f)
+    if ((!writePitch || pitchDelta == 0.0f) && yawDelta == 0.0f)
         return;
 
     // Use time-based exponential damping instead of dividing the error by a
@@ -1536,7 +1604,7 @@ void FlushCurrentCameraAimInternal(uintptr_t camera) {
     const float maxStepAt60Hz = 45.0f -
         (averageSmooth - 1.0f) * (33.0f / 19.0f);
     const float maxStep = maxStepAt60Hz * deltaSeconds * 60.0f;
-    if (!aimOnlyYaw) {
+    if (writePitch) {
         pitch = instantPitch
             ? targetPitch
             : pitch + (std::clamp)(pitchDelta * pitchAlpha, -maxStep, maxStep);
@@ -1566,6 +1634,10 @@ void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3
     }
     if (kCameraRelativeMovement)
         EnsurePawnProcessUserCmdHook(currentLocalPawn);
+    // CreateMove and the following local input stage can both append weapon
+    // recoil. Bracket the stock call so the state is clear before a shot is
+    // built and immediately clear any state it produced afterwards.
+    ApplyVisibleAimInput(input);
     if (originalCreateMove) originalCreateMove(input, splitScreenIndex, a3);
     // Engine physics tracing is only safe on the gameplay thread. Present
     // queues visibility requests; resolve them here and publish cached results.
@@ -1583,6 +1655,7 @@ void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3
     const auto callCount = ++createMoveCalls;
     const uintptr_t userCmd = GetCurrentUserCmd();
     if (userCmd) ++userCmdResolvedCalls;
+    ApplyVisibleAimRecoilCommand(userCmd);
 
     // The pawn callback captures the exact raw movement and visible camera
     // yaw. ApplyPendingUserCmdAngles rotates that same command only when a

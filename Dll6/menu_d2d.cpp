@@ -2578,11 +2578,6 @@ void RenderD2DMenu(std::size_t playerCount) {
         DrawSectionHeading(leftX, firstY + 322, columnWidth, L"Accuracy");
         DrawSlider(l, leftX, firstY + 363, columnWidth, L"Hitchance",
                    &aimHitchance, 0.0f, 100.0f, L"%.0f%%");
-        DrawToggle(l, leftX, firstY + 441, columnWidth, L"Backtrack",
-                   L"Aim at a recent target position", &aimBacktrack);
-        if (aimBacktrack)
-            DrawSlider(l, leftX, firstY + 497, columnWidth, L"Backtrack time",
-                       &aimBacktrackMs, 1.0f, 1000.0f, L"%.0f ms");
         DrawSectionHeading(rightX, firstY + 390, rightColumnWidth, L"Behavior");
         DrawToggle(l, rightX, firstY + 431, rightColumnWidth, L"Only Yaw",
                    L"Adjust horizontal aim only", &aimOnlyYaw);

@@ -33,10 +33,8 @@ bool aimNormalActive = false;
 bool farmNormalActive = false;
 bool aimSilentActive = false;
 bool aimOnlyYaw = false;
-bool aimBacktrack = false;
 bool aimLockTarget = false;
 float aimHitchance = 100.0f;
-float aimBacktrackMs = 100.0f;
 float aimPitchSmooth = 6.0f;
 float aimYawSmooth = 6.0f;
 AimSelectionMode aimSelectionMode = AimSelectionMode::Crosshair;
@@ -418,7 +416,6 @@ void LoadConfig() {
         else if (key == "aimSilentMode") aimSilentMode = value;
         else if (key == "aimMixedMode") aimMixedMode = value;
         else if (key == "aimOnlyYaw") aimOnlyYaw = value;
-        else if (key == "aimBacktrack") aimBacktrack = value;
         else if (key == "aimLockTarget") aimLockTarget = value;
         else if (key == "aimVisibilityCheck") aimVisibilityCheck = value;
         else if (key == "aimToggleMode") aimToggleMode = value;
@@ -431,7 +428,6 @@ void LoadConfig() {
         else if (key == "farmFov") farmFov = static_cast<float>(number);
         else if (key == "aimSmooth") aimSmooth = static_cast<float>(number);
         else if (key == "aimHitchance") aimHitchance = static_cast<float>(number);
-        else if (key == "aimBacktrackMs") aimBacktrackMs = static_cast<float>(number);
         else if (key == "aimPitchSmooth") aimPitchSmooth = static_cast<float>(number);
         else if (key == "aimYawSmooth") aimYawSmooth = static_cast<float>(number);
         else if (key == "farmAimSmooth") farmAimSmooth = static_cast<float>(number);
@@ -441,6 +437,11 @@ void LoadConfig() {
         else if (key == "aimTargetMode") aimTargetMode = static_cast<AimTargetMode>(static_cast<int>(number));
         else if (key == "aimSelectionMode") aimSelectionMode = static_cast<AimSelectionMode>(static_cast<int>(number));
     }
+    // The aim mode is a three-way choice, even though compatibility with old
+    // configs stores it as two booleans. Mixed wins if an old build saved an
+    // invalid state with both flags enabled.
+    if (aimMixedMode)
+        aimSilentMode = false;
 }
 
 void SaveConfig() {
@@ -687,7 +688,6 @@ void SaveConfig() {
            << "aimSilentMode " << aimSilentMode << '\n'
            << "aimMixedMode " << aimMixedMode << '\n'
            << "aimOnlyYaw " << aimOnlyYaw << '\n'
-           << "aimBacktrack " << aimBacktrack << '\n'
            << "aimLockTarget " << aimLockTarget << '\n'
            << "aimVisibilityCheck " << aimVisibilityCheck << '\n'
            << "aimToggleMode " << aimToggleMode << '\n'
@@ -700,7 +700,6 @@ void SaveConfig() {
            << "farmFov " << farmFov << '\n'
            << "aimSmooth " << aimSmooth << '\n'
            << "aimHitchance " << aimHitchance << '\n'
-           << "aimBacktrackMs " << aimBacktrackMs << '\n'
            << "aimPitchSmooth " << aimPitchSmooth << '\n'
            << "aimYawSmooth " << aimYawSmooth << '\n'
            << "farmAimSmooth " << farmAimSmooth << '\n'

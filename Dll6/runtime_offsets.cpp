@@ -748,7 +748,7 @@ bool InitializeRuntimeOffsets() {
     // a build. Keep a validated partial live-schema result instead of
     // discarding every resolved critical field because one optional name was
     // removed.
-    const bool liveSchemaReady = InitializeLiveSchemaOffsets(loaded, 38);
+    const bool liveSchemaReady = InitializeLiveSchemaOffsets(loaded, 37);
     if (!liveSchemaReady) {
         loaded = 0;
         loaded += SetField(fields, "CBasePlayerController.m_hPawn", Offsets::ControllerPawn);

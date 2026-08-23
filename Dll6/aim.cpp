@@ -1307,85 +1307,9 @@ bool IsWorldAimPointVisible(const Vector3& point, uintptr_t targetEntity) {
 
 namespace {
 
-struct BacktrackSample {
-    ULONGLONG time{};
-    Vector3 head{};
-    Vector3 body{};
-    bool hasHead{};
-    bool hasBody{};
-};
-
-std::unordered_map<uintptr_t, std::vector<BacktrackSample>> backtrackHistory;
 uintptr_t lockedAimTarget = 0;
 Vector3 cachedVisibleAimPoint{};
-Vector3 cachedVisibleAimVelocity{};
-ULONGLONG cachedVisibleAimAt = 0;
 bool cachedVisibleAimReady = false;
-
-struct AimMotionState {
-    Vector3 sample{};
-    Vector3 velocity{};
-    ULONGLONG sampleAt{};
-    ULONGLONG observedAt{};
-    bool initialized{};
-};
-
-std::unordered_map<uintptr_t, AimMotionState> aimMotionStates;
-
-Vector3 MeasureAimTargetVelocity(uintptr_t entity, const Vector3& position,
-                                 ULONGLONG now) {
-    if (!entity || !std::isfinite(position.x) ||
-        !std::isfinite(position.y) || !std::isfinite(position.z))
-        return {};
-
-    auto& state = aimMotionStates[entity];
-    state.observedAt = now;
-    if (!state.initialized) {
-        state.sample = position;
-        state.sampleAt = now;
-        state.initialized = true;
-        return {};
-    }
-
-    const Vector3 delta{position.x - state.sample.x,
-                        position.y - state.sample.y,
-                        position.z - state.sample.z};
-    const float distanceSquared = delta.x * delta.x +
-        delta.y * delta.y + delta.z * delta.z;
-    // AbsOrigin can stay unchanged for several Presents. Measure only on an
-    // actual simulation publication so zero duplicate samples do not pull the
-    // estimated velocity toward zero between ticks.
-    if (std::isfinite(distanceSquared) && distanceSquared > 0.0001f) {
-        const ULONGLONG elapsedMs = now - state.sampleAt;
-        if (elapsedMs >= 2 && elapsedMs <= 150 &&
-            distanceSquared <= 256.0f * 256.0f) {
-            const float inverseSeconds = 1000.0f /
-                static_cast<float>(elapsedMs);
-            const Vector3 measured{delta.x * inverseSeconds,
-                                   delta.y * inverseSeconds,
-                                   delta.z * inverseSeconds};
-            const float measuredSpeedSquared = measured.x * measured.x +
-                measured.y * measured.y + measured.z * measured.z;
-            if (std::isfinite(measuredSpeedSquared) &&
-                measuredSpeedSquared <= 2500.0f * 2500.0f) {
-                const float alpha = state.sampleAt == 0 ? 1.0f : 0.45f;
-                state.velocity.x +=
-                    (measured.x - state.velocity.x) * alpha;
-                state.velocity.y +=
-                    (measured.y - state.velocity.y) * alpha;
-                state.velocity.z +=
-                    (measured.z - state.velocity.z) * alpha;
-            }
-        } else {
-            state.velocity = {};
-        }
-        state.sample = position;
-        state.sampleAt = now;
-    } else if (now - state.sampleAt > 150) {
-        state.velocity = {};
-    }
-    return state.velocity;
-}
 
 bool RollHitchance() {
     if (aimHitchance >= 99.99f) return true;
@@ -1395,69 +1319,28 @@ bool RollHitchance() {
     return distribution(generator) <= std::clamp(aimHitchance, 0.0f, 100.0f);
 }
 
-void UpdateBacktrackHistory(const std::vector<PlayerData>& players, ULONGLONG now) {
-    if (!aimBacktrack) return;
-    const ULONGLONG keepMs = static_cast<ULONGLONG>(std::clamp(aimBacktrackMs, 1.0f, 1000.0f)) + 250;
-    for (const auto& player : players) {
-        if (!player.entity) continue;
-        auto& history = backtrackHistory[player.entity];
-        history.push_back({now, player.headPos, player.bodyPos,
-                           player.hasHeadBone, player.hasBodyBone});
-        while (!history.empty() && now - history.front().time > keepMs)
-            history.erase(history.begin());
-    }
-    for (auto it = backtrackHistory.begin(); it != backtrackHistory.end();) {
-        if (now - it->second.back().time > keepMs)
-            it = backtrackHistory.erase(it);
-        else
-            ++it;
-    }
-}
-
-bool GetBacktrackedPoint(uintptr_t entity, AimTargetMode mode, ULONGLONG now,
-                         Vector3& point) {
-    if (!aimBacktrack) return false;
-    const auto it = backtrackHistory.find(entity);
-    if (it == backtrackHistory.end() || it->second.empty()) return false;
-    const ULONGLONG targetTime = now - static_cast<ULONGLONG>(
-        std::clamp(aimBacktrackMs, 1.0f, 1000.0f));
-    const BacktrackSample* selected = &it->second.front();
-    for (const auto& sample : it->second) {
-        if (sample.time <= targetTime) selected = &sample;
-        else break;
-    }
-    if (mode == AimTargetMode::Head && selected->hasHead) {
-        point = selected->head;
-        return true;
-    }
-    if (mode == AimTargetMode::Body && selected->hasBody) {
-        point = selected->body;
-        return true;
-    }
-    if (mode == AimTargetMode::Closest) {
-        if (selected->hasHead) { point = selected->head; return true; }
-        if (selected->hasBody) { point = selected->body; return true; }
-    }
-    return false;
-}
-
 }
 
 void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     humanAimTargetFound = false;
     const bool leftButtonDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     const bool rightButtonDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
-    const bool silentPass = aimSilentMode || (aimMixedMode && leftButtonDown);
+    // Treat the two persisted booleans as one mode. Older menu variants and
+    // configs could leave both true; in that state the old ternaries made
+    // Mixed wait for LMB as if it were pure pSilent and its visible pass died.
+    const bool mixedMode = aimMixedMode;
+    const bool silentMode = aimSilentMode && !mixedMode;
+    const bool silentPass = silentMode || (mixedMode && leftButtonDown);
     aimSilentActive = silentPass;
-    if ((!aimMixedMode && !leftButtonDown) || (!aimSilentMode && !aimMixedMode))
+    if ((!mixedMode && !leftButtonDown) || (!silentMode && !mixedMode))
         ClearPendingSilentAngles();
     const bool configuredAimKeyDown = (GetAsyncKeyState(aimAssistKey) & 0x8000) != 0;
     const bool configuredAimKeyPressed = configuredAimKeyDown && !aimToggleLastDown;
     if (aimToggleMode && configuredAimKeyPressed) aimToggleActive = !aimToggleActive;
     aimToggleLastDown = configuredAimKeyDown;
     const bool keyActive = aimToggleMode ? aimToggleActive : configuredAimKeyDown;
-    aimNormalActive = !aimSilentMode && !aimMixedMode && keyActive;
-    const bool aiming = aimSilentMode ? (keyActive && leftButtonDown) : keyActive;
+    aimNormalActive = !silentMode && !mixedMode && keyActive;
+    const bool aiming = silentMode ? (keyActive && leftButtonDown) : keyActive;
     if (!aimAssist || menuOpen || !aiming || !currentViewMatrixReady) {
         cachedVisibleAimReady = false;
         ResetNormalMouseAim();
@@ -1467,9 +1350,6 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         if (!aimLockTarget) lockedAimTarget = 0;
         return;
     }
-    const ULONGLONG now = GetTickCount64();
-    UpdateBacktrackHistory(players, now);
-
     // Do not bypass the visibility predicate when the GPU snapshot is not
     // usable. With the option enabled, an unknown depth result is blocked;
     // otherwise the assist silently falls back to aiming through walls.
@@ -1517,18 +1397,12 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         float visibleDistance = FLT_MAX;
         for (int candidateIndex = 0; candidateIndex < candidateCount; ++candidateIndex) {
             Vector3 point = candidates[candidateIndex].point;
-            Vector3 historicalPoint{};
-            const bool usingBacktrack = GetBacktrackedPoint(
-                player.entity, aimTargetMode, now, historicalPoint);
-            if (usingBacktrack) {
-                point = historicalPoint;
-            } else if (candidates[candidateIndex].bone &&
-                       player.hasVisualAnchor) {
+            if (candidates[candidateIndex].bone && player.hasVisualAnchor) {
                 // Bones belong to the interpolated render snapshot, while
                 // player.pos is the latest simulation origin. Preserve the
                 // rendered pose but move it onto the current pawn origin so
                 // aim does not trail a running target by one interpolation
-                // interval. Backtrack points intentionally remain historical.
+                // interval.
                 const Vector3 originDelta{
                     player.pos.x - player.visualAnchor.x,
                     player.pos.y - player.visualAnchor.y,
@@ -1607,56 +1481,18 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
 
     // Mixed always keeps the current visible Normal camera path. While the
     // attack button is held, pSilent is applied in addition to it.
-    const bool visibleMouseAim = aimNormalActive || aimMixedMode;
-    // Use the live engine velocity when available. The position-delta
-    // estimator is intentionally retained as a fallback for entities whose
-    // velocity field is unavailable, but it lags badly when a target starts
-    // sprinting and makes the camera trail behind the target.
-    const Vector3 measuredVelocity = MeasureAimTargetVelocity(
-        best->entity, best->pos, now);
-    const float engineVelocitySquared =
-        best->velocity.x * best->velocity.x +
-        best->velocity.y * best->velocity.y +
-        best->velocity.z * best->velocity.z;
-    const bool haveEngineVelocity =
-        std::isfinite(engineVelocitySquared) &&
-        engineVelocitySquared > 1.0f &&
-        engineVelocitySquared <= 2500.0f * 2500.0f;
-    cachedVisibleAimVelocity = haveEngineVelocity
-        ? best->velocity : measuredVelocity;
-    if (!std::isfinite(cachedVisibleAimVelocity.x) ||
-        !std::isfinite(cachedVisibleAimVelocity.y) ||
-        !std::isfinite(cachedVisibleAimVelocity.z)) {
-        cachedVisibleAimVelocity = {};
-    }
+    const bool visibleMouseAim = aimNormalActive || mixedMode;
     cachedVisibleAimPoint = bestAimPoint;
-    if (!aimBacktrack) {
-        // Both camera aim and pSilent consume this render-side target on the
-        // next gameplay/input update. Advance by one measured render interval
-        // so neither path fires at the position from the preceding frame.
-        const float pipelineSeconds = (std::clamp)(
-            ImGui::GetIO().DeltaTime, 0.001f, 1.0f / 60.0f);
-        cachedVisibleAimPoint.x +=
-            cachedVisibleAimVelocity.x * pipelineSeconds;
-        cachedVisibleAimPoint.y +=
-            cachedVisibleAimVelocity.y * pipelineSeconds;
-        cachedVisibleAimPoint.z +=
-            cachedVisibleAimVelocity.z * pipelineSeconds;
-    }
-    cachedVisibleAimAt = now;
     cachedVisibleAimReady = visibleMouseAim;
-
-    for (auto it = aimMotionStates.begin(); it != aimMotionStates.end();) {
-        if (now - it->second.observedAt > 2000)
-            it = aimMotionStates.erase(it);
-        else
-            ++it;
-    }
     // Normal aim is applied by UpdateVisibleAimCamera/camera hook. Do not
     // also publish the same target through CreateMove: applying both paths
     // fights over the view angles and makes the camera and ESP oscillate.
     // Mixed keeps the input-angle path only for its silent attack pass.
-    if (silentPass) {
+    // Publish the exact selected angle for both the command-side recoil
+    // correction in Normal and the existing pSilent path in Mixed/Silent.
+    // Previously Normal only moved the render camera, so the command used to
+    // create a bullet could retain the game's upward recoil pitch.
+    if (silentPass || visibleMouseAim) {
         Vector2 commandScreen{};
         Vector3 commandAngles{};
         const bool haveCommandAngles = GetWorldAimPointScreen(
@@ -1668,8 +1504,10 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
             pendingHumanAngles = commandAngles;
             pendingHumanReady = true;
         }
+    }
+    if (silentPass) {
         // Pure pSilent intentionally stops here so the visible camera stays still.
-        if (silentPass && !aimMixedMode)
+        if (silentPass && !mixedMode)
             return;
     }
     // Normal/Mixed keeps the selected world target alive for the gameplay
@@ -1694,33 +1532,7 @@ void UpdateVisibleAimCamera() {
     }
     const bool instantVisibleAim =
         aimPitchSmooth <= 1.001f && aimYawSmooth <= 1.001f;
-    Vector3 predictedPoint = cachedVisibleAimPoint;
-    if (cachedVisibleAimAt != 0 && !aimBacktrack) {
-        const ULONGLONG ageMs = (std::min)(
-            GetTickCount64() - cachedVisibleAimAt,
-            static_cast<ULONGLONG>(32));
-        const float ageSeconds = static_cast<float>(ageMs) * 0.001f;
-        const auto smoothingDelay = [](float value) {
-            // FlushCurrentCameraAim uses this exact exponential response. A
-            // first-order tracker follows a constant-velocity target behind
-            // by velocity/rate, so feed that delay forward into the target.
-            const float divisor = (std::max)(1.0f, value);
-            const float retention =
-                (std::max)(0.001f, 1.0f - 1.0f / divisor);
-            const float rate = -std::log(retention) * 60.0f;
-            return rate > 0.001f
-                ? (std::min)(1.0f / rate, 0.250f) : 0.0f;
-        };
-        // Smooth=1 has no camera-response delay. Only compensate the real age
-        // of the render-side target before the next gameplay-camera callback.
-        const float horizontalLead = ageSeconds +
-            (instantVisibleAim ? 0.0f : smoothingDelay(aimYawSmooth));
-        const float verticalLead = ageSeconds +
-            (instantVisibleAim ? 0.0f : smoothingDelay(aimPitchSmooth));
-        predictedPoint.x += cachedVisibleAimVelocity.x * horizontalLead;
-        predictedPoint.y += cachedVisibleAimVelocity.y * horizontalLead;
-        predictedPoint.z += cachedVisibleAimVelocity.z * verticalLead;
-    }
+    const Vector3 aimPoint = cachedVisibleAimPoint;
 
     // Bone/render snapshots are not published atomically with the camera
     // snapshot. With low aim smoothing, feeding every tiny snapshot change
@@ -1734,10 +1546,10 @@ void UpdateVisibleAimCamera() {
         // At the minimum slider value Normal must use the same current point
         // as pSilent. The 18 ms measurement filter was the remaining visible
         // trail behind a running head even though camera smoothing was 1.
-        filteredPoint = predictedPoint;
+        filteredPoint = aimPoint;
         filteredPointReady = true;
         filteredAt = std::chrono::steady_clock::now();
-        ApplyCurrentCameraAim(predictedPoint);
+        ApplyCurrentCameraAim(aimPoint);
         return;
     }
     const auto filterNow = std::chrono::steady_clock::now();
@@ -1748,15 +1560,15 @@ void UpdateVisibleAimCamera() {
     if (!std::isfinite(filterDelta) || filterDelta <= 0.0f ||
         filterDelta > 0.100f)
         filterDelta = 1.0f / 60.0f;
-    const float filterDx = predictedPoint.x - filteredPoint.x;
-    const float filterDy = predictedPoint.y - filteredPoint.y;
-    const float filterDz = predictedPoint.z - filteredPoint.z;
+    const float filterDx = aimPoint.x - filteredPoint.x;
+    const float filterDy = aimPoint.y - filteredPoint.y;
+    const float filterDz = aimPoint.z - filteredPoint.z;
     const float filterDistanceSquared =
         filterDx * filterDx + filterDy * filterDy + filterDz * filterDz;
     // A target switch/teleport must not be dragged through the old target.
     if (!filteredPointReady || !std::isfinite(filterDistanceSquared) ||
         filterDistanceSquared > 256.0f * 256.0f) {
-        filteredPoint = predictedPoint;
+        filteredPoint = aimPoint;
         filteredPointReady = true;
     } else {
         constexpr float filterTimeConstant = 0.018f;
