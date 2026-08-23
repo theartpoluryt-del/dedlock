@@ -472,8 +472,13 @@ bool IsNormalFillPawn(uintptr_t pawn) {
         (pawnTeam != 2 && pawnTeam != 3)) return false;
     const bool ally = pawnTeam == localTeam;
     const bool teamEspEnabled = ally ? allyEspEnabled : enemyEspEnabled;
-    return teamEspEnabled && (ally ? allyGlowEnabled : enemyGlowEnabled) &&
-           (ally ? allyGlowMode : enemyGlowMode) == 1;
+    const bool invisibleChamsEnabled = ally
+        ? allyInvisibleChamsEnabled : enemyInvisibleChamsEnabled;
+    const bool normalGlowFill = (ally ? allyGlowEnabled : enemyGlowEnabled) &&
+                                (ally ? allyGlowMode : enemyGlowMode) == 1;
+    // Invisible Chams always use the complete model mask. Their coverage must
+    // never inherit the HP-clipped mode selected for ordinary native glow.
+    return teamEspEnabled && (invisibleChamsEnabled || normalGlowFill);
 }
 
 static uint32_t GlowPackedColor(const float color[4]) {
