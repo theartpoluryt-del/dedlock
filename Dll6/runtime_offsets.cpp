@@ -420,6 +420,11 @@ bool runtimeOffsetsReady = false;
 std::string runtimeBuildKey;
 bool nativeGlowReady = false;
 
+uintptr_t ResolveRuntimeSchemaOffset(const char* className,
+                                     const char* fieldName) {
+    return FindSchemaOffset(className, fieldName);
+}
+
 bool InitializePatternOffsets() {
     if (!clientBase) return false;
 

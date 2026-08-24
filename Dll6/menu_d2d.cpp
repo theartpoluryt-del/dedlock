@@ -592,6 +592,36 @@ void DrawCombo(const Layout& l, int id, float x, float y, float width,
     }
 }
 
+void DrawColorSetting(const Layout& l, float x, float y, float width,
+                      const wchar_t* label, const wchar_t* description,
+                      float* colorValue) {
+    if (!colorValue) return;
+    const float baseY = y;
+    NoteContent(x, baseY + 66.0f);
+    y = ScrolledY(x, y);
+    const D2D1_RECT_F row = Rect(x, y, x + width, y + 44);
+    const D2D1_RECT_F swatch = Rect(x + width - 34, y + 10,
+                                    x + width - 4, y + 32);
+    if (!g.colorPopup && Contains(row, l.mouse)) {
+        FillRounded(Rect(x + 3, y + 2, x + width - 3, y + 42), 3,
+                    Color(1, 1, 1, 0.025f));
+    }
+    Text(label, Rect(x + 10, y + 5, x + width - 52, y + 28),
+         g.regular.Get(), White());
+    if (description && *description) {
+        Text(description, Rect(x + 10, y + 25, x + width - 52, y + 46),
+             g.regular.Get(), Muted(0.72f));
+    }
+    FillRounded(swatch, 4,
+                Color(colorValue[0], colorValue[1], colorValue[2]));
+    StrokeRounded(swatch, 4, Border(), 0.8f);
+    if (ColumnVisible(x, y, 66.0f) && Clicked(l, row)) {
+        g.colorPopup = g.colorPopup == colorValue ? nullptr : colorValue;
+        g.colorPopupAnchor = swatch;
+        g.openCombo = 0;
+    }
+}
+
 void DrawHeroCombo(const Layout& l, int id, float x, float y, float width,
                    const wchar_t* label, int* value) {
     constexpr int heroCount = static_cast<int>(std::size(kPreviewHeroNames));
@@ -702,6 +732,14 @@ void DrawNavigationIcon(int variant, float x, float y, bool selected) {
         Line(D2D1::Point2F(x - 9, y + 8), D2D1::Point2F(x, y - 9), c, 1.6f);
         Line(D2D1::Point2F(x, y - 9), D2D1::Point2F(x + 9, y + 8), c, 1.6f);
         Line(D2D1::Point2F(x - 6, y + 2), D2D1::Point2F(x + 6, y + 2), c, 1.4f); return;
+    }
+    if (variant == 5) {                                             // World
+        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 10, 10),
+                              g.brush.Get(), 1.5f);
+        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 4, 10),
+                              g.brush.Get(), 1.2f);
+        Line(D2D1::Point2F(x - 9, y), D2D1::Point2F(x + 9, y), c, 1.2f);
+        return;
     }
     DrawTabIcon(2, x, y, selected);                                 // Misc
 }
@@ -2022,7 +2060,8 @@ void RenderD2DMenu(std::size_t playerCount) {
     if (!freezePreview) {
         g.preview3dActive = false;
     }
-    if (!freezePreview && g.tab == 0 && pDevice && pContext) {
+    if (!freezePreview && g.tab == 0 && g.visualTeam < 2 &&
+        pDevice && pContext) {
         Preview3DFrame previewFrame{};
         SetPanoramaPreviewRole(g.visualTeam);
         const int previewHeroId = GetPanoramaPreviewHero();
@@ -2264,15 +2303,17 @@ void RenderD2DMenu(std::size_t playerCount) {
     nav(L"Enemy", 124, 0, g.tab == 0 && g.visualTeam == 0, [&] { g.tab = 0; g.visualTeam = 0; });
     nav(L"Ally", 168, 1, g.tab == 0 && g.visualTeam == 1, [&] { g.tab = 0; g.visualTeam = 1; });
     nav(L"Creep", 212, 2, g.tab == 0 && g.visualTeam == 2, [&] { g.tab = 0; g.visualTeam = 2; });
-    section(L"AIM ASSIST", 278);
-    nav(L"Player aim", 302, 3, g.tab == 1 && g.aimSubtab == 0, [&] { g.tab = 1; g.aimSubtab = 0; });
-    nav(L"Creep aim", 346, 4, g.tab == 1 && g.aimSubtab != 0, [&] { g.tab = 1; g.aimSubtab = 1; });
-    section(L"MISCELLANEOUS", 412);
-    nav(L"Misc", 436, 5, g.tab == 2, [&] { g.tab = 2; });
+    nav(L"World", 256, 5, g.tab == 0 && g.visualTeam == 3, [&] { g.tab = 0; g.visualTeam = 3; });
+    section(L"AIM ASSIST", 322);
+    nav(L"Player aim", 346, 3, g.tab == 1 && g.aimSubtab == 0, [&] { g.tab = 1; g.aimSubtab = 0; });
+    nav(L"Creep aim", 390, 4, g.tab == 1 && g.aimSubtab != 0, [&] { g.tab = 1; g.aimSubtab = 1; });
+    section(L"MISCELLANEOUS", 456);
+    nav(L"Misc", 480, 6, g.tab == 2, [&] { g.tab = 2; });
 
     const float contentX = 349.0f + g.pageShift;
     const wchar_t* pageTitle = g.tab == 0 ? (g.visualTeam == 0 ? L"Enemy" :
-                                             g.visualTeam == 1 ? L"Ally" : L"Creep") :
+                                             g.visualTeam == 1 ? L"Ally" :
+                                             g.visualTeam == 2 ? L"Creep" : L"World") :
                                 g.tab == 1 ? (g.aimSubtab == 0 ? L"Player aim" : L"Creep aim") :
                                              L"Misc";
     Text(pageTitle, Rect(contentX, 83, 700, 113), g.title.Get(),
@@ -2341,7 +2382,32 @@ void RenderD2DMenu(std::size_t playerCount) {
              visualEditor ? kDesignHeight : contentPanelBottom),
         D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
-    if (g.tab == 0) {
+    if (g.tab == 0 && g.visualTeam == 3) {
+        DrawSectionHeading(leftX, firstY + 18, columnWidth, L"World");
+        DrawToggle(l, leftX, firstY + 58, columnWidth,
+                   L"Enabled", L"Enable world rendering settings",
+                   &worldModulationEnabled);
+        DrawToggle(l, leftX, firstY + 124, columnWidth,
+                   L"Disable Skybox", L"Hide sky rendering",
+                   &disableSkybox);
+        DrawColorSetting(l, leftX, firstY + 190, columnWidth,
+                         L"Skybox color", L"Sky tint", skyboxColor);
+        DrawSlider(l, leftX, firstY + 256, columnWidth,
+                   L"Skybox brightness", &skyboxBrightness,
+                   0.0f, 50.0f, L"%.2f");
+
+        DrawSectionHeading(rightX, firstY + 18, rightColumnWidth,
+                           L"Scene");
+        DrawColorSetting(l, rightX, firstY + 58, rightColumnWidth,
+                         L"Props Color", L"Object tint", propsColor);
+        DrawColorSetting(l, rightX, firstY + 124, rightColumnWidth,
+                         L"Light Color", L"Light and shadow tint", lightColor);
+        DrawSlider(l, rightX, firstY + 190, rightColumnWidth,
+                   L"Light Brightness", &lightBrightness,
+                   0.0f, 50.0f, L"%.2f");
+        DrawColorSetting(l, rightX, firstY + 256, rightColumnWidth,
+                         L"World Color", L"World geometry tint", worldColor);
+    } else if (g.tab == 0) {
         bool* teamEsp = g.visualTeam == 0 ? &enemyEspEnabled :
                         g.visualTeam == 1 ? &allyEspEnabled : &creepEspEnabled;
         bool* teamBoxes = g.visualTeam == 0 ? &enemyBoxesEnabled :

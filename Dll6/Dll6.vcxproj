@@ -193,6 +193,7 @@
     <ClCompile Include="menu_d2d.cpp" />
     <ClCompile Include="panorama_preview.cpp" />
     <ClCompile Include="runtime_offsets.cpp" />
+    <ClCompile Include="world_visuals.cpp" />
     <ClCompile Include="protobuf\gameevents.pb.cc" />
     <ClCompile Include="usercmd_runtime.cpp" />
     <ClCompile Include="protobuf\citadel_usercmd.pb.cc" />

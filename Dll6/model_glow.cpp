@@ -34,6 +34,12 @@ using DrawInstancedIndirectFn = void(STDMETHODCALLTYPE*)(
 using CreateDeferredContextFn = HRESULT(STDMETHODCALLTYPE*)(
     ID3D11Device*, UINT, ID3D11DeviceContext**);
 using RenderDepthStateFn = void(__fastcall*)(uintptr_t, void*, uint32_t);
+using DrawSceneObjectFn = uintptr_t(__fastcall*)(
+    uintptr_t, uintptr_t, uintptr_t, int, int, uintptr_t, uintptr_t, uintptr_t);
+using LightSceneObjectFn = uintptr_t(__fastcall*)(
+    uintptr_t, uintptr_t, uintptr_t);
+using DrawSceneObjectArrayFn = void(__fastcall*)(
+    uintptr_t, uintptr_t, uintptr_t);
 using CreateInterfaceFn = void*(__cdecl*)(const char*, int*);
 struct KeyValues3Storage {
     alignas(16) std::array<uint8_t, 0x20> bytes{};
@@ -62,6 +68,9 @@ DrawIndexedInstancedIndirectFn originalDrawIndexedInstancedIndirect = nullptr;
 DrawInstancedIndirectFn originalDrawInstancedIndirect = nullptr;
 CreateDeferredContextFn originalCreateDeferredContext = nullptr;
 RenderDepthStateFn originalRenderDepthState = nullptr;
+DrawSceneObjectFn originalDrawSceneObject = nullptr;
+LightSceneObjectFn originalLightSceneObject = nullptr;
+DrawSceneObjectArrayFn originalDrawSceneObjectArray = nullptr;
 
 void* drawModelTarget = nullptr;
 void* generatePrimitivesTarget = nullptr;
@@ -77,6 +86,10 @@ void* drawIndexedInstancedIndirectTarget = nullptr;
 void* drawInstancedIndirectTarget = nullptr;
 void* createDeferredContextTarget = nullptr;
 void* renderDepthStateTarget = nullptr;
+void* drawSceneObjectTarget = nullptr;
+void* lightSceneObjectTarget = nullptr;
+void* drawSceneObjectArrayTarget = nullptr;
+uintptr_t lightDataQueueGlobal = 0;
 
 ID3D11PixelShader* glowPixelShader = nullptr;
 ID3D11Buffer* glowColorBuffer = nullptr;
@@ -114,6 +127,12 @@ constexpr char DrawModelPattern[] =
     "48 8B C4 53 57 41 54 48 81 EC D0 00 00";
 constexpr char GeneratePrimitivesVtablePattern[] =
     "48 8D 05 ? ? ? ? 48 89 07 48 8B 7C 24 48";
+constexpr char LightSceneObjectCallPattern[] =
+    "E8 ? ? ? ? 44 0F 28 5C 24 60";
+constexpr char DrawSceneObjectArrayPattern[] =
+    "48 8B C4 48 89 50 10 48 89 48 08 55 53 56 57 41 54 41 55 41 56 41 57 48 8D A8 38 F9 FF FF";
+constexpr char LightDataQueuePattern[] =
+    "48 8B 05 ? ? ? ? 48 C1 E1 04";
 constexpr char PlayerOutlinePattern[] =
     "4C 89 44 24 ? 48 89 54 24 ? 55 53 56 57 41 56 41 57 "
     "48 8D AC 24";
@@ -319,6 +338,43 @@ uintptr_t FindGeneratePrimitivesTarget(HMODULE sceneModule) {
     const uintptr_t end = begin + info.SizeOfImage;
     return candidate >= begin && candidate < end ? candidate : 0;
 }
+
+uintptr_t FindDrawSceneObjectTarget(HMODULE sceneModule) {
+    const uintptr_t constructor = FindPattern(
+        sceneModule, GeneratePrimitivesVtablePattern);
+    if (!constructor) return 0;
+    const int32_t displacement = Read<int32_t>(constructor + 3);
+    const uintptr_t vtable = constructor + 7 + displacement;
+    return Read<uintptr_t>(vtable + 0x08);
+}
+
+uintptr_t FindRelativeCallTarget(HMODULE module, const char* pattern) {
+    const uintptr_t call = FindPattern(module, pattern);
+    if (!call || Read<uint8_t>(call) != 0xE8) return 0;
+    return call + 5 + Read<int32_t>(call + 1);
+}
+
+uintptr_t FindRipRelativeGlobal(HMODULE module, const char* pattern,
+                                uintptr_t add = 0) {
+    const uintptr_t instruction = FindPattern(module, pattern);
+    if (!instruction) return 0;
+    return instruction + 7 + Read<int32_t>(instruction + 3) + add;
+}
+
+bool IsWritableRange(uintptr_t address, size_t size) {
+    if (address < 0x10000 || !size) return false;
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) ||
+        info.State != MEM_COMMIT ||
+        (info.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return false;
+    const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY |
+        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (!(info.Protect & writable)) return false;
+    const uintptr_t end = reinterpret_cast<uintptr_t>(info.BaseAddress) +
+                          info.RegionSize;
+    return address <= end && size <= end - address;
+}
+
 
 uintptr_t GetEnemyHeroMeshPawn(uintptr_t entry) {
     const uintptr_t sceneObject =
@@ -753,16 +809,23 @@ bool BeginGlowPipeline(
         if (mode == 1) {
             glowColor = allyChamsColor;
         } else if (mode == 2) {
-            // World/sky geometry is submitted without an entity owner.
-            modulationColor[0] = disableSkybox ? 0.0f : skyboxColor[0] * skyboxBrightness * lightColor[0] * lightBrightness;
-            modulationColor[1] = disableSkybox ? 0.0f : skyboxColor[1] * skyboxBrightness * lightColor[1] * lightBrightness;
-            modulationColor[2] = disableSkybox ? 0.0f : skyboxColor[2] * skyboxBrightness * lightColor[2] * lightBrightness;
-            modulationColor[3] = 1.0f;
+            modulationColor[0] = skyboxColor[0] * skyboxBrightness * lightColor[0] * lightBrightness;
+            modulationColor[1] = skyboxColor[1] * skyboxBrightness * lightColor[1] * lightBrightness;
+            modulationColor[2] = skyboxColor[2] * skyboxBrightness * lightColor[2] * lightBrightness;
+            // The blend state preserves the destination for alpha zero, so a
+            // disabled sky does not clear unrelated colour/depth targets.
+            modulationColor[3] = disableSkybox ? 0.0f : 1.0f;
             glowColor = modulationColor;
         } else if (mode == 3) {
             modulationColor[0] = propsColor[0] * lightColor[0] * lightBrightness;
             modulationColor[1] = propsColor[1] * lightColor[1] * lightBrightness;
             modulationColor[2] = propsColor[2] * lightColor[2] * lightBrightness;
+            modulationColor[3] = 1.0f;
+            glowColor = modulationColor;
+        } else if (mode == 4) {
+            modulationColor[0] = worldColor[0] * lightColor[0] * lightBrightness;
+            modulationColor[1] = worldColor[1] * lightColor[1] * lightBrightness;
+            modulationColor[2] = worldColor[2] * lightColor[2] * lightBrightness;
             modulationColor[3] = 1.0f;
             glowColor = modulationColor;
         }
@@ -1048,6 +1111,102 @@ void ProbeRenderDepthMethod(uintptr_t renderContext) {
     LogGlowHook(message);
 }
 
+uintptr_t __fastcall HookLightSceneObject(
+    uintptr_t thisptr, uintptr_t object, uintptr_t a3) {
+    const bool apply = worldModulationEnabled && object;
+    const std::array<float, 3> original = apply
+        ? std::array<float, 3>{Read<float>(object + 0xE4),
+                               Read<float>(object + 0xE8),
+                               Read<float>(object + 0xEC)}
+        : std::array<float, 3>{};
+    if (apply) {
+        const float intensity = std::clamp(lightBrightness, 0.0f, 50.0f);
+        Write<float>(object + 0xE4,
+                     std::clamp(lightColor[0] * intensity, 0.0f, 50.0f));
+        Write<float>(object + 0xE8,
+                     std::clamp(lightColor[1] * intensity, 0.0f, 50.0f));
+        Write<float>(object + 0xEC,
+                     std::clamp(lightColor[2] * intensity, 0.0f, 50.0f));
+    }
+    const uintptr_t result = originalLightSceneObject
+        ? originalLightSceneObject(thisptr, object, a3) : 0;
+    if (apply) {
+        Write<float>(object + 0xE4, original[0]);
+        Write<float>(object + 0xE8, original[1]);
+        Write<float>(object + 0xEC, original[2]);
+    }
+    return result;
+}
+
+void __fastcall HookDrawSceneObjectArray(
+    uintptr_t thisptr, uintptr_t a2, uintptr_t objectArray) {
+    if (originalDrawSceneObjectArray)
+        originalDrawSceneObjectArray(thisptr, a2, objectArray);
+    if (!worldModulationEnabled || !objectArray || !lightDataQueueGlobal)
+        return;
+
+    const uintptr_t objectData = Read<uintptr_t>(objectArray + 0x08);
+    const uintptr_t queue = Read<uintptr_t>(lightDataQueueGlobal);
+    const uintptr_t base = queue ? Read<uintptr_t>(queue + 0x18) : 0;
+    if (!objectData || !base) return;
+    const int count = Read<int>(objectData + 0x04);
+    const int index = Read<int>(objectData + 0x30);
+    if (count <= 0 || count > 4096 || index < 0 || index > 65535)
+        return;
+    const uintptr_t first = base + (static_cast<uintptr_t>(index) << 5);
+    const size_t span = static_cast<size_t>(count - 1) * 0x20 +
+                        sizeof(ColorRGBA);
+    if (!IsWritableRange(first, span)) return;
+
+    const ColorRGBA color = {
+        static_cast<uint8_t>(std::clamp(worldColor[0], 0.0f, 1.0f) * 255.0f),
+        static_cast<uint8_t>(std::clamp(worldColor[1], 0.0f, 1.0f) * 255.0f),
+        static_cast<uint8_t>(std::clamp(worldColor[2], 0.0f, 1.0f) * 255.0f),
+        255};
+    for (int i = 0; i < count; ++i)
+        Write<ColorRGBA>(first + static_cast<uintptr_t>(i) * 0x20, color);
+}
+
+uintptr_t __fastcall HookDrawSceneObject(
+    uintptr_t a1, uintptr_t a2, uintptr_t batch, int batchCount,
+    int a5, uintptr_t a6, uintptr_t a7, uintptr_t a8) {
+    struct SavedColor { uintptr_t mesh{}; uint32_t value{}; };
+    std::array<SavedColor, 1024> saved{};
+    size_t savedCount = 0;
+    if (worldModulationEnabled && batch && batchCount > 0 &&
+        batchCount <= static_cast<int>(saved.size())) {
+        for (int i = 0; i < batchCount; ++i) {
+            const uintptr_t mesh = batch + static_cast<uintptr_t>(i) * MeshEntryStride;
+            const uintptr_t sceneObject = Read<uintptr_t>(mesh + MeshSceneObject);
+            const uint32_t handle = sceneObject
+                ? Read<uint32_t>(sceneObject + SceneObjectOwner) : 0xFFFFFFFFu;
+            const uintptr_t owner = handle != 0xFFFFFFFFu
+                ? ResolveEntity(handle) : 0;
+            const std::string className = owner
+                ? GetEntityClassName(owner) : std::string{};
+            if (owner == currentLocalPawn ||
+                className.find("CitadelPlayerPawn") != std::string::npos)
+                continue;
+            const bool sky = className.find("EnvSky") != std::string::npos;
+            const float* color = sky ? skyboxColor
+                                     : (owner ? propsColor : worldColor);
+            const float brightness = sky ? skyboxBrightness : 1.0f;
+            const float components[4] = {
+                std::clamp(color[0] * brightness, 0.0f, 1.0f),
+                std::clamp(color[1] * brightness, 0.0f, 1.0f),
+                std::clamp(color[2] * brightness, 0.0f, 1.0f), 1.0f};
+            saved[savedCount++] = {mesh, Read<uint32_t>(mesh + MeshColor)};
+            Write<uint32_t>(mesh + MeshColor, GlowPackedColor(components));
+        }
+    }
+    const uintptr_t result = originalDrawSceneObject
+        ? originalDrawSceneObject(a1, a2, batch, batchCount,
+                                  a5, a6, a7, a8) : 0;
+    for (size_t i = 0; i < savedCount; ++i)
+        Write<uint32_t>(saved[i].mesh + MeshColor, saved[i].value);
+    return result;
+}
+
 void** __fastcall HookDrawModel(
     __int64 sceneObjectDesc, __int64 dx11, __int64* meshDraws,
     int meshCount, __int64 sceneView, __int64 sceneLayer, __int64 a7) {
@@ -1057,7 +1216,7 @@ void** __fastcall HookDrawModel(
     __int64* submittedMeshes = meshDraws;
     const int safeWorldCount = meshCount > 0 && meshCount < 512 ? meshCount : 0;
     const bool trooperChamsActive = enemyTrooperChams || allyTrooperChams || neutralChams;
-    if ((worldModulationEnabled || trooperChamsActive) &&
+    if (trooperChamsActive &&
         meshDraws && safeWorldCount > 0) {
         worldMeshes.resize(static_cast<size_t>(safeWorldCount));
         worldDescriptors.resize(static_cast<size_t>(safeWorldCount));
@@ -1084,6 +1243,8 @@ void** __fastcall HookDrawModel(
             const uintptr_t owner = ownerHandle != 0xFFFFFFFFu
                 ? ResolveEntity(ownerHandle) : 0;
             const bool hero = owner == currentLocalPawn || GetGlowHeroMeshPawn(entry) != 0;
+            const bool sky = owner &&
+                GetEntityClassName(owner).find("EnvSky") != std::string::npos;
             const float* trooperTint = GetTrooperChamsTint(owner);
             if (trooperTint) {
                 const float tint[4] = {
@@ -1091,19 +1252,6 @@ void** __fastcall HookDrawModel(
                     std::clamp(trooperTint[1], 0.0f, 1.0f),
                     std::clamp(trooperTint[2], 0.0f, 1.0f),
                     1.0f
-                };
-                SetGlowDescriptorTint(descriptorCopy.bytes, tint);
-            } else if (worldModulationEnabled && !hero) {
-                const float* base = owner ? propsColor : worldColor;
-                const float skyFactor = owner ? 1.0f : skyboxBrightness;
-                const float tint[4] = {
-                    std::clamp(base[0] * lightColor[0] * lightBrightness *
-                               (owner ? 1.0f : skyboxColor[0]) * skyFactor, 0.0f, 4.0f),
-                    std::clamp(base[1] * lightColor[1] * lightBrightness *
-                               (owner ? 1.0f : skyboxColor[1]) * skyFactor, 0.0f, 4.0f),
-                    std::clamp(base[2] * lightColor[2] * lightBrightness *
-                               (owner ? 1.0f : skyboxColor[2]) * skyFactor, 0.0f, 4.0f),
-                    disableSkybox && !owner ? 0.0f : 1.0f
                 };
                 SetGlowDescriptorTint(descriptorCopy.bytes, tint);
             }
@@ -1116,34 +1264,34 @@ void** __fastcall HookDrawModel(
             submittedMeshes = reinterpret_cast<__int64*>(worldMeshes.data());
     }
 
-    bool hasOwnedMesh = false;
-    bool hasHeroMesh = false;
-    if (worldModulationEnabled && meshDraws && safeWorldCount > 0) {
-        const uintptr_t source = reinterpret_cast<uintptr_t>(meshDraws);
+    // Source 2's DrawSceneObject mesh color lives directly at +0x50.  Apply
+    // modulation only for this submission and restore it immediately after
+    // the engine consumes the array.  Do not replace the scene pixel shader.
+    struct SavedWorldColor { uintptr_t entry{}; uint32_t color{}; };
+    std::array<SavedWorldColor, 512> savedWorldColors{};
+    size_t savedWorldColorCount = 0;
+    if (worldModulationEnabled && submittedMeshes && safeWorldCount > 0) {
+        const uintptr_t source = reinterpret_cast<uintptr_t>(submittedMeshes);
         for (int i = 0; i < safeWorldCount; ++i) {
             const uintptr_t entry = source + static_cast<uintptr_t>(i) * MeshEntryStride;
             const uintptr_t sceneObject = Read<uintptr_t>(entry + MeshSceneObject);
-            const uint32_t handle = sceneObject
-                ? Read<uint32_t>(sceneObject + SceneObjectOwner) : 0xFFFFFFFFu;
+            const uint32_t handle = sceneObject ? Read<uint32_t>(sceneObject + SceneObjectOwner) : 0xFFFFFFFFu;
             const uintptr_t owner = handle != 0xFFFFFFFFu ? ResolveEntity(handle) : 0;
-            if (!owner) continue;
-            hasOwnedMesh = true;
-            if (GetEntityClassName(owner).find("CitadelPlayerPawn") != std::string::npos) {
-                hasHeroMesh = true;
-                break;
-            }
+            const std::string className = owner ? GetEntityClassName(owner) : std::string{};
+            if (owner == currentLocalPawn || className.find("CitadelPlayerPawn") != std::string::npos)
+                continue;
+            const bool sky = className.find("EnvSky") != std::string::npos;
+            const float* sourceColor = sky ? skyboxColor : (owner ? propsColor : worldColor);
+            const float brightness = sky ? skyboxBrightness : 1.0f;
+            const float packedColor[4] = {
+                std::clamp(sourceColor[0] * brightness, 0.0f, 1.0f),
+                std::clamp(sourceColor[1] * brightness, 0.0f, 1.0f),
+                std::clamp(sourceColor[2] * brightness, 0.0f, 1.0f), 1.0f};
+            savedWorldColors[savedWorldColorCount++] = {
+                entry, Read<uint32_t>(entry + MeshColor)};
+            Write<uint32_t>(entry + MeshColor, GlowPackedColor(packedColor));
         }
     }
-    // Do not recolour player model batches.  All non-player scene batches use
-    // the active D3D context, which affects the final shader rather than an
-    // unused material-descriptor copy.
-    auto* modulationContext = worldModulationEnabled && !hasHeroMesh &&
-            LooksLikeD3D11Context(reinterpret_cast<void*>(dx11))
-        ? reinterpret_cast<ID3D11DeviceContext*>(dx11) : nullptr;
-    SavedPipelineState modulationSaved{};
-    const bool modulationOverridden = modulationContext &&
-        BeginGlowPipeline(modulationContext, modulationSaved,
-                          hasOwnedMesh ? 3 : 2);
 
     struct SavedChamsMesh {
         uintptr_t entry{};
@@ -1270,8 +1418,9 @@ void** __fastcall HookDrawModel(
             Write<uintptr_t>(saved.entry + MeshMaterial, saved.material);
             Write<uint32_t>(saved.entry + MeshColor, saved.color);
         }
-        if (modulationOverridden)
-            EndGlowPipeline(modulationContext, modulationSaved);
+        for (size_t i = 0; i < savedWorldColorCount; ++i)
+            Write<uint32_t>(savedWorldColors[i].entry + MeshColor,
+                            savedWorldColors[i].color);
         return result;
     }
 
@@ -1294,9 +1443,9 @@ void** __fastcall HookDrawModel(
         Write<uintptr_t>(saved.entry + MeshMaterial, saved.material);
         Write<uint32_t>(saved.entry + MeshColor, saved.color);
     }
-    if (modulationOverridden) {
-        EndGlowPipeline(modulationContext, modulationSaved);
-    }
+    for (size_t i = 0; i < savedWorldColorCount; ++i)
+        Write<uint32_t>(savedWorldColors[i].entry + MeshColor,
+                        savedWorldColors[i].color);
     return result;
 }
 
@@ -1468,6 +1617,10 @@ void RemoveHookTarget(void*& target) {
 
 } // namespace
 
+void RestoreWorldRenderState() {
+    // Render-object values are restored synchronously inside their hook.
+}
+
 bool InstallModelGlowHook() {
     const MH_STATUS init = MH_Initialize();
     if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
@@ -1538,6 +1691,54 @@ bool InstallModelGlowHook() {
         }
     }
 
+    if (!drawSceneObjectTarget) {
+        HMODULE scene = GetModuleHandleA("scenesystem.dll");
+        const uintptr_t candidate = scene
+            ? FindDrawSceneObjectTarget(scene) : 0;
+        if (candidate && InstallContextHook(
+                drawSceneObjectTarget,
+                reinterpret_cast<void*>(candidate),
+                reinterpret_cast<void*>(&HookDrawSceneObject),
+                originalDrawSceneObject)) {
+            LogGlowHook("SceneSystem DrawSceneObject hook installed");
+        } else {
+            LogGlowHook("SceneSystem DrawSceneObject hook failed");
+        }
+    }
+
+    if (!lightSceneObjectTarget) {
+        HMODULE scene = GetModuleHandleA("scenesystem.dll");
+        const uintptr_t candidate = scene
+            ? FindRelativeCallTarget(scene, LightSceneObjectCallPattern) : 0;
+        if (candidate && InstallContextHook(
+                lightSceneObjectTarget,
+                reinterpret_cast<void*>(candidate),
+                reinterpret_cast<void*>(&HookLightSceneObject),
+                originalLightSceneObject)) {
+            LogGlowHook("SceneSystem light object hook installed");
+        } else {
+            LogGlowHook("SceneSystem light object hook failed");
+        }
+    }
+
+    if (!drawSceneObjectArrayTarget) {
+        HMODULE scene = GetModuleHandleA("scenesystem.dll");
+        if (scene && !lightDataQueueGlobal)
+            lightDataQueueGlobal = FindRipRelativeGlobal(
+                scene, LightDataQueuePattern, 0x08);
+        const uintptr_t candidate = scene
+            ? FindPattern(scene, DrawSceneObjectArrayPattern) : 0;
+        if (candidate && lightDataQueueGlobal && InstallContextHook(
+                drawSceneObjectArrayTarget,
+                reinterpret_cast<void*>(candidate),
+                reinterpret_cast<void*>(&HookDrawSceneObjectArray),
+                originalDrawSceneObjectArray)) {
+            LogGlowHook("safe SceneObjectArray world hook installed");
+        } else {
+            LogGlowHook("safe SceneObjectArray world hook failed");
+        }
+    }
+
     // Chams now operate entirely on the SceneSystem DrawModel mesh array. Do
     // not hook ID3D11DeviceContext::Draw* here: those callbacks run for every
     // draw in the frame and the former atomic bookkeeping alone caused a
@@ -1576,6 +1777,9 @@ void RemoveModelGlowHook() {
     RemoveHookTarget(drawTarget);
     RemoveHookTarget(drawIndexedTarget);
     RemoveHookTarget(generatePrimitivesTarget);
+    RemoveHookTarget(drawSceneObjectTarget);
+    RemoveHookTarget(lightSceneObjectTarget);
+    RemoveHookTarget(drawSceneObjectArrayTarget);
     RemoveHookTarget(drawModelTarget);
     RemoveHookTarget(createDeferredContextTarget);
     RemoveHookTarget(playerOutlineTarget);
@@ -1584,6 +1788,10 @@ void RemoveModelGlowHook() {
     RemoveHookTarget(playerHealthGlowRenderTarget);
 
     originalDrawInstanced = nullptr;
+    originalDrawSceneObject = nullptr;
+    originalLightSceneObject = nullptr;
+    originalDrawSceneObjectArray = nullptr;
+    lightDataQueueGlobal = 0;
     originalDrawInstancedIndirect = nullptr;
     originalDrawIndexedInstancedIndirect = nullptr;
     originalDrawIndexedInstanced = nullptr;

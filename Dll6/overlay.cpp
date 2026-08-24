@@ -70,6 +70,7 @@ void RestorePresentHook() {
 
 void ShutdownOverlay() {
     SaveConfig();
+    RestoreWorldVisuals();
     freeCam = false;
     freeCamActive = false;
 
@@ -353,6 +354,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
                           previewLeft, previewTop, previewRight, previewBottom,
                           previewVisible);
     ApplyEnemyRadar(enemyRadarEnabled);
+    UpdateWorldVisuals();
     std::size_t sessionPlayerCount = 0;
     {
         std::lock_guard<std::mutex> lock(heroPawnsMutex);

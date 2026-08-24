@@ -139,6 +139,8 @@ bool IsXpOrbAlive(uintptr_t, uint32_t);
 bool InitializeRuntimeOffsets();
 bool InitializePatternOffsets();
 uintptr_t FindUniqueClientPattern(const char* pattern);
+uintptr_t ResolveRuntimeSchemaOffset(const char* className,
+                                     const char* fieldName);
 bool WriteResolvedOffsetSnapshot();
 extern bool runtimeOffsetsReady;
 extern std::string runtimeBuildKey;
@@ -168,6 +170,9 @@ bool InstallModelGlowHook(); void RemoveModelGlowHook();
 void UpdateRemSizedHull(); void RestoreRemSizedHull();
 BOOL CALLBACK FindGameWindowCallback(HWND,LPARAM); bool HookGameWindow(); uintptr_t ResolveEntity(uint32_t); uintptr_t ResolveEntityIndex(uint32_t); uint32_t FindEntityHandle(uintptr_t); bool GetEntityPosition(uintptr_t,Vector3&); bool GetEntityRenderPosition(uintptr_t,Vector3&); bool GetEntityRenderTransformPosition(uintptr_t,Vector3&); void RefreshFarmTargets(); DWORD WINAPI FarmTargetWorker(LPVOID); bool GetEntityScreenBounds(uintptr_t,const Vector3&,const Matrix4x4&,float&,float&,float&,float&); std::string GetEntityClassName(uintptr_t); bool NotifyGlowTypeChanged(uintptr_t); void ApplyHeroGlow(uintptr_t); void ApplyTrooperGlow(uintptr_t); void DiscoverHeroVTables(); void RefreshHeroPawns(); DWORD WINAPI HeroDiscoveryWorker(LPVOID); DWORD WINAPI GlowApplyWorker(LPVOID); bool IsCombatEntity(uintptr_t);
 void ApplyEnemyRadar(bool enabled);
+void UpdateWorldVisuals();
+void RestoreWorldVisuals();
+void RestoreWorldRenderState();
 void DebugEntityHandle(uint32_t);
 float GetClientGameTime();
 void SetMenuOpen(bool); bool InstallInputLockHooks(); void RemoveInputLockHooks(); std::vector<PlayerData> GetPlayers(); void RenderESP(const std::vector<PlayerData>&); void RenderMenu(size_t); void RestorePresentHook(); void ShutdownOverlay(); DWORD WINAPI UnloadThread(LPVOID); void RequestUnload(); HRESULT __stdcall hkPresent(IDXGISwapChain*,UINT,UINT); LRESULT __stdcall hkWndProc(HWND,UINT,WPARAM,LPARAM); void* DetourFunc(BYTE*,const BYTE*,const int); void SetupHooks(); DWORD WINAPI InitializeThread(LPVOID);
