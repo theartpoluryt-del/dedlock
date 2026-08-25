@@ -1,5 +1,8 @@
 #include "shared.h"
+#include "hero_scripts.h"
 #include "panorama_preview.h"
+#include "portable_paths.h"
+#include "resource.h"
 bool freeCam=false;
 bool freeCamActive=false;
 bool movementDiagnostics=false;
@@ -34,11 +37,14 @@ bool farmNormalActive = false;
 bool aimSilentActive = false;
 bool aimOnlyYaw = false;
 bool aimLockTarget = false;
+bool aimPrediction = false;
+bool antiFrog = false;
+float antiFrogHsThreshold = 45.0f;
 float aimHitchance = 100.0f;
 float aimPitchSmooth = 6.0f;
 float aimYawSmooth = 6.0f;
 AimSelectionMode aimSelectionMode = AimSelectionMode::Crosshair;
-AimTargetMode aimTargetMode = AimTargetMode::Closest;
+int aimBonesMask = AimBoneHead | AimBoneNeck | AimBoneTorso;
 int aimAssistKey = VK_RBUTTON;
 bool aimKeyCapture = false;
 int farmAssistKey = VK_XBUTTON1;
@@ -132,24 +138,37 @@ float lightColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
 float lightBrightness = 1.0f;
 float worldColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
 bool talonEspEnabled = false, campTimersEnabled = false,
-     campTimersOnScreen = true, campTimersOnMinimap = false;
+     campTimersOnScreen = true, campTimersOnMinimap = true;
 float talonEspColor[4] = {0.95f, 0.35f, 0.12f, 1.00f};
 float campTimerColor[4] = {1.00f, 0.82f, 0.20f, 1.00f};
+float campTimerMinimapSize = 15.0f;
+std::mutex campTimersMutex; std::vector<CampTimerData> campTimers;
 namespace {
 std::string ConfigPath() {
-    // Manual-map injectors do not register the image in the loader list, so
-    // GetModuleFileName(moduleHandle) can fail even though DllMain received a
-    // valid image base. The old relative fallback then read/wrote Dll6.ini in
-    // Deadlock's process working directory instead of next to the built DLL.
-    constexpr const char* StableConfigPath =
-        "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\Dll6.ini";
-    char modulePath[MAX_PATH]{};
-    if (!moduleHandle || !GetModuleFileNameA(moduleHandle, modulePath, MAX_PATH))
-        return StableConfigPath;
-    std::string path(modulePath);
-    const size_t separator = path.find_last_of("\\/");
-    if (separator == std::string::npos) return StableConfigPath;
-    return path.substr(0, separator + 1) + "Dll6.ini";
+    // A manual-mapped image has no loader path. LOCALAPPDATA is available for
+    // both LoadLibrary and manual-map injection and remains writable when the
+    // game itself is installed below Program Files.
+    return Dll6Paths::DataFileA("Dll6.ini");
+}
+
+bool ExtractBundledDefaultConfig(const std::string& path) {
+    const HRSRC resource = FindResourceW(
+        moduleHandle, MAKEINTRESOURCEW(IDR_DEFAULT_CONFIG), RT_RCDATA);
+    const HGLOBAL loaded = resource ? LoadResource(moduleHandle, resource) : nullptr;
+    const DWORD size = resource ? SizeofResource(moduleHandle, resource) : 0;
+    const void* bytes = loaded ? LockResource(loaded) : nullptr;
+    if (!bytes || !size) return false;
+
+    const HANDLE file = CreateFileA(
+        path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const bool success = WriteFile(file, bytes, size, &written, nullptr) &&
+                         written == size;
+    CloseHandle(file);
+    if (!success) DeleteFileA(path.c_str());
+    return success;
 }
 }
 
@@ -157,13 +176,19 @@ void LoadConfig() {
     const std::string path = ConfigPath();
     std::ifstream input(path);
     if (!input) {
-        // Materialize the defaults once so every later injection has a stable,
-        // editable config file instead of silently loading nothing.
-        SaveConfig();
-        return;
+        input.close();
+        input.clear();
+        if (ExtractBundledDefaultConfig(path)) input.open(path);
+        if (!input) {
+            // Resource extraction can fail only when the target directory is
+            // not writable. Preserve the compiled defaults in that case.
+            SaveConfig();
+            return;
+        }
     }
     std::string key;
     double number = 0.0;
+    bool loadedAimBonesMask = false;
     while (input >> key >> number) {
         const bool value = number != 0.0;
         if (key == "previewEnemyHero")
@@ -224,10 +249,9 @@ void LoadConfig() {
         else if (key == "creepEspMaxDistance") creepEspMaxDistance = static_cast<float>(number);
         else if (key == "orbEspMaxDistance") orbEspMaxDistance = static_cast<float>(number);
         else if (key == "powerupEspEnabled") powerupEspEnabled = value;
-        // Migrate old Chams presets to the ordinary Creep ESP switches.
-        else if (key == "enemyTrooperChams") creepEspEnabled = value;
-        else if (key == "allyTrooperChams") allyCreepEspEnabled = value;
-        else if (key == "neutralChams") neutralCreepEspEnabled = value;
+        else if (key == "enemyTrooperChams") enemyTrooperChams = value;
+        else if (key == "allyTrooperChams") allyTrooperChams = value;
+        else if (key == "neutralChams") neutralChams = value;
         else if (key == "fovChangerEnabled") fovChangerEnabled = value;
         else if (key == "overrideScopeFov") overrideScopeFov = value;
         else if (key == "cameraFov") cameraFov = static_cast<float>(number);
@@ -240,6 +264,9 @@ void LoadConfig() {
         else if (key == "campTimersEnabled") campTimersEnabled = value;
         else if (key == "campTimersOnScreen") campTimersOnScreen = value;
         else if (key == "campTimersOnMinimap") campTimersOnMinimap = value;
+        else if (key == "campTimerMinimapSize")
+            campTimerMinimapSize = std::clamp(static_cast<float>(number),
+                                              15.0f, 30.0f);
         else if (key == "drawTeammates") drawTeammates = value;
         else if (key == "drawPlayerNames") drawPlayerNames = value;
         else if (key == "cornerBoxes") cornerBoxes = value;
@@ -417,6 +444,10 @@ void LoadConfig() {
         else if (key == "aimMixedMode") aimMixedMode = value;
         else if (key == "aimOnlyYaw") aimOnlyYaw = value;
         else if (key == "aimLockTarget") aimLockTarget = value;
+        else if (key == "aimPrediction") aimPrediction = value;
+        else if (key == "antiFrog") antiFrog = value;
+        else if (key == "antiFrogHsThreshold")
+            antiFrogHsThreshold = std::clamp(static_cast<float>(number), 1.0f, 99.0f);
         else if (key == "aimVisibilityCheck") aimVisibilityCheck = value;
         else if (key == "aimToggleMode") aimToggleMode = value;
         if (key == "farmToggleMode") farmToggleMode = value;
@@ -434,8 +465,31 @@ void LoadConfig() {
         else if (key == "fovCircleAlpha") fovCircleAlpha = static_cast<float>(number);
         else if (key == "farmFovAlpha") farmFovAlpha = static_cast<float>(number);
         else if (key == "snaplineAlpha") snaplineAlpha = static_cast<float>(number);
-        else if (key == "aimTargetMode") aimTargetMode = static_cast<AimTargetMode>(static_cast<int>(number));
+        else if (key == "aimBonesMask") {
+            aimBonesMask = std::clamp(static_cast<int>(number), 1, AimBoneAll);
+            loadedAimBonesMask = true;
+        } else if (key == "aimTargetMode" && !loadedAimBonesMask) {
+            // One-time migration: Head, Body, Closest from older configs.
+            const int oldMode = static_cast<int>(number);
+            aimBonesMask = oldMode == 0 ? AimBoneHead
+                : oldMode == 1 ? AimBoneTorso
+                : AimBoneHead | AimBoneTorso;
+        }
         else if (key == "aimSelectionMode") aimSelectionMode = static_cast<AimSelectionMode>(static_cast<int>(number));
+        else if (key == "vindictaAutoSnipeEnabled") vindictaAutoSnipeEnabled = value;
+        else if (key == "hazeSleepDaggerEnabled") hazeSleepDaggerEnabled = value;
+        else if (key == "shivSerratedKnivesEnabled") shivSerratedKnivesEnabled = value;
+        else if (key == "heroScriptsShowFov") heroScriptsShowFov = value;
+        else if (key == "hazePredictionDot") hazePredictionDot = value;
+        else if (key == "vindictaSnipeFov") vindictaSnipeFov = std::clamp(static_cast<float>(number), 10.0f, 500.0f);
+        else if (key == "vindictaSnipeSmoothX") vindictaSnipeSmoothX = std::clamp(static_cast<float>(number), 1.0f, 30.0f);
+        else if (key == "vindictaSnipeSmoothY") vindictaSnipeSmoothY = std::clamp(static_cast<float>(number), 1.0f, 30.0f);
+        else if (key == "hazeDaggerFov") hazeDaggerFov = std::clamp(static_cast<float>(number), 10.0f, 500.0f);
+        else if (key == "hazeDaggerSmoothX") hazeDaggerSmoothX = std::clamp(static_cast<float>(number), 1.0f, 30.0f);
+        else if (key == "hazeDaggerSmoothY") hazeDaggerSmoothY = std::clamp(static_cast<float>(number), 1.0f, 30.0f);
+        else if (key == "shivKnivesFov") shivKnivesFov = std::clamp(static_cast<float>(number), 10.0f, 500.0f);
+        else if (key == "shivKnivesSmoothX") shivKnivesSmoothX = std::clamp(static_cast<float>(number), 1.0f, 30.0f);
+        else if (key == "shivKnivesSmoothY") shivKnivesSmoothY = std::clamp(static_cast<float>(number), 1.0f, 30.0f);
     }
     // The aim mode is a three-way choice, even though compatibility with old
     // configs stores it as two booleans. Mixed wins if an old build saved an
@@ -517,6 +571,7 @@ void SaveConfig() {
            << "campTimersEnabled " << campTimersEnabled << '\n'
            << "campTimersOnScreen " << campTimersOnScreen << '\n'
            << "campTimersOnMinimap " << campTimersOnMinimap << '\n'
+           << "campTimerMinimapSize " << campTimerMinimapSize << '\n'
            << "drawTeammates " << drawTeammates << '\n'
            << "drawPlayerNames " << drawPlayerNames << '\n'
            << "cornerBoxes " << cornerBoxes << '\n'
@@ -689,6 +744,9 @@ void SaveConfig() {
            << "aimMixedMode " << aimMixedMode << '\n'
            << "aimOnlyYaw " << aimOnlyYaw << '\n'
            << "aimLockTarget " << aimLockTarget << '\n'
+           << "aimPrediction " << aimPrediction << '\n'
+           << "antiFrog " << antiFrog << '\n'
+           << "antiFrogHsThreshold " << antiFrogHsThreshold << '\n'
            << "aimVisibilityCheck " << aimVisibilityCheck << '\n'
            << "aimToggleMode " << aimToggleMode << '\n'
            << "farmToggleMode " << farmToggleMode << '\n'
@@ -706,6 +764,20 @@ void SaveConfig() {
            << "fovCircleAlpha " << fovCircleAlpha << '\n'
            << "farmFovAlpha " << farmFovAlpha << '\n'
            << "snaplineAlpha " << snaplineAlpha << '\n'
-           << "aimTargetMode " << static_cast<int>(aimTargetMode) << '\n'
+           << "aimBonesMask " << (aimBonesMask & AimBoneAll) << '\n'
            << "aimSelectionMode " << static_cast<int>(aimSelectionMode) << '\n';
+    output << "vindictaAutoSnipeEnabled " << vindictaAutoSnipeEnabled << '\n'
+           << "hazeSleepDaggerEnabled " << hazeSleepDaggerEnabled << '\n'
+           << "shivSerratedKnivesEnabled " << shivSerratedKnivesEnabled << '\n'
+           << "heroScriptsShowFov " << heroScriptsShowFov << '\n'
+           << "hazePredictionDot " << hazePredictionDot << '\n'
+           << "vindictaSnipeFov " << vindictaSnipeFov << '\n'
+           << "vindictaSnipeSmoothX " << vindictaSnipeSmoothX << '\n'
+           << "vindictaSnipeSmoothY " << vindictaSnipeSmoothY << '\n'
+           << "hazeDaggerFov " << hazeDaggerFov << '\n'
+           << "hazeDaggerSmoothX " << hazeDaggerSmoothX << '\n'
+           << "hazeDaggerSmoothY " << hazeDaggerSmoothY << '\n'
+           << "shivKnivesFov " << shivKnivesFov << '\n'
+           << "shivKnivesSmoothX " << shivKnivesSmoothX << '\n'
+           << "shivKnivesSmoothY " << shivKnivesSmoothY << '\n';
 }

@@ -1,4 +1,5 @@
 #include "shared.h"
+#include "hero_scripts.h"
 #include "menu_d2d.h"
 #include "preview_3d.h"
 #include "panorama_preview.h"
@@ -60,6 +61,8 @@ struct Renderer {
     int lastDisplayedPreviewHeroId = 0;
     int pendingFallbackHeroId = 0;
     int pendingFallbackFrames = 0;
+    int previewValidationHeroId = 0;
+    int previewValidationFrames = 0;
     ComPtr<ID2D1Bitmap> tabIcons[4];
     ComPtr<ID2D1Bitmap> previewAbilityIcons[4];
     ComPtr<ID2D1Bitmap> previewHeroPortraits[38];
@@ -94,6 +97,7 @@ struct Renderer {
     int tab = 0;
     int visualTeam = 0;
     int aimSubtab = 0;
+    int scriptHero = 0;
     int openCombo = 0;
     float pageAlpha = 1.0f;
     float pageShift = 0.0f;
@@ -220,7 +224,11 @@ bool Contains(const D2D1_RECT_F& r, const D2D1_POINT_2F& p) {
 }
 
 float ColumnScroll(float x) {
-    return x < 655.0f ? g.leftColumnScroll : g.rightColumnScroll;
+    // Every page is laid out to fit in the fixed menu frame. Keeping this at
+    // zero also prevents a previously scrolled page from shifting controls
+    // over section headings after switching tabs.
+    (void)x;
+    return 0.0f;
 }
 
 float ScrolledY(float x, float y) {
@@ -592,6 +600,44 @@ void DrawCombo(const Layout& l, int id, float x, float y, float width,
     }
 }
 
+void DrawAimBoneSelector(const Layout& l, float x, float y, float width) {
+    aimBonesMask &= AimBoneAll;
+    if (!aimBonesMask) aimBonesMask = AimBoneHead;
+    if (antiFrog && (aimBonesMask & ~AimBoneHead) == 0)
+        aimBonesMask |= AimBoneNeck;
+
+    NoteContent(x, y + 64.0f);
+    y = ScrolledY(x, y);
+    Text(L"Target bones", Rect(x + 10, y + 2, x + width, y + 26),
+         g.regular.Get(), White());
+    static constexpr const wchar_t* labels[]{
+        L"Head", L"Neck", L"Torso", L"Arms", L"Legs"};
+    static constexpr int bits[]{
+        AimBoneHead, AimBoneNeck, AimBoneTorso, AimBoneArms, AimBoneLegs};
+    constexpr float gap = 6.0f;
+    const float itemWidth = (width - gap * 4.0f) / 5.0f;
+    for (int index = 0; index < 5; ++index) {
+        const float left = x + index * (itemWidth + gap);
+        const D2D1_RECT_F item = Rect(left, y + 31, left + itemWidth, y + 61);
+        const bool selected = (aimBonesMask & bits[index]) != 0;
+        if (ColumnVisible(x, y, 64.0f) && !g.colorPopup && !g.openCombo &&
+            Clicked(l, item)) {
+            int next = aimBonesMask ^ bits[index];
+            if (next != 0) {
+                if (antiFrog && (next & ~AimBoneHead) == 0)
+                    next |= AimBoneNeck;
+                aimBonesMask = next & AimBoneAll;
+            }
+        }
+        FillRounded(item, 5, selected
+            ? Color(Red().r, Red().g, Red().b, 0.22f)
+            : Color(0.075f, 0.078f, 0.094f));
+        StrokeRounded(item, 5, selected ? Red(0.72f) : Border(), 0.9f);
+        Text(labels[index], item, g.centered.Get(),
+             selected ? White() : Muted());
+    }
+}
+
 void DrawColorSetting(const Layout& l, float x, float y, float width,
                       const wchar_t* label, const wchar_t* description,
                       float* colorValue) {
@@ -675,6 +721,48 @@ void DrawHeroCombo(const Layout& l, int id, float x, float y, float width,
     }
 }
 
+void DrawScriptHeroSelector(const Layout& l, float x, float y, float width) {
+    static constexpr int heroIds[]{3, 13, 19};
+    static constexpr const wchar_t* names[]{L"Vindicta", L"Haze", L"Shiv"};
+    const bool enabled[]{vindictaAutoSnipeEnabled, hazeSleepDaggerEnabled,
+                         shivSerratedKnivesEnabled};
+    constexpr float gap = 8.0f;
+    const float itemWidth = (width - gap * 2.0f) / 3.0f;
+    g.scriptHero = std::clamp(g.scriptHero, 0, 2);
+    for (int index = 0; index < 3; ++index) {
+        const float left = x + index * (itemWidth + gap);
+        const D2D1_RECT_F card = Rect(left, y, left + itemWidth, y + 112.0f);
+        const bool selected = g.scriptHero == index;
+        if (!g.colorPopup && !g.openCombo && Clicked(l, card)) {
+            g.scriptHero = index;
+            g.pageAlpha = 0.0f;
+            g.pageShift = 6.0f;
+        }
+        FillRounded(card, 7, selected
+            ? Color(Red().r, Red().g, Red().b, 0.16f)
+            : Color(0.050f, 0.053f, 0.065f, 0.92f));
+        StrokeRounded(card, 7, selected ? Red(0.72f) : Border(), 1.0f);
+        const int portraitIndex = PreviewHeroIndex(heroIds[index]);
+        if (g.previewHeroPortraits[portraitIndex]) {
+            g.target->DrawBitmap(g.previewHeroPortraits[portraitIndex].Get(),
+                                 Rect(left + 13, y + 8,
+                                      left + itemWidth - 13, y + 78),
+                                 selected ? 1.0f : 0.76f,
+                                 D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        }
+        SetBrush(enabled[index] ? Color(0.27f, 0.85f, 0.51f, 0.95f)
+                                : Color(0.36f, 0.38f, 0.43f, 0.90f));
+        g.target->FillEllipse(D2D1::Ellipse(
+            D2D1::Point2F(card.right - 12.0f, card.top + 12.0f), 3.5f, 3.5f),
+            g.brush.Get());
+        Text(names[index], Rect(left + 2, y + 80, left + itemWidth - 2, y + 108),
+             g.centered.Get(), selected ? White() : Muted());
+        if (selected)
+            FillRounded(Rect(left + 14, y + 108, left + itemWidth - 14, y + 110),
+                        1.0f, Red(0.92f));
+    }
+}
+
 void DrawEspChip(const Layout& l, float x, float y, float width,
                  const wchar_t* label, bool* value,
                  const float* colorValue = nullptr) {
@@ -739,6 +827,13 @@ void DrawNavigationIcon(int variant, float x, float y, bool selected) {
         g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 4, 10),
                               g.brush.Get(), 1.2f);
         Line(D2D1::Point2F(x - 9, y), D2D1::Point2F(x + 9, y), c, 1.2f);
+        return;
+    }
+    if (variant == 7) {                                             // Scripts
+        Line(D2D1::Point2F(x - 10, y - 7), D2D1::Point2F(x - 3, y), c, 1.6f);
+        Line(D2D1::Point2F(x - 3, y), D2D1::Point2F(x - 10, y + 7), c, 1.6f);
+        Line(D2D1::Point2F(x + 10, y - 7), D2D1::Point2F(x + 3, y), c, 1.6f);
+        Line(D2D1::Point2F(x + 3, y), D2D1::Point2F(x + 10, y + 7), c, 1.6f);
         return;
     }
     DrawTabIcon(2, x, y, selected);                                 // Misc
@@ -1423,6 +1518,112 @@ bool LoadPanoramaFallbackBitmap(int heroId, ComPtr<ID2D1Bitmap>& output) {
     return true;
 }
 
+bool PanoramaTextureLooksLikePortrait(
+        ID3D11Texture2D* texture, ID3D11DeviceContext* context,
+        const std::array<Preview3DPoint, 18>& skeleton) {
+    if (!texture || !context) return false;
+
+    float left = 1.0f, top = 1.0f, right = 0.0f, bottom = 0.0f;
+    size_t visibleJoints = 0;
+    for (const Preview3DPoint& point : skeleton) {
+        if (!point.visible || !std::isfinite(point.x) ||
+            !std::isfinite(point.y) || point.x < -0.10f || point.x > 1.10f ||
+            point.y < -0.10f || point.y > 1.10f) {
+            continue;
+        }
+        left = (std::min)(left, point.x);
+        top = (std::min)(top, point.y);
+        right = (std::max)(right, point.x);
+        bottom = (std::max)(bottom, point.y);
+        ++visibleJoints;
+    }
+    if (visibleJoints < 6 || right - left < 0.06f || right - left > 0.82f ||
+        bottom - top < 0.20f || bottom - top > 0.98f) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC source{};
+    texture->GetDesc(&source);
+    const bool bgra = source.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                      source.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    const bool rgba = source.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                      source.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    if ((!bgra && !rgba) || source.SampleDesc.Count != 1 ||
+        !source.Width || !source.Height) {
+        return false;
+    }
+    if (!g.previewReadbackTexture ||
+        g.previewReadbackWidth != source.Width ||
+        g.previewReadbackHeight != source.Height ||
+        g.previewReadbackFormat != source.Format) {
+        g.previewReadbackTexture.Reset();
+        ComPtr<ID3D11Device> device;
+        texture->GetDevice(device.GetAddressOf());
+        if (!device) return false;
+        D3D11_TEXTURE2D_DESC staging = source;
+        staging.Usage = D3D11_USAGE_STAGING;
+        staging.BindFlags = 0;
+        staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        staging.MiscFlags = 0;
+        if (FAILED(device->CreateTexture2D(
+                &staging, nullptr, g.previewReadbackTexture.GetAddressOf()))) {
+            return false;
+        }
+        g.previewReadbackWidth = source.Width;
+        g.previewReadbackHeight = source.Height;
+        g.previewReadbackFormat = source.Format;
+    }
+
+    context->CopyResource(g.previewReadbackTexture.Get(), texture);
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context->Map(g.previewReadbackTexture.Get(), 0,
+                            D3D11_MAP_READ, 0, &mapped))) {
+        return false;
+    }
+
+    // The portrait scene deliberately has a black backdrop. A leaked game
+    // backbuffer (street, HUD, weapon, etc.) has detail across the whole
+    // texture. Validate the area outside the padded skeleton bounds and also
+    // require visible hero pixels inside it.
+    const float paddedLeft = std::clamp(left - 0.10f, 0.0f, 1.0f);
+    const float paddedTop = std::clamp(top - 0.08f, 0.0f, 1.0f);
+    const float paddedRight = std::clamp(right + 0.10f, 0.0f, 1.0f);
+    const float paddedBottom = std::clamp(bottom + 0.06f, 0.0f, 1.0f);
+    unsigned outsideSamples = 0, darkOutsideSamples = 0;
+    unsigned insideSamples = 0, litInsideSamples = 0;
+    constexpr unsigned grid = 32;
+    for (unsigned gy = 0; gy < grid; ++gy) {
+        const float ny = (static_cast<float>(gy) + 0.5f) / grid;
+        const UINT y = (std::min)(source.Height - 1,
+            static_cast<UINT>(ny * source.Height));
+        const auto* row = static_cast<const uint8_t*>(mapped.pData) +
+            static_cast<size_t>(y) * mapped.RowPitch;
+        for (unsigned gx = 0; gx < grid; ++gx) {
+            const float nx = (static_cast<float>(gx) + 0.5f) / grid;
+            const UINT x = (std::min)(source.Width - 1,
+                static_cast<UINT>(nx * source.Width));
+            const uint8_t* pixel = row + static_cast<size_t>(x) * 4;
+            const unsigned r = rgba ? pixel[0] : pixel[2];
+            const unsigned green = pixel[1];
+            const unsigned b = rgba ? pixel[2] : pixel[0];
+            const unsigned luminance = (r * 54 + green * 183 + b * 19) / 256;
+            const bool inside = nx >= paddedLeft && nx <= paddedRight &&
+                                ny >= paddedTop && ny <= paddedBottom;
+            if (inside) {
+                ++insideSamples;
+                if (luminance > 28) ++litInsideSamples;
+            } else {
+                ++outsideSamples;
+                if (luminance <= 24) ++darkOutsideSamples;
+            }
+        }
+    }
+    context->Unmap(g.previewReadbackTexture.Get(), 0);
+    return outsideSamples && insideSamples &&
+        darkOutsideSamples * 100 >= outsideSamples * 72 &&
+        litInsideSamples * 100 >= insideSamples * 4;
+}
+
 void LoadEmbeddedAssets() {
     LoadEmbeddedBitmap(IDR_DEADLOCK_LOGO, g.logoBitmap);
     const UINT iconIds[4]{IDR_ICON_EYE, IDR_ICON_CROSSHAIR,
@@ -2072,8 +2273,27 @@ void RenderD2DMenu(std::size_t playerCount) {
         std::array<Preview3DPoint, 18> liveSkeleton{};
         const bool liveSkeletonReady = panoramaTexture &&
             GetPanoramaPreviewSkeleton(liveSkeleton.data(), liveSkeleton.size());
-        if (!liveSkeletonReady)
+        const bool portraitReady = liveSkeletonReady &&
+            PanoramaTextureLooksLikePortrait(panoramaTexture, pContext,
+                                             liveSkeleton);
+        if (!portraitReady) {
+            g.previewValidationHeroId = previewHeroId;
+            g.previewValidationFrames = 0;
             panoramaTexture = nullptr;
+        } else {
+            if (g.previewValidationHeroId != previewHeroId) {
+                g.previewValidationHeroId = previewHeroId;
+                g.previewValidationFrames = 1;
+            } else {
+                g.previewValidationFrames = (std::min)(
+                    g.previewValidationFrames + 1, 3);
+            }
+            // Panorama's pose data can lead the copied render target by one
+            // or two Presents. Keep the packaged hero fallback visible until
+            // three consecutive texture frames pass validation.
+            if (g.previewValidationFrames < 3)
+                panoramaTexture = nullptr;
+        }
         g.previewUsesPersistedFallback = false;
         if (!panoramaTexture) {
             // This is a D2D copy of a frame that was actually displayed by
@@ -2309,13 +2529,15 @@ void RenderD2DMenu(std::size_t playerCount) {
     nav(L"Creep aim", 390, 4, g.tab == 1 && g.aimSubtab != 0, [&] { g.tab = 1; g.aimSubtab = 1; });
     section(L"MISCELLANEOUS", 456);
     nav(L"Misc", 480, 6, g.tab == 2, [&] { g.tab = 2; });
+    section(L"HEROES", 546);
+    nav(L"Scripts", 570, 7, g.tab == 3, [&] { g.tab = 3; });
 
     const float contentX = 349.0f + g.pageShift;
     const wchar_t* pageTitle = g.tab == 0 ? (g.visualTeam == 0 ? L"Enemy" :
                                              g.visualTeam == 1 ? L"Ally" :
                                              g.visualTeam == 2 ? L"Creep" : L"World") :
                                 g.tab == 1 ? (g.aimSubtab == 0 ? L"Player aim" : L"Creep aim") :
-                                             L"Misc";
+                                g.tab == 3 ? L"Scripts" : L"Misc";
     Text(pageTitle, Rect(contentX, 83, 700, 113), g.title.Get(),
          Color(White().r, White().g, White().b, g.pageAlpha));
 
@@ -2356,20 +2578,11 @@ void RenderD2DMenu(std::size_t playerCount) {
     const float firstY = cardTop;
 
     const float viewportTop = cardTop;
-    const bool mouseInColumnViewport =
-        l.mouse.y >= viewportTop && l.mouse.y <= contentPanelBottom;
-    const float previousLeftMax = ColumnMaxScroll(g.leftContentBottom);
-    const float previousRightMax = ColumnMaxScroll(g.rightContentBottom);
-    if (mouseInColumnViewport && io.MouseWheel != 0.0f && !g.openCombo) {
-        const float scrollStep = 72.0f * io.MouseWheel;
-        if (l.mouse.x >= leftX && l.mouse.x < rightX)
-            g.leftColumnScroll = std::clamp(g.leftColumnScroll + scrollStep,
-                                            -previousLeftMax, 0.0f);
-        else if (l.mouse.x >= rightX && l.mouse.x <= 996.0f)
-            g.rightColumnScroll = std::clamp(g.rightColumnScroll + scrollStep,
-                                             -previousRightMax, 0.0f);
-    }
-    if (!l.down) g.activeScrollColumn = 0;
+    // The menu intentionally has no scrollbars or wheel scrolling. All
+    // controls use the fixed design grid below.
+    g.leftColumnScroll = 0.0f;
+    g.rightColumnScroll = 0.0f;
+    g.activeScrollColumn = 0;
     g.leftContentBottom = viewportTop;
     g.rightContentBottom = viewportTop;
 
@@ -2407,6 +2620,18 @@ void RenderD2DMenu(std::size_t playerCount) {
                    0.0f, 50.0f, L"%.2f");
         DrawColorSetting(l, rightX, firstY + 256, rightColumnWidth,
                          L"World Color", L"World geometry tint", worldColor);
+        DrawSectionHeading(rightX, firstY + 350, rightColumnWidth, L"Camp Timers");
+        DrawToggle(l, rightX, firstY + 390, rightColumnWidth,
+                   L"Enabled", L"Track cleared neutral camps", &campTimersEnabled,
+                   campTimerColor);
+        DrawToggle(l, rightX, firstY + 444, rightColumnWidth,
+                   L"On screen", L"Show the timer at each camp", &campTimersOnScreen);
+        DrawToggle(l, rightX, firstY + 498, rightColumnWidth,
+                   L"On minimap", L"Draw countdowns over neutral camp icons",
+                   &campTimersOnMinimap);
+        DrawSlider(l, rightX, firstY + 552, rightColumnWidth,
+                   L"Minimap timer size", &campTimerMinimapSize,
+                   15.0f, 30.0f, L"%.0f px");
     } else if (g.tab == 0) {
         bool* teamEsp = g.visualTeam == 0 ? &enemyEspEnabled :
                         g.visualTeam == 1 ? &allyEspEnabled : &creepEspEnabled;
@@ -2571,24 +2796,35 @@ void RenderD2DMenu(std::size_t playerCount) {
                 DrawSlider(l, leftX, firstY + 590 + radarOffset, fullWidth, L"Corner length",
                            teamCornerLength, 0.10f, 0.35f, L"%.2f");
             } else {
-                DrawSectionHeading(leftX, firstY + 18, fullWidth, L"General");
-                DrawToggle(l, leftX, firstY + 58, fullWidth,
+                // Split Creep controls into two fixed columns. The former
+                // single-column layout exceeded the menu frame after the
+                // three chams toggles were added and required scrolling.
+                DrawSectionHeading(leftX, firstY + 18, leftColumnWidth, L"General");
+                DrawToggle(l, leftX, firstY + 58, leftColumnWidth,
                            L"Enable ESP", L"", teamEsp);
-                DrawToggle(l, leftX, firstY + 112, fullWidth,
+                DrawToggle(l, leftX, firstY + 112, leftColumnWidth,
                            L"Ally", L"Show ESP on allied creeps", &allyCreepEspEnabled);
-                DrawToggle(l, leftX, firstY + 166, fullWidth,
+                DrawToggle(l, leftX, firstY + 166, leftColumnWidth,
+                           L"Neutral", L"Show ESP on neutral creeps", &neutralCreepEspEnabled);
+                DrawToggle(l, leftX, firstY + 220, leftColumnWidth,
                            L"Orb ESP", L"Show active soul orbs", &drawOrbEsp);
-                DrawSlider(l, leftX, firstY + 224, fullWidth,
+                DrawSlider(l, leftX, firstY + 292, leftColumnWidth,
                            L"Creep max distance", teamMaxDistance,
                            10.0f, 500.0f, L"%.0f m");
-                DrawSlider(l, leftX, firstY + 294, fullWidth,
+                DrawSlider(l, leftX, firstY + 362, leftColumnWidth,
                            L"Orb max distance", &orbEspMaxDistance,
                            10.0f, 500.0f, L"%.0f m");
-                DrawSectionHeading(leftX, firstY + 376, fullWidth, L"Appearance");
-                DrawSlider(l, leftX, firstY + 416, fullWidth, L"Box thickness",
-                           teamBoxThickness, 0.5f, 4.0f, L"%.2f px");
-                DrawSlider(l, leftX, firstY + 486, fullWidth, L"Corner length",
-                           teamCornerLength, 0.10f, 0.35f, L"%.2f");
+
+                DrawSectionHeading(rightX, firstY + 18, rightColumnWidth, L"Visible Chams");
+                DrawToggle(l, rightX, firstY + 58, rightColumnWidth,
+                           L"Enemy", L"Apply visible chams to enemy creeps",
+                           &enemyTrooperChams, enemyTrooperChamsColor);
+                DrawToggle(l, rightX, firstY + 112, rightColumnWidth,
+                           L"Ally", L"Apply visible chams to allied creeps",
+                           &allyTrooperChams, allyTrooperChamsColor);
+                DrawToggle(l, rightX, firstY + 166, rightColumnWidth,
+                           L"Neutral", L"Apply visible chams to neutral creeps",
+                           &neutralChams, neutralChamsColor);
             }
         }
     } else if (g.tab == 1) {
@@ -2613,11 +2849,7 @@ void RenderD2DMenu(std::size_t playerCount) {
         DrawCombo(l, 102, leftX, firstY + 239, columnWidth, L"Activation",
                   &bindMode, bindModes, 2);
         aimToggleMode = bindMode == 1;
-        int targetMode = static_cast<int>(aimTargetMode);
-        const wchar_t* targets[] = {L"Head", L"Body", L"Closest"};
-        DrawCombo(l, 103, rightX, firstY, rightColumnWidth, L"Target point",
-                  &targetMode, targets, 3);
-        aimTargetMode = static_cast<AimTargetMode>(std::clamp(targetMode, 0, 2));
+        DrawAimBoneSelector(l, rightX, firstY, rightColumnWidth);
         int selectionMode = static_cast<int>(aimSelectionMode);
         const wchar_t* selections[] = {L"Crosshair", L"Distance", L"Health"};
         DrawCombo(l, 104, rightX, firstY + 73, rightColumnWidth, L"Target selection",
@@ -2644,14 +2876,21 @@ void RenderD2DMenu(std::size_t playerCount) {
         DrawSectionHeading(leftX, firstY + 322, columnWidth, L"Accuracy");
         DrawSlider(l, leftX, firstY + 363, columnWidth, L"Hitchance",
                    &aimHitchance, 0.0f, 100.0f, L"%.0f%%");
+        DrawToggle(l, leftX, firstY + 441, columnWidth, L"Anti-Frog",
+                   L"Control headshot rate with neck and body aim", &antiFrog);
+        if (antiFrog)
+            DrawSlider(l, leftX, firstY + 495, columnWidth, L"HS threshold",
+                       &antiFrogHsThreshold, 1.0f, 99.0f, L"%.0f%%");
         DrawSectionHeading(rightX, firstY + 390, rightColumnWidth, L"Behavior");
         DrawToggle(l, rightX, firstY + 431, rightColumnWidth, L"Only Yaw",
                    L"Adjust horizontal aim only", &aimOnlyYaw);
         DrawToggle(l, rightX, firstY + 485, rightColumnWidth, L"Lock Target",
                    L"Keep the current target while valid", &aimLockTarget);
-        DrawToggle(l, rightX, firstY + 539, rightColumnWidth, L"Draw FOV circle",
+        DrawToggle(l, rightX, firstY + 539, rightColumnWidth, L"Prediction",
+                   L"Lead moving targets using live bullet speed", &aimPrediction);
+        DrawToggle(l, rightX, firstY + 593, rightColumnWidth, L"Draw FOV circle",
                    L"Show active target radius", &drawFovCircle);
-        DrawSlider(l, rightX, firstY + 593, rightColumnWidth, L"FOV opacity",
+        DrawSlider(l, rightX, firstY + 647, rightColumnWidth, L"FOV opacity",
                    &fovCircleAlpha, 0.0f, 255.0f, L"%.0f");
         }
         } else if (g.aimSubtab == 99) {
@@ -2731,6 +2970,68 @@ void RenderD2DMenu(std::size_t playerCount) {
                             &autoLastHitOrbsKeyCapture);
             }
         }
+    } else if (g.tab == 3) {
+        DrawSectionHeading(leftX, firstY + 18, columnWidth, L"Heroes");
+        DrawScriptHeroSelector(l, leftX, firstY + 58, columnWidth);
+        DrawSectionHeading(leftX, firstY + 202, columnWidth, L"Scripts");
+        const wchar_t* scriptNames[]{L"Auto Snipe", L"Sleep Dagger", L"Serrated Knives"};
+        const wchar_t* descriptionLine1[]{
+            L"Auto-fires lethal Snipe.",
+            L"Predicts dagger flight.",
+            L"Aims Serrated Knives."};
+        const wchar_t* descriptionLine2[]{
+            L"Uses live damage values.",
+            L"Targets nearest to crosshair.",
+            L"Casts when aligned."};
+        const D2D1_RECT_F scriptCard = Rect(leftX, firstY + 246,
+                                            leftX + columnWidth, firstY + 352);
+        FillRounded(scriptCard, 7, Color(Red().r, Red().g, Red().b, 0.12f));
+        StrokeRounded(scriptCard, 7, Red(0.58f), 1.0f);
+        SetBrush(Red());
+        g.target->FillEllipse(D2D1::Ellipse(
+            D2D1::Point2F(scriptCard.left + 19, scriptCard.top + 25), 4, 4),
+            g.brush.Get());
+        Text(scriptNames[g.scriptHero],
+             Rect(scriptCard.left + 34, scriptCard.top + 7,
+                  scriptCard.right - 8, scriptCard.top + 36),
+             g.semibold.Get(), White());
+        Text(descriptionLine1[g.scriptHero],
+             Rect(scriptCard.left + 12, scriptCard.top + 39,
+                  scriptCard.right - 8, scriptCard.top + 66),
+             g.regular.Get(), Muted(0.82f));
+        Text(descriptionLine2[g.scriptHero],
+             Rect(scriptCard.left + 12, scriptCard.top + 68,
+                  scriptCard.right - 8, scriptCard.top + 95),
+             g.regular.Get(), Muted(0.82f));
+
+        DrawSectionHeading(rightX, firstY + 18, rightColumnWidth, L"Settings");
+        bool* enabled = g.scriptHero == 0 ? &vindictaAutoSnipeEnabled :
+                        g.scriptHero == 1 ? &hazeSleepDaggerEnabled :
+                                            &shivSerratedKnivesEnabled;
+        float* fov = g.scriptHero == 0 ? &vindictaSnipeFov :
+                     g.scriptHero == 1 ? &hazeDaggerFov : &shivKnivesFov;
+        float* smoothX = g.scriptHero == 0 ? &vindictaSnipeSmoothX :
+                         g.scriptHero == 1 ? &hazeDaggerSmoothX : &shivKnivesSmoothX;
+        float* smoothY = g.scriptHero == 0 ? &vindictaSnipeSmoothY :
+                         g.scriptHero == 1 ? &hazeDaggerSmoothY : &shivKnivesSmoothY;
+        DrawToggle(l, rightX, firstY + 58, rightColumnWidth,
+                   L"Enabled", L"Enable this hero script", enabled);
+        DrawToggle(l, rightX, firstY + 112, rightColumnWidth,
+                   L"Show FOV", L"Draw the active script radius", &heroScriptsShowFov);
+        const bool hazeTab = g.scriptHero == 1;
+        if (hazeTab) {
+            DrawToggle(l, rightX, firstY + 166, rightColumnWidth,
+                       L"Prediction dot",
+                       L"Show the point where Sleep Dagger is aimed",
+                       &hazePredictionDot);
+        }
+        const float controlsOffset = hazeTab ? 54.0f : 0.0f;
+        DrawSlider(l, rightX, firstY + 180 + controlsOffset, rightColumnWidth,
+                   L"Target FOV", fov, 10.0f, 500.0f, L"%.0f px");
+        DrawSlider(l, rightX, firstY + 258 + controlsOffset, rightColumnWidth,
+                   L"Pitch smoothing", smoothX, 1.0f, 30.0f, L"%.1f");
+        DrawSlider(l, rightX, firstY + 336 + controlsOffset, rightColumnWidth,
+                   L"Yaw smoothing", smoothY, 1.0f, 30.0f, L"%.1f");
     } else if (g.tab == 99) {
         DrawToggle(l, leftX, firstY, columnWidth, L"Creep aim",
                    L"Enable creep targeting", &farmAssist);
@@ -2814,15 +3115,6 @@ void RenderD2DMenu(std::size_t playerCount) {
         if (Clicked(l, unload)) RequestUnload();
     }
 
-    const float leftMax = ColumnMaxScroll(g.leftContentBottom);
-    const float rightMax = ColumnMaxScroll(g.rightContentBottom);
-    g.leftColumnScroll = std::clamp(g.leftColumnScroll, -leftMax, 0.0f);
-    g.rightColumnScroll = std::clamp(g.rightColumnScroll, -rightMax, 0.0f);
-    DrawColumnScrollbar(l, 642.0f, viewportTop, g.leftContentBottom,
-                        g.leftColumnScroll);
-    DrawColumnScrollbar(l, visualEditor ? 1422.0f : 984.0f,
-                        viewportTop, g.rightContentBottom,
-                        g.rightColumnScroll);
     g.target->PopAxisAlignedClip();
     DrawPopup(l);
     DrawMenuSettingsPanel(settingsLayout);
@@ -2831,8 +3123,6 @@ void RenderD2DMenu(std::size_t playerCount) {
         aimMixedMode = popupSelectionValue == 2;
     } else if (popupSelectionId == 102) {
         aimToggleMode = popupSelectionValue == 1;
-    } else if (popupSelectionId == 103) {
-        aimTargetMode = static_cast<AimTargetMode>(std::clamp(popupSelectionValue, 0, 2));
     } else if (popupSelectionId == 104) {
         aimSelectionMode = static_cast<AimSelectionMode>(std::clamp(popupSelectionValue, 0, 2));
     } else if (popupSelectionId == 301) {

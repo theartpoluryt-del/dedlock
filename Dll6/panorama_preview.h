@@ -33,4 +33,5 @@ void ReportPanoramaPreviewGlowRegistration(bool success);
 void ReportPanoramaPreviewBinding(bool success);
 void ProcessPanoramaPreviewUiThread();
 void SetPanoramaRadarEnabled(bool enabled);
+void SetPanoramaCampTimersEnabled(bool enabled);
 void ShutdownPanoramaPreview();

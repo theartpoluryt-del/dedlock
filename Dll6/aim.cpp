@@ -1,4 +1,5 @@
 #include "shared.h"
+#include "portable_paths.h"
 #include <cstring>
 #include <fstream>
 #include <random>
@@ -369,7 +370,7 @@ bool ResolveNativeVisibility() {
         nativeVisibility.managerGlobal;
 
     std::ofstream log(
-        "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\visibility_runtime.log",
+        Dll6Paths::DataFileA("visibility_runtime.log"),
         std::ios::app);
     if (log) {
         log << "trace=0x" << std::hex
@@ -764,7 +765,7 @@ bool CaptureDepthSnapshot() {
         if (depthDiagnosticState == state) return;
         depthDiagnosticState = state;
         FILE* file = nullptr;
-        if (fopen_s(&file, "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\visibility_runtime.log", "a") == 0 && file) {
+        if (fopen_s(&file, Dll6Paths::DataFileA("visibility_runtime.log").c_str(), "a") == 0 && file) {
             fprintf(file, "depth_state=%d\\n", state);
             fclose(file);
         }
@@ -881,7 +882,7 @@ bool CaptureDepthSnapshot() {
             }
         }
         FILE* file = nullptr;
-        if (fopen_s(&file, "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\visibility_runtime.log", "a") == 0 && file) {
+        if (fopen_s(&file, Dll6Paths::DataFileA("visibility_runtime.log").c_str(), "a") == 0 && file) {
             fprintf(file, "depth_range format=%u min=%.6f max=%.6f populated=%u\\n",
                     static_cast<unsigned>(depthFormat), minDepth, maxDepth, populated);
             fclose(file);
@@ -1007,7 +1008,7 @@ bool IsDepthPointVisible(const Vector3& point) {
     if (!sampled) {
         if (logVisibility) {
             FILE* file = nullptr;
-            if (fopen_s(&file, "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\visibility_runtime.log", "a") == 0 && file) {
+            if (fopen_s(&file, Dll6Paths::DataFileA("visibility_runtime.log").c_str(), "a") == 0 && file) {
                 fprintf(file, "vis sampled=0 target=%.6f screen=%.1f,%.1f depth=%ux%u\\n",
                         comparisonTargetDepth, screenX, screenY,
                         depthWidth, depthHeight);
@@ -1021,7 +1022,7 @@ bool IsDepthPointVisible(const Vector3& point) {
     const bool visible = matched;
     if (logVisibility) {
         FILE* file = nullptr;
-        if (fopen_s(&file, "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\visibility_runtime.log", "a") == 0 && file) {
+        if (fopen_s(&file, Dll6Paths::DataFileA("visibility_runtime.log").c_str(), "a") == 0 && file) {
             fprintf(file, "vis sampled=1 target=%.6f scene=%.6f matched=%d result=%d screen=%.1f,%.1f depth=%ux%u\\n",
                     comparisonTargetDepth, firstSceneDepth, matched ? 1 : 0,
                     visible ? 1 : 0, screenX, screenY, depthWidth, depthHeight);
@@ -1311,6 +1312,19 @@ uintptr_t lockedAimTarget = 0;
 Vector3 cachedVisibleAimPoint{};
 bool cachedVisibleAimReady = false;
 
+std::mutex antiFrogStateMutex;
+int antiFrogDamageHits = 0;
+int antiFrogHeadHits = 0;
+float antiFrogHeadshotPercent = 0.0f;
+bool antiFrogBodySlot = false;
+bool antiFrogNeckSlot = false;
+int antiFrogSlotRemaining = 0;
+
+bool AntiFrogUsesBodySlot() {
+    std::lock_guard<std::mutex> lock(antiFrogStateMutex);
+    return antiFrogBodySlot;
+}
+
 bool RollHitchance() {
     if (aimHitchance >= 99.99f) return true;
     if (aimHitchance <= 0.01f) return false;
@@ -1319,6 +1333,96 @@ bool RollHitchance() {
     return distribution(generator) <= std::clamp(aimHitchance, 0.0f, 100.0f);
 }
 
+}
+
+void ResetAntiFrogStats() {
+    std::lock_guard<std::mutex> lock(antiFrogStateMutex);
+    antiFrogDamageHits = 0;
+    antiFrogHeadHits = 0;
+    antiFrogHeadshotPercent = 0.0f;
+    antiFrogBodySlot = false;
+    antiFrogNeckSlot = false;
+    antiFrogSlotRemaining = 0;
+}
+
+void NotifyAntiFrogDamage(int attackerEntityIndex, int victimEntityIndex,
+                          int hitgroupId) {
+    if (hitgroupId <= 0 || !currentLocalPawn) return;
+
+    uint32_t localHandle = currentLocalPawnHandle;
+    if (localHandle == 0 || localHandle == 0xFFFFFFFFu) {
+        localHandle = FindEntityHandle(currentLocalPawn);
+        if (localHandle != 0 && localHandle != 0xFFFFFFFFu)
+            currentLocalPawnHandle = localHandle;
+    }
+    if (localHandle == 0 || localHandle == 0xFFFFFFFFu ||
+        attackerEntityIndex != static_cast<int>(
+            localHandle & Offsets::HandleIndexMask)) {
+        return;
+    }
+
+    const uintptr_t victim = ResolveEntityIndex(
+        static_cast<uint32_t>(victimEntityIndex));
+    if (!victim) return;
+    const std::string victimClass = GetEntityClassName(victim);
+    if (victimClass.find("CitadelPlayerPawn") == std::string::npos)
+        return;
+
+    std::lock_guard<std::mutex> lock(antiFrogStateMutex);
+    ++antiFrogDamageHits;
+    if (hitgroupId == 1)
+        ++antiFrogHeadHits;
+    antiFrogHeadshotPercent = antiFrogDamageHits > 0
+        ? static_cast<float>(antiFrogHeadHits) /
+            static_cast<float>(antiFrogDamageHits) * 100.0f
+        : 0.0f;
+    if (!antiFrog || --antiFrogSlotRemaining > 0)
+        return;
+
+    const float threshold = std::clamp(antiFrogHsThreshold, 1.0f, 99.0f);
+    const float ratio = antiFrogHeadshotPercent / threshold;
+    thread_local std::mt19937 generator(std::random_device{}());
+    std::uniform_real_distribution<float> probability(0.0f, 1.0f);
+    const float roll = probability(generator);
+    antiFrogBodySlot = false;
+    antiFrogNeckSlot = false;
+
+    if (ratio >= 0.8f && ratio < 1.0f) {
+        const float neckChance = (ratio - 0.8f) / 0.2f * 0.35f;
+        antiFrogNeckSlot = roll < neckChance;
+    } else if (ratio >= 1.0f && ratio < 1.2f) {
+        const float neckChance = 0.35f +
+            (ratio - 1.0f) / 0.2f * 0.30f;
+        const float bodyChance =
+            (ratio - 1.0f) / 0.2f * 0.20f;
+        if (roll < bodyChance)
+            antiFrogBodySlot = true;
+        else if (roll < bodyChance + neckChance)
+            antiFrogNeckSlot = true;
+    } else if (ratio >= 1.2f) {
+        if (roll < 0.75f)
+            antiFrogBodySlot = true;
+        else if (roll < 0.90f)
+            antiFrogNeckSlot = true;
+    }
+
+    std::uniform_int_distribution<int> bodyLength(2, 4);
+    std::uniform_int_distribution<int> neckLength(3, 5);
+    antiFrogSlotRemaining = antiFrogBodySlot
+        ? bodyLength(generator) : neckLength(generator);
+}
+
+float GetAntiFrogHeadshotPercent() {
+    std::lock_guard<std::mutex> lock(antiFrogStateMutex);
+    return antiFrogHeadshotPercent;
+}
+
+const char* GetAntiFrogSlotLabel() {
+    std::lock_guard<std::mutex> lock(antiFrogStateMutex);
+    // The reference removes Head unconditionally while Anti-Frog is enabled;
+    // its light slot therefore resolves to Neck even when its old overlay
+    // called that state HEAD.
+    return antiFrogBodySlot ? "BODY" : "NECK";
 }
 
 void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
@@ -1372,25 +1476,48 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         const float modelHeight = player.modelHeight > 20.0f ? player.modelHeight : 80.0f;
         const float modelMinZ = std::isfinite(player.modelMinZ) ? player.modelMinZ : 0.0f;
         const float fallbackHead = modelMinZ + modelHeight * 0.92f;
+        const float fallbackNeck = modelMinZ + modelHeight * 0.82f;
         const float fallbackBody = modelMinZ + modelHeight * 0.62f;
         const float headHeight = ResolveAimHeightFromBox(player, 0.12f, fallbackHead);
+        const float neckHeight = ResolveAimHeightFromBox(player, 0.24f, fallbackNeck);
         const float bodyHeight = ResolveAimHeightFromBox(player, 0.60f, fallbackBody);
-        const float centerHeight = ResolveAimHeightFromBox(player, 0.50f, modelMinZ + modelHeight * 0.50f);
         const Vector3 fallbackHeadPoint{ player.pos.x, player.pos.y, player.pos.z + headHeight };
+        const Vector3 fallbackNeckPoint{ player.pos.x, player.pos.y, player.pos.z + neckHeight };
         const Vector3 fallbackBodyPoint{ player.pos.x, player.pos.y, player.pos.z + bodyHeight };
-        const Vector3 fallbackCenterPoint{ player.pos.x, player.pos.y, player.pos.z + centerHeight };
         struct AimCandidate { Vector3 point; bool bone; };
-        AimCandidate candidates[3]{};
+        AimCandidate candidates[8]{};
         int candidateCount = 0;
-        if (aimTargetMode == AimTargetMode::Head) {
-            candidates[candidateCount++] = { player.hasHeadBone ? player.headPos : fallbackHeadPoint, player.hasHeadBone };
-        } else if (aimTargetMode == AimTargetMode::Body) {
-            candidates[candidateCount++] = { player.hasBodyBone ? player.bodyPos : fallbackBodyPoint, player.hasBodyBone };
-        } else {
-            if (player.hasHeadBone) candidates[candidateCount++] = { player.headPos, true };
-            if (player.hasBodyBone) candidates[candidateCount++] = { player.bodyPos, true };
-            if (candidateCount == 0) candidates[candidateCount++] = { fallbackCenterPoint, false };
+        int effectiveMask = aimBonesMask & AimBoneAll;
+        if (!effectiveMask)
+            effectiveMask = AimBoneHead;
+        if (antiFrog) {
+            // Match Andromeda: Anti-Frog never aims at Head. A heavy slot also
+            // removes Neck, leaving the user's selected body/limb points.
+            effectiveMask &= ~AimBoneHead;
+            if (AntiFrogUsesBodySlot())
+                effectiveMask &= ~AimBoneNeck;
+            if (!effectiveMask)
+                effectiveMask = AimBoneAll & ~AimBoneHead;
         }
+        if (effectiveMask & AimBoneHead) {
+            candidates[candidateCount++] = { player.hasHeadBone ? player.headPos : fallbackHeadPoint, player.hasHeadBone };
+        }
+        if (effectiveMask & AimBoneNeck) {
+            candidates[candidateCount++] = { player.hasNeckBone ? player.neckPos : fallbackNeckPoint, player.hasNeckBone };
+        }
+        if (effectiveMask & AimBoneTorso) {
+            candidates[candidateCount++] = { player.hasBodyBone ? player.bodyPos : fallbackBodyPoint, player.hasBodyBone };
+        }
+        if ((effectiveMask & AimBoneArms) && player.hasLeftArmBone)
+            candidates[candidateCount++] = { player.leftArmPos, true };
+        if ((effectiveMask & AimBoneArms) && player.hasRightArmBone)
+            candidates[candidateCount++] = { player.rightArmPos, true };
+        if ((effectiveMask & AimBoneLegs) && player.hasLeftLegBone)
+            candidates[candidateCount++] = { player.leftLegPos, true };
+        if ((effectiveMask & AimBoneLegs) && player.hasRightLegBone)
+            candidates[candidateCount++] = { player.rightLegPos, true };
+        if (candidateCount == 0)
+            continue;
         bool targetVisible = false;
         Vector2 visibleAimScreen{};
         Vector3 visibleAimPoint{};
@@ -1471,6 +1598,13 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         ResetNormalMouseAim();
         ClearPendingSilentAngles();
         return;
+    }
+    if (aimPrediction) {
+        // Keep target selection and visibility on the current rendered bone,
+        // then lead only the final command/camera point. This avoids making
+        // FOV selection jump ahead of a fast target.
+        bestAimPoint = PredictPlayerAimPoint(
+            best->entity, bestAimPoint, best->worldPos);
     }
     humanAimTargetFound = true;
     {

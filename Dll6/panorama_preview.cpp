@@ -2,6 +2,7 @@
 #include "panorama_preview.h"
 #include "preview_3d.h"
 #include "resource.h"
+#include "portable_paths.h"
 
 #include <MinHook.h>
 #include <dxgi.h>
@@ -75,6 +76,10 @@ std::atomic<int> requestedRadarState{0};
 // loop from a previous manual-map injection alive when Radar was already off.
 std::atomic<int> appliedRadarState{-1};
 std::atomic<bool> radarUiRequestQueued{false};
+std::atomic<int> requestedCampTimerState{0};
+std::atomic<int> appliedCampTimerState{-1};
+std::atomic<bool> campTimerUiRequestQueued{false};
+std::atomic<uint64_t> requestedCampTimerSnapshotHash{0};
 bool radarStyleResourcesReady = false;
 ULONGLONG lastInitializeAttemptAt = 0;
 ULONGLONG lastSpawnAttemptAt = 0;
@@ -111,8 +116,7 @@ std::atomic<uint64_t> failedBindingSerial{0};
 uintptr_t configuredPortraitCamera = 0;
 float configuredPortraitFov = 0.0f;
 std::mutex logMutex;
-std::string logPath =
-    "C:\\Users\\artpo\\source\\repos\\Dll6\\x64\\Release\\panorama_preview.log";
+std::string logPath = Dll6Paths::DataFileA("panorama_preview.log");
 
 void ProcessPendingUiWork(uintptr_t engine, uintptr_t contextPanel);
 void Log(const char* message);
@@ -425,6 +429,133 @@ bool RunPanoramaScript(uintptr_t engine, uintptr_t contextPanel,
     return RunPanoramaScriptOnUiThread(engine, contextPanel, script);
 }
 
+bool ApplyCampTimerUiState(uintptr_t engine, uintptr_t contextPanel,
+                           bool enabled) {
+    std::string initialTimers = "[";
+    if (enabled) {
+        std::vector<CampTimerData> timers;
+        {
+            std::lock_guard lock(campTimersMutex);
+            timers = campTimers;
+        }
+        const float now = GetCampGameTime();
+        for (const CampTimerData& camp : timers) {
+            if (camp.respawnAt <= now) continue;
+            const char* type = camp.campClass == 34 ? "neutral_weak" :
+                camp.campClass == 35 ? "neutral_medium" :
+                camp.campClass == 36 ? "neutral_large" :
+                camp.campClass == 37 ? "neutral_vault" : nullptr;
+            if (!type) continue;
+            char item[192]{};
+            std::snprintf(item, sizeof(item),
+                "%s{t:'%s',x:%.6f,y:%.6f,r:%.3f}",
+                initialTimers.size() > 1 ? "," : "", type,
+                static_cast<float>(camp.mapX) / 255.0f,
+                static_cast<float>(camp.mapY) / 255.0f,
+                camp.respawnAt - now);
+            initialTimers += item;
+        }
+    }
+    initialTimers += "]";
+
+    char script[12000]{};
+    std::snprintf(script, sizeof(script), R"JS(
+(function(){
+var r=$.GetContextPanel();while(r.GetParent())r=r.GetParent();
+r.__dll6CampTimerToken=(r.__dll6CampTimerToken||0)+1;
+var token=r.__dll6CampTimerToken;
+var old=r.FindChildTraverse('Dll6_camp_timer_overlay');
+if(old)old.DeleteAsync(0);
+if(!%d){r.__dll6CampTimerStates={};return;}
+var states={};r.__dll6CampTimerStates=states;
+var initial=%s;
+var duration={neutral_weak:85,neutral_medium:290,neutral_large:335,neutral_vault:300};
+function typeOf(b){
+ if(b.BHasClass('neutral_weak'))return 'neutral_weak';
+ if(b.BHasClass('neutral_medium'))return 'neutral_medium';
+ if(b.BHasClass('neutral_large'))return 'neutral_large';
+ if(b.BHasClass('neutral_vault'))return 'neutral_vault';return '';
+}
+function parseTime(v){
+ var s=String(v||''),c=s.indexOf(':');if(c<0)return 0;
+ var m=0,n=0,k;
+ for(var i=0;i<c;i++){k=s.charCodeAt(i);if(k>=48&&k<=57)m=m*10+k-48;}
+ for(var j=c+1,q=0;j<s.length&&q<2;j++,q++){
+  k=s.charCodeAt(j);if(k>=48&&k<=57)n=n*10+k-48;else break;}
+ return m*60+(n>59?n%%60:n);
+}
+function gameTime(){
+ try{var top=r.FindChildTraverse('TopBar');
+  var p=top?top.FindChildrenWithClassTraverse('GameTime'):null;
+  return p&&p.length?parseTime(p[0].text):0;}catch(e){return 0;}
+}
+function initialRemaining(t,x,y){
+ var best=999,remaining=0;
+ for(var i=0;i<initial.length;i++){var a=initial[i];if(a.t!==t)continue;
+  var d1=(a.x-x)*(a.x-x)+(a.y-y)*(a.y-y);
+  var d2=(1-a.x-x)*(1-a.x-x)+(1-a.y-y)*(1-a.y-y);
+  var d=Math.min(d1,d2);if(d<best){best=d;remaining=a.r;}}
+ return best<999?remaining:0;
+}
+function loop(){
+ if(r.__dll6CampTimerToken!==token)return;
+ var mm=r.FindChildTraverse('hud_minimap');
+ if(!mm){$.Schedule(.25,loop);return;}
+ var box=r.FindChildTraverse('minimap_container');
+ if(!box){$.Schedule(.25,loop);return;}
+ var layer=box.FindChildTraverse('Dll6_camp_timer_overlay');
+ if(!layer){layer=$.CreatePanel('Panel',box,'Dll6_camp_timer_overlay');
+  layer.hittest=false;layer.hittestchildren=false;
+  layer.style.width='100%%';layer.style.height='100%%';
+  layer.style.position='0px 0px 0px';layer.style.overflow='noclip';
+  layer.style.zIndex='2000';}
+ var w=mm.actuallayoutwidth||mm.contentwidth||1;
+ var h=mm.actuallayoutheight||mm.contentheight||1;
+ var now=gameTime();var buttons=[];
+ try{buttons=mm.FindChildrenWithClassTraverse('map_button')||[];}catch(e){}
+ for(var i=0;i<buttons.length;i++){
+  var b=buttons[i],t=typeOf(b);if(!t)continue;
+  var x=b.actualxoffset,y=b.actualyoffset;
+  if(!isFinite(x)||!isFinite(y))continue;
+  var key=(b.id||t+'_'+Math.round(x)+'_'+Math.round(y));
+  var active=b.BHasClass('active'),s=states[key];
+  if(!s){s={active:active,end:0,label:null};states[key]=s;
+   if(!active){var ir=initialRemaining(t,x/w,y/h);if(ir>0)s.end=now+ir;}}
+  if(s.active&&!active)s.end=now+(duration[t]||0);
+  if(active)s.end=0;s.active=active;
+  if(s.end>now){
+   var id='Dll6_camp_'+key.replace(/[^a-zA-Z0-9_]/g,'_');
+   var l=layer.FindChildTraverse(id);
+   if(!l){l=$.CreatePanel('Label',layer,id);l.hittest=false;
+    l.style.width='62px';l.style.height='22px';l.style.textAlign='center';
+    l.style.fontSize='13px';l.style.fontWeight='bold';
+    l.style.color='#ffd13cff';l.style.backgroundColor='#05080cd9';
+    l.style.border='1px solid #ffd13ccc';l.style.borderRadius='4px';
+    l.style.textShadow='1px 1px 2px 2 #000000ff';l.style.zIndex='2001';}
+   l.style.position=((x/w)*100)+'%% '+((y/h)*100)+'%% 0px';
+   l.style.transform='translate3d(-31px,-11px,0px)';
+   var rem=Math.max(0,Math.ceil(s.end-now));
+   l.text=Math.floor(rem/60)+':'+('0'+(rem%%60)).slice(-2);
+  }else{
+   var dead=layer.FindChildTraverse('Dll6_camp_'+key.replace(/[^a-zA-Z0-9_]/g,'_'));
+   if(dead)dead.DeleteAsync(0);
+  }
+ }
+ $.Schedule(.2,loop);
+}
+loop();
+})();
+)JS", enabled ? 1 : 0, initialTimers.c_str());
+    const bool applied = RunPanoramaScript(engine, contextPanel, script);
+    char message[192]{};
+    std::snprintf(message, sizeof(message),
+                  "[CAMP_TIMERS] PanoramaState=%s InitialBytes=%zu Run=%s",
+                  enabled ? "ON" : "OFF", initialTimers.size(),
+                  applied ? "PASS" : "FAIL");
+    Log(message);
+    return applied;
+}
+
 HeroPanelStatus ConfigureHeroPanel(uintptr_t panel) {
     if (!panel) {
         Log("HeroScenePanelCreate hook did not capture a panel");
@@ -726,6 +857,7 @@ void InvalidatePanelState(uintptr_t engine, uintptr_t contextPanel) {
     // particular, Radar OFF must cancel a scheduled loop left by an older
     // injected image; that loop lives in Panorama, not in this DLL.
     appliedRadarState.store(-1, std::memory_order_release);
+    appliedCampTimerState.store(-1, std::memory_order_release);
     settleFrames.store(0, std::memory_order_release);
     captureReleasePending.store(true, std::memory_order_release);
     Log("Panorama context changed; preview state invalidated");
@@ -744,6 +876,17 @@ void ProcessPendingUiWork(uintptr_t engine, uintptr_t contextPanel) {
         // engine pointers. Radar is handled by the FOW path in entities.cpp.
         appliedRadarState.store(radarState, std::memory_order_release);
         radarUiRequestQueued.store(false, std::memory_order_release);
+    }
+    const int campTimerState = requestedCampTimerState.load(
+        std::memory_order_acquire);
+    if (campTimerState != appliedCampTimerState.load(
+            std::memory_order_acquire)) {
+        if (!ApplyCampTimerUiState(engine, contextPanel,
+                                   campTimerState != 0))
+            return;
+        appliedCampTimerState.store(campTimerState,
+                                    std::memory_order_release);
+        campTimerUiRequestQueued.store(false, std::memory_order_release);
     }
     const uint64_t generation = requestedGeneration.load(std::memory_order_acquire);
     const bool visible = requestedVisible.load(std::memory_order_acquire);
@@ -929,6 +1072,49 @@ bool HasVisibleCapturePixels(ID3D11Device* device,
     return visible;
 }
 
+int PanoramaFallbackResourceIndex(int heroId) {
+    switch (heroId) {
+        case 1: return 0; case 2: return 1; case 3: return 2;
+        case 4: return 3; case 6: return 4; case 7: return 5;
+        case 8: return 6; case 10: return 7; case 11: return 8;
+        case 12: return 9; case 13: return 10; case 14: return 11;
+        case 15: return 12; case 16: return 13; case 17: return 14;
+        case 18: return 15; case 19: return 16; case 20: return 17;
+        case 25: return 18; case 27: return 19; case 31: return 20;
+        case 35: return 21; case 50: return 22; case 52: return 23;
+        case 58: return 24; case 60: return 25; case 63: return 26;
+        case 64: return 27; case 65: return 28; case 66: return 29;
+        case 67: return 30; case 69: return 31; case 72: return 32;
+        case 76: return 33; case 77: return 34; case 79: return 35;
+        case 80: return 36; case 81: return 37;
+        default: return -1;
+    }
+}
+
+bool ExtractPanoramaFallbackResource(int resourceId,
+                                     const std::wstring& outputPath) {
+    const HRSRC resource = FindResourceW(
+        moduleHandle, MAKEINTRESOURCEW(resourceId), RT_RCDATA);
+    const HGLOBAL loaded = resource ? LoadResource(moduleHandle, resource) : nullptr;
+    const DWORD size = resource ? SizeofResource(moduleHandle, resource) : 0;
+    const void* bytes = loaded ? LockResource(loaded) : nullptr;
+    if (!bytes || !size) return false;
+
+    // Packaged fallback frames are the immutable source of truth. Always
+    // redeploy them before loading so a stale/bad capture from an older DLL
+    // cannot survive reinjection and appear as the hero preview.
+    const HANDLE file = CreateFileW(
+        outputPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const bool success = WriteFile(file, bytes, size, &written, nullptr) &&
+                         written == size;
+    CloseHandle(file);
+    if (!success) DeleteFileW(outputPath.c_str());
+    return success;
+}
+
 std::wstring BuildPanoramaFallbackPath(int heroId) {
     const wchar_t* name = L"unknown";
     switch (heroId) {
@@ -953,11 +1139,19 @@ std::wstring BuildPanoramaFallbackPath(int heroId) {
         case 80: name = L"silver"; break; case 81: name = L"celeste"; break;
         case 55: name = L"trooper"; break;
     }
-    wchar_t path[MAX_PATH]{};
-    std::swprintf(path, std::size(path),
-                  L"C:\\Users\\artpo\\source\\repos\\Dll6\\work\\merge-main-codex\\Dll6\\assets\\panorama_fallback\\%s.png",
-                  name);
-    return path;
+    const std::wstring stem(name);
+    const std::wstring pngPath =
+        Dll6Paths::DataFileW((stem + L".png").c_str());
+    const int resourceIndex = PanoramaFallbackResourceIndex(heroId);
+    if (resourceIndex >= 0) {
+        CreateDirectoryW(Dll6Paths::DataDirectoryW().c_str(), nullptr);
+        ExtractPanoramaFallbackResource(
+            IDR_PANORAMA_FALLBACK_BASE + resourceIndex * 2, pngPath);
+        ExtractPanoramaFallbackResource(
+            IDR_PANORAMA_FALLBACK_BASE + resourceIndex * 2 + 1,
+            Dll6Paths::DataFileW((stem + L".esp").c_str()));
+    }
+    return pngPath;
 }
 
 std::wstring BuildPanoramaFallbackMetadataPath(int heroId) {
@@ -1024,9 +1218,7 @@ bool SaveCaptureAsPng(ID3D11Device* device, ID3D11DeviceContext* context,
     if (GetFileAttributesW(output.c_str()) != INVALID_FILE_ATTRIBUTES) {
         return true;
     }
-    CreateDirectoryW(
-        L"C:\\Users\\artpo\\source\\repos\\Dll6\\work\\merge-main-codex\\Dll6\\assets\\panorama_fallback",
-        nullptr);
+    CreateDirectoryW(Dll6Paths::DataDirectoryW().c_str(), nullptr);
     D3D11_TEXTURE2D_DESC desc{};
     captureTexture->GetDesc(&desc);
     const bool rgba = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
@@ -1777,6 +1969,36 @@ void SetPanoramaRadarEnabled(bool enabled) {
         radarUiRequestQueued.store(false, std::memory_order_release);
 }
 
+void SetPanoramaCampTimersEnabled(bool enabled) {
+    const int requested = enabled ? 1 : 0;
+    requestedCampTimerState.store(requested, std::memory_order_release);
+    uint64_t snapshotHash = enabled ? 1469598103934665603ull : 0;
+    if (enabled) {
+        const float now = GetCampGameTime();
+        std::lock_guard lock(campTimersMutex);
+        for (const CampTimerData& camp : campTimers) {
+            if (camp.respawnAt <= now) continue;
+            snapshotHash ^= camp.id;
+            snapshotHash *= 1099511628211ull;
+        }
+    }
+    const bool snapshotChanged =
+        requestedCampTimerSnapshotHash.exchange(
+            snapshotHash, std::memory_order_acq_rel) != snapshotHash;
+    if (snapshotChanged) {
+        appliedCampTimerState.store(-1, std::memory_order_release);
+        campTimerUiRequestQueued.store(false, std::memory_order_release);
+    }
+    if (!initialized.load(std::memory_order_acquire) ||
+        appliedCampTimerState.load(std::memory_order_acquire) == requested ||
+        campTimerUiRequestQueued.exchange(true, std::memory_order_acq_rel))
+        return;
+    if (gameWindow)
+        PostMessageW(gameWindow, PanoramaPreviewUiMessage, 0, 0);
+    else
+        campTimerUiRequestQueued.store(false, std::memory_order_release);
+}
+
 void ShutdownPanoramaPreview() {
     // The Panorama source is an independent game panel.  Remove it while the
     // RunScript hook is still live; otherwise it can outlast an unload as a
@@ -1789,6 +2011,7 @@ void ShutdownPanoramaPreview() {
 var p=r.FindChildTraverse('Dll6_esp_preview');if(p)p.DeleteAsync(0);})();
 )JS";
         RunPanoramaScript(engine, contextPanel, removePreviewScript);
+        ApplyCampTimerUiState(engine, contextPanel, false);
     }
     if (runScriptTarget) {
         MH_DisableHook(runScriptTarget);
@@ -1826,6 +2049,10 @@ var p=r.FindChildTraverse('Dll6_esp_preview');if(p)p.DeleteAsync(0);})();
     requestedRadarState.store(0, std::memory_order_release);
     appliedRadarState.store(0, std::memory_order_release);
     radarUiRequestQueued.store(false, std::memory_order_release);
+    requestedCampTimerState.store(0, std::memory_order_release);
+    appliedCampTimerState.store(0, std::memory_order_release);
+    campTimerUiRequestQueued.store(false, std::memory_order_release);
+    requestedCampTimerSnapshotHash.store(0, std::memory_order_release);
     appliedHeroId.store(0, std::memory_order_release);
     enemyHeroId.store(1, std::memory_order_release);
     allyHeroId.store(1, std::memory_order_release);

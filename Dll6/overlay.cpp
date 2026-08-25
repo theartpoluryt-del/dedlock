@@ -1,4 +1,6 @@
 #include "shared.h"
+#include "hero_scripts.h"
+#include "portable_paths.h"
 #include <fstream>
 #include <MinHook.h>
 #include "menu_d2d.h"
@@ -122,6 +124,7 @@ void ShutdownOverlay() {
         Write<float>(entity + Offsets::GlowBackfaceMult, 1.0f);
     }
 
+    ResetHeroScripts();
     RemoveUserCmdHook();
     RemoveInputLockHooks();
     RemoveSoundEventHook();
@@ -209,7 +212,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     if (!presentMarkerWritten) {
         presentMarkerWritten = true;
         std::ofstream marker(
-            "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\Dll6_present.marker",
+            Dll6Paths::DataFileA("Dll6_present.marker"),
             std::ios::trunc);
         if (marker) marker << "hkPresent reached\n";
     }
@@ -224,6 +227,16 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             if (thread) CloseHandle(thread);
         }
         return result;
+    }
+
+    // Persist changes even if the game or mapper terminates without running
+    // the normal DLL shutdown path. This is deliberately infrequent so it
+    // cannot affect frame time or continuously write to disk.
+    static ULONGLONG lastConfigSaveAt = 0;
+    const ULONGLONG configSaveNow = GetTickCount64();
+    if (configSaveNow - lastConfigSaveAt >= 2000) {
+        lastConfigSaveAt = configSaveNow;
+        SaveConfig();
     }
 
     if (!pDevice) {
@@ -330,6 +343,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     // Never retain a previous visual frame. At 144 Hz, the old 150 ms grace
     // period could redraw the same moving position for more than 20 Presents.
     visualSnapshot = GetPlayers();
+    UpdateHeroScriptTargets(visualSnapshot);
     // Human aim follows the same coherent visual sample every render frame.
     // A fixed 16 ms acquisition gate visibly stair-steps on 120/144/240 Hz.
     AimAtClosestEnemy(visualSnapshot);
@@ -340,6 +354,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         lastAuxiliaryUpdate = now;
     }
     RenderESP(visualSnapshot);
+    DrawHeroScriptsOverlay();
     // Target acquisition and visibility tracing are bounded above. Camera
     // interpolation remains per-frame; the gameplay camera hook consumes it.
     UpdateVisibleAimCamera();
@@ -353,6 +368,10 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     UpdatePanoramaPreview(pSwapChain, pContext,
                           previewLeft, previewTop, previewRight, previewBottom,
                           previewVisible);
+    // Camp timers are rendered by the D3D overlay.  Panorama RunScript is not
+    // available in every live match (notably after reconnect/map reload),
+    // which made the minimap markers disappear completely.
+    SetPanoramaCampTimersEnabled(false);
     ApplyEnemyRadar(enemyRadarEnabled);
     UpdateWorldVisuals();
     std::size_t sessionPlayerCount = 0;
@@ -418,7 +437,8 @@ LRESULT __stdcall hkWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
 
-    if (uMsg == WM_KEYUP && wParam == VK_INSERT) {
+    if (uMsg == WM_KEYUP &&
+        (wParam == VK_INSERT || wParam == VK_PRIOR)) {
         SetMenuOpen(!menuOpen);
         return 0;
     }

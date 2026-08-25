@@ -1,4 +1,5 @@
 #include "shared.h"
+#include "portable_paths.h"
 
 #include <MinHook.h>
 #include <cstdint>
@@ -13,11 +14,12 @@
 // The protobuf type and its generated implementation are kept in the work
 // tree supplied with this project. They are the same CMsgSosStartSoundEvent
 // used by the original ParseMessage hook.
-#include "C:/Users/artpo/source/repos/Dll6/Dll6/work/Andromeda-DeadLock-Base-1.2.0/Andromeda-DeadLock-Base/Andromeda-DeadLock/DeadLock/Protobuf/gameevents.pb.h"
+#include "protobuf/gameevents.pb.h"
 
 namespace {
 
 constexpr uint16_t kSosStartSoundEvent = 208;
+constexpr uint16_t kCitadelDamageMessage = 300;
 constexpr uintptr_t kParseMessageProtobufOffset = 0x30;
 constexpr char kParseMessagePattern[] = "40 56 57 41 57 48 83 EC ? 4C 8B F9";
 
@@ -26,6 +28,7 @@ ParseMessageFn originalParseMessage = nullptr;
 void* parseMessageTarget = nullptr;
 bool soundHookInstalled = false;
 volatile LONG soundParsingDisabled = 0;
+volatile LONG damageParsingDisabled = 0;
 std::mutex soundLogMutex;
 std::mutex soundCacheMutex;
 std::unordered_map<uint32_t, bool> meleeSoundHashCache;
@@ -47,7 +50,7 @@ void CacheMeleeSound(uint32_t hash, bool isMeleeCharge) {
 
 void LogSound(const char* message) {
     std::lock_guard<std::mutex> lock(soundLogMutex);
-    std::ofstream log("C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\sound_hook.log", std::ios::app);
+    std::ofstream log(Dll6Paths::DataFileA("sound_hook.log"), std::ios::app);
     if (log) log << message << '\n';
 }
 
@@ -189,9 +192,55 @@ void TryHandleSoundMessage(uintptr_t serializer, uintptr_t netMessage) {
     if (isMeleeCharge) NotifyParrySound(sourceEntity, kMeleeChargeSound);
 }
 
+void HandleDamageMessageUnsafe(uintptr_t serializer, uintptr_t netMessage) {
+    if (Read<uint16_t>(serializer + 0x28) != kCitadelDamageMessage)
+        return;
+    // The reference hook receives a fully decoded protobuf object at
+    // netMessage + 0x30. Reflection lets us read the three fields used by
+    // Anti-Frog without importing the archive's 2 MB generated message unit
+    // and all of its unrelated GC dependencies.
+    auto* message = reinterpret_cast<google::protobuf::Message*>(
+        netMessage + kParseMessageProtobufOffset);
+    const auto* descriptor = message->GetDescriptor();
+    const auto* reflection = message->GetReflection();
+    if (!descriptor || !reflection ||
+        descriptor->name() != "CCitadelUserMessage_Damage") {
+        return;
+    }
+    const auto* attacker = descriptor->FindFieldByName("entindex_attacker");
+    const auto* victim = descriptor->FindFieldByName("entindex_victim");
+    const auto* hitgroup = descriptor->FindFieldByName("hitgroup_id");
+    if (!attacker || !victim || !hitgroup ||
+        !reflection->HasField(*message, attacker) ||
+        !reflection->HasField(*message, victim) ||
+        !reflection->HasField(*message, hitgroup)) {
+        return;
+    }
+    NotifyAntiFrogDamage(
+        reflection->GetInt32(*message, attacker),
+        reflection->GetInt32(*message, victim),
+        reflection->GetInt32(*message, hitgroup));
+}
+
+void TryHandleDamageMessage(uintptr_t serializer, uintptr_t netMessage) {
+    if (InterlockedCompareExchange(&damageParsingDisabled, 0, 0) != 0 ||
+        !IsReadable(serializer, 0x2A) ||
+        !IsReadable(netMessage + kParseMessageProtobufOffset)) {
+        return;
+    }
+    __try {
+        HandleDamageMessageUnsafe(serializer, netMessage);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&damageParsingDisabled, 1);
+        LogSound("damage parser exception; Anti-Frog events disabled");
+    }
+}
+
 bool __fastcall HookParseMessage(uintptr_t demoRecorder, uintptr_t serializer, uintptr_t netMessage) {
-    if (serializer && netMessage)
+    if (serializer && netMessage) {
         TryHandleSoundMessage(serializer, netMessage);
+        TryHandleDamageMessage(serializer, netMessage);
+    }
     return originalParseMessage ? originalParseMessage(demoRecorder, serializer, netMessage) : false;
 }
 

@@ -156,7 +156,9 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="framework.h" />
+    <ClInclude Include="hero_scripts.h" />
     <ClInclude Include="menu_d2d.h" />
+    <ClInclude Include="portable_paths.h" />
     <ClInclude Include="preview_3d.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="shared.h" />
@@ -181,6 +183,7 @@
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="globals.cpp" />
+    <ClCompile Include="hero_scripts.cpp" />
     <ClCompile Include="aim.cpp" />
     <ClCompile Include="parry.cpp" />
     <ClCompile Include="entities.cpp" />

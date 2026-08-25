@@ -1,4 +1,5 @@
 #include "shared.h"
+#include "portable_paths.h"
 #include <MinHook.h>
 #include <array>
 #include <atomic>
@@ -159,7 +160,7 @@ struct alignas(8) MaterialDescriptorCopy {
 
 void LogGlowHook(const char* message) {
     std::ofstream log(
-        "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\model_glow.log",
+        Dll6Paths::DataFileA("model_glow.log"),
         std::ios::app);
     if (log) log << message << '\n';
 }
@@ -1312,7 +1313,10 @@ void** __fastcall HookDrawModel(
     thread_local std::array<SavedChamsMesh, 256> savedChams{};
     size_t savedChamsCount = 0;
 
-    const bool anyVisibleChams = enemyChamsEnabled || allyChamsEnabled;
+    const bool anyTrooperChams = enemyTrooperChams || allyTrooperChams ||
+                                 neutralChams;
+    const bool anyVisibleChams = enemyChamsEnabled || allyChamsEnabled ||
+                                 anyTrooperChams;
     const bool anyInvisibleChams = enemyInvisibleChamsEnabled ||
                                    allyInvisibleChamsEnabled;
     if ((anyVisibleChams || anyInvisibleChams) && flatChamsMaterial &&
@@ -1382,6 +1386,18 @@ void** __fastcall HookDrawModel(
                         invisibleColor[2], 1.0f};
                     evaluatedVisibleColor = GlowPackedColor(visibleComponents);
                     evaluatedInvisibleColor = GlowPackedColor(invisibleComponents);
+                } else if (anyTrooperChams) {
+                    // Troopers use the same visible flat-material pass as
+                    // heroes. Their owner is not in heroPawns, so resolve
+                    // their per-team tint separately.
+                    const float* trooperTint = GetTrooperChamsTint(cached.pawn);
+                    if (trooperTint) {
+                        const float components[4] = {
+                            trooperTint[0], trooperTint[1],
+                            trooperTint[2], 1.0f};
+                        evaluatedVisible = true;
+                        evaluatedVisibleColor = GlowPackedColor(components);
+                    }
                 }
             }
 

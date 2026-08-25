@@ -1,5 +1,7 @@
 #include "shared.h"
+#include "hero_scripts.h"
 #include "resource.h"
+#include "portable_paths.h"
 #include <wincodec.h>
 extern bool InvertMatrix(const Matrix4x4&, Matrix4x4&);
 #include <algorithm>
@@ -104,7 +106,7 @@ std::string ReadHeroName(uintptr_t entity) {
     static std::unordered_set<uint32_t> loggedIds;
     if (loggedIds.insert(heroId).second) {
         FILE* log = nullptr;
-        if (fopen_s(&log, "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\hero_ids.log", "a") == 0 && log) {
+        if (fopen_s(&log, Dll6Paths::DataFileA("hero_ids.log").c_str(), "a") == 0 && log) {
             fprintf(log, "entity=%p spawned=0x%X loading=0x%X component=0x%X portrait=0x%X\\n",
                     reinterpret_cast<void*>(entity),
                     heroId,
@@ -120,14 +122,43 @@ std::string ReadHeroName(uintptr_t entity) {
 std::string ReadPlayerName(uintptr_t controller) {
     if (!controller) return {};
     std::string name;
+    name.reserve(128);
     for (size_t i = 0; i < 128; ++i) {
-        const char c = Read<char>(controller + Offsets::PlayerName + i);
+        const unsigned char c = Read<unsigned char>(
+            controller + Offsets::PlayerName + i);
         if (!c) break;
-        if (static_cast<unsigned char>(c) < 0x20 ||
-            static_cast<unsigned char>(c) > 0x7E) break;
-        name.push_back(c);
+        // Source 2 stores m_iszPlayerName as a UTF-8 char[128]. Previously
+        // every byte above ASCII 0x7E terminated the read, so Cyrillic and
+        // other Unicode names always became an empty string/"Unknown".
+        if (c < 0x20 || c == 0x7F) continue;
+        name.push_back(static_cast<char>(c));
     }
     return name;
+}
+
+void DrawAimBoneSelectorImGui() {
+    aimBonesMask &= AimBoneAll;
+    if (!aimBonesMask) aimBonesMask = AimBoneHead;
+    if (antiFrog && (aimBonesMask & ~AimBoneHead) == 0)
+        aimBonesMask |= AimBoneNeck;
+    static constexpr const char* labels[]{
+        "Head", "Neck", "Torso", "Arms", "Legs"};
+    static constexpr int bits[]{
+        AimBoneHead, AimBoneNeck, AimBoneTorso, AimBoneArms, AimBoneLegs};
+    ImGui::TextUnformatted("Target bones");
+    for (int index = 0; index < 5; ++index) {
+        if (index != 0) ImGui::SameLine();
+        bool selected = (aimBonesMask & bits[index]) != 0;
+        if (ImGui::Checkbox(labels[index], &selected)) {
+            int next = selected ? aimBonesMask | bits[index]
+                                : aimBonesMask & ~bits[index];
+            if (next != 0) {
+                if (antiFrog && (next & ~AimBoneHead) == 0)
+                    next |= AimBoneNeck;
+                aimBonesMask = next & AimBoneAll;
+            }
+        }
+    }
 }
 
 struct CollisionDiagnosticSnapshot {
@@ -425,6 +456,270 @@ uint32_t FindClientEntityIndex(uintptr_t target) {
     return 0xFFFFFFFFu;
 }
 
+struct SpectatorEntry {
+    std::string name;
+    bool isEnemy{};
+};
+
+int GetObserverTargetIndex(uintptr_t pawn) {
+    if (!pawn) return -1;
+    const uintptr_t services = Read<uintptr_t>(
+        pawn + Offsets::ObserverServices);
+    if (!services) return -1;
+    // Source 2 can retain the last observer target after the player has
+    // stopped spectating. The mode is cleared immediately, so do not treat a
+    // stale target handle as an active spectator.
+    if (Read<uint8_t>(services + Offsets::ObserverMode) == 0)
+        return -1;
+    const uint32_t handle = Read<uint32_t>(
+        services + Offsets::ObserverTarget);
+    if (!handle || handle == 0xFFFFFFFFu) return -1;
+    return static_cast<int>(handle & Offsets::HandleIndexMask);
+}
+
+bool ObserverCameraTargetsLocal(uintptr_t observerPawn) {
+    if (!observerPawn || !currentLocalPawn) return true;
+    const uintptr_t services = Read<uintptr_t>(
+        observerPawn + Offsets::ObserverServices);
+    if (!services) return true;
+
+    const Vector3 cameraTarget = Read<Vector3>(
+        services + Offsets::ObserverTargetCameraPos);
+    if (!std::isfinite(cameraTarget.x) ||
+        !std::isfinite(cameraTarget.y) ||
+        !std::isfinite(cameraTarget.z) ||
+        (fabsf(cameraTarget.x) < 0.01f &&
+         fabsf(cameraTarget.y) < 0.01f &&
+         fabsf(cameraTarget.z) < 0.01f))
+        return true;
+
+    std::vector<uintptr_t> pawns;
+    {
+        std::lock_guard<std::mutex> lock(heroPawnsMutex);
+        pawns = heroPawns;
+    }
+    if (std::find(pawns.begin(), pawns.end(), currentLocalPawn) ==
+        pawns.end())
+        pawns.push_back(currentLocalPawn);
+
+    uintptr_t nearestPawn = 0;
+    float nearestDistanceSquared = FLT_MAX;
+    for (const uintptr_t pawn : pawns) {
+        if (!pawn) continue;
+        Vector3 position{};
+        if (!GetEntityRenderPosition(pawn, position) &&
+            !GetEntityPosition(pawn, position))
+            continue;
+        const float dx = cameraTarget.x - position.x;
+        const float dy = cameraTarget.y - position.y;
+        const float dz = cameraTarget.z - position.z;
+        const float distanceSquared = dx * dx + dy * dy + dz * dz;
+        if (!std::isfinite(distanceSquared) ||
+            distanceSquared >= nearestDistanceSquared)
+            continue;
+        nearestDistanceSquared = distanceSquared;
+        nearestPawn = pawn;
+    }
+    return !nearestPawn || nearestPawn == currentLocalPawn;
+}
+
+void LogObserverState(uintptr_t controller, uintptr_t pawn,
+                      const char* source, int localHeroIndex,
+                      int localBaseIndex) {
+    if (!controller || !pawn || !source) return;
+    const uintptr_t services = Read<uintptr_t>(
+        pawn + Offsets::ObserverServices);
+    const uint8_t mode = services
+        ? Read<uint8_t>(services + Offsets::ObserverMode)
+        : 0;
+    const uint32_t target = services
+        ? Read<uint32_t>(services + Offsets::ObserverTarget)
+        : 0xFFFFFFFFu;
+    const Vector3 cameraTarget = services
+        ? Read<Vector3>(services + Offsets::ObserverTargetCameraPos)
+        : Vector3{};
+    const uint64_t key =
+        (static_cast<uint64_t>(controller) >> 4) ^
+        (static_cast<uint64_t>(pawn) << 17);
+    uint64_t signature =
+        static_cast<uint64_t>(target) |
+        (static_cast<uint64_t>(mode) << 32);
+    signature ^= static_cast<uint64_t>(std::hash<float>{}(cameraTarget.x));
+    signature ^= static_cast<uint64_t>(std::hash<float>{}(cameraTarget.y)) << 1;
+    signature ^= static_cast<uint64_t>(std::hash<float>{}(cameraTarget.z)) << 2;
+    static std::unordered_map<uint64_t, uint64_t> previous;
+    const auto it = previous.find(key);
+    if (it != previous.end() && it->second == signature) return;
+    previous[key] = signature;
+
+    FILE* log = nullptr;
+    if (fopen_s(&log,
+                Dll6Paths::DataFileA("spectator_debug.log").c_str(),
+                "a") != 0 || !log)
+        return;
+    const uintptr_t resolvedTarget = ResolveEntity(target);
+    const std::string name = ReadPlayerName(controller);
+    const std::string pawnClass = GetEntityClassName(pawn);
+    const std::string targetClass = GetEntityClassName(resolvedTarget);
+    fprintf(log,
+            "tick=%llu name=%s controller=%p source=%s pawn=%p "
+            "pawnClass=%s services=%p mode=%u target=0x%08X "
+            "targetIndex=%d targetEntity=%p targetClass=%s "
+            "cameraTarget=(%.2f,%.2f,%.2f) cameraSaysLocal=%d "
+            "localHeroIndex=%d localBaseIndex=%d\n",
+            static_cast<unsigned long long>(GetTickCount64()),
+            name.empty() ? "<empty>" : name.c_str(),
+            reinterpret_cast<void*>(controller), source,
+            reinterpret_cast<void*>(pawn),
+            pawnClass.empty() ? "<unknown>" : pawnClass.c_str(),
+            reinterpret_cast<void*>(services),
+            static_cast<unsigned>(mode), target,
+            target == 0xFFFFFFFFu
+                ? -1
+                : static_cast<int>(target & Offsets::HandleIndexMask),
+            reinterpret_cast<void*>(resolvedTarget),
+            targetClass.empty() ? "<unknown>" : targetClass.c_str(),
+            cameraTarget.x, cameraTarget.y, cameraTarget.z,
+            ObserverCameraTargetsLocal(pawn) ? 1 : 0,
+            localHeroIndex, localBaseIndex);
+    fclose(log);
+}
+
+std::vector<SpectatorEntry> CollectCurrentSpectators() {
+    std::vector<SpectatorEntry> result;
+    if (!clientBase) return result;
+
+    const uintptr_t entitySystem =
+        Read<uintptr_t>(clientBase + Offsets::GameEntitySystem);
+    if (!entitySystem) return result;
+
+    uintptr_t localController = 0;
+    std::vector<uintptr_t> controllers;
+    std::vector<uintptr_t> observerPawns;
+    std::unordered_set<uintptr_t> seen;
+    const int reportedHighest = Read<int>(
+        entitySystem + Offsets::HighestEntityIndex);
+    const uint32_t highest =
+        reportedHighest > 0 &&
+        reportedHighest <= static_cast<int>(Offsets::HandleIndexMask)
+        ? static_cast<uint32_t>(reportedHighest)
+        : Offsets::HandleIndexMask;
+
+    for (uint32_t chunkIndex = 0;
+         chunkIndex <= (highest >> Offsets::HandleChunkShift);
+         ++chunkIndex) {
+        const uintptr_t chunk = Read<uintptr_t>(
+            entitySystem + Offsets::EntityChunks +
+            Offsets::EntityChunkStride * chunkIndex);
+        if (!chunk) continue;
+        const uint32_t slotLimit =
+            chunkIndex == (highest >> Offsets::HandleChunkShift)
+            ? highest & Offsets::HandleChunkMask
+            : Offsets::HandleChunkMask;
+        for (uint32_t slot = 0; slot <= slotLimit; ++slot) {
+            const uintptr_t identity =
+                chunk + Offsets::EntityStride * slot;
+            const uintptr_t entity = Read<uintptr_t>(identity);
+            if (!entity || !seen.insert(entity).second) continue;
+            const uint32_t expectedIndex =
+                (chunkIndex << Offsets::HandleChunkShift) | slot;
+            const uint32_t handle = Read<uint32_t>(
+                identity + Offsets::EntityHandleOffset);
+            if ((handle & Offsets::HandleIndexMask) != expectedIndex) continue;
+            const std::string className = GetEntityClassName(entity);
+            if (className.find("PlayerController") != std::string::npos) {
+                controllers.push_back(entity);
+                if (Read<uint8_t>(
+                        entity + Offsets::IsLocalPlayerController) == 1) {
+                    localController = entity;
+                }
+            } else if (className.find("ObserverPawn") != std::string::npos) {
+                observerPawns.push_back(entity);
+            }
+        }
+    }
+
+    if (!localController && currentLocalPawn) {
+        localController = ResolveEntity(Read<uint32_t>(
+            currentLocalPawn + Offsets::PawnController));
+    }
+    if (!localController) return result;
+
+    const uint32_t localBaseHandle = Read<uint32_t>(
+        localController + Offsets::ControllerPawn);
+    const int localHeroIndex =
+        currentLocalPawnHandle && currentLocalPawnHandle != 0xFFFFFFFFu
+        ? static_cast<int>(currentLocalPawnHandle & Offsets::HandleIndexMask)
+        : currentLocalPawn
+            ? static_cast<int>(FindClientEntityIndex(currentLocalPawn))
+            : -1;
+    const int localBaseIndex =
+        localBaseHandle && localBaseHandle != 0xFFFFFFFFu
+        ? static_cast<int>(localBaseHandle & Offsets::HandleIndexMask)
+        : -1;
+    const uint8_t localTeam = Read<uint8_t>(
+        localController + Offsets::Team);
+
+    for (const uintptr_t controller : controllers) {
+        if (!controller || controller == localController ||
+            Read<uint8_t>(
+                controller + Offsets::IsLocalPlayerController) == 1)
+            continue;
+
+        const uintptr_t controllerPawn = ResolveEntity(Read<uint32_t>(
+            controller + Offsets::ControllerPawn));
+        uintptr_t activeObserverPawn = 0;
+
+        LogObserverState(controller, controllerPawn, "controllerPawn",
+                         localHeroIndex, localBaseIndex);
+
+        // In current Deadlock builds m_hPawn may remain the dead hero/base
+        // pawn while a separate C_CitadelObserverPawn owns the live camera
+        // target. Prefer that dedicated pawn and never OR its result with the
+        // stale target retained by the old pawn.
+        if (controllerPawn &&
+            GetEntityClassName(controllerPawn).find("ObserverPawn") !=
+                std::string::npos) {
+            activeObserverPawn = controllerPawn;
+        } else {
+            for (const uintptr_t observerPawn : observerPawns) {
+                const uintptr_t owner = ResolveEntity(Read<uint32_t>(
+                    observerPawn + Offsets::PawnController));
+                if (owner != controller) continue;
+                LogObserverState(controller, observerPawn,
+                                 "dedicatedObserverPawn",
+                                 localHeroIndex, localBaseIndex);
+                activeObserverPawn = observerPawn;
+                break;
+            }
+        }
+
+        // Fall back only when this controller has no dedicated observer pawn.
+        // Once one exists, an invalid target means the player is not currently
+        // watching another player and must disappear from the list.
+        const uintptr_t observerPawn = activeObserverPawn
+            ? activeObserverPawn
+            : controllerPawn;
+        const int observerTargetIndex =
+            GetObserverTargetIndex(observerPawn);
+        if (observerTargetIndex < 0) continue;
+
+        const bool watchingHero = observerTargetIndex == localHeroIndex;
+        const bool watchingBase = observerTargetIndex == localBaseIndex;
+        if (!watchingHero && !watchingBase)
+            continue;
+        if (!ObserverCameraTargetsLocal(observerPawn))
+            continue;
+
+        std::string name = ReadPlayerName(controller);
+        if (name.empty()) name = "Unknown";
+        result.push_back(SpectatorEntry{
+            std::move(name),
+            Read<uint8_t>(controller + Offsets::Team) != localTeam});
+    }
+    return result;
+}
+
 std::string ReadModuleClassName(
     uintptr_t entity, uintptr_t moduleBase, size_t moduleSize) {
     if (!entity || !moduleBase || !moduleSize) return {};
@@ -599,7 +894,7 @@ void UpdateCollisionDiagnostic() {
     if (!collisionSnapshot.valid) return;
 
     std::ofstream log(
-        "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\collision_diagnostic.csv",
+        Dll6Paths::DataFileA("collision_diagnostic.csv"),
         std::ios::app);
     if (!log) return;
     static bool headerWritten = false;
@@ -1214,7 +1509,7 @@ std::vector<PlayerData> GetPlayers() {
     const bool farmNeedsBones = farmAssist &&
         (farmToggleMode ? farmToggleActive : farmKeyDown);
     const bool needPlayerBones = drawBones || enemyBonesEnabled || allyBonesEnabled ||
-        aimNeedsBones || farmNeedsBones;
+        aimNeedsBones || farmNeedsBones || HeroScriptsNeedPlayerBones();
     for (const uintptr_t entity : pawns) {
         // World snapshots may contain the local third-person pawn. It must
         // never be treated as an ESP target: its render skeleton is updated
@@ -1267,11 +1562,24 @@ std::vector<PlayerData> GetPlayers() {
         player.modelHeight = player.modelMaxZ - player.modelMinZ;
         if (needPlayerBones) {
             player.hasHeadBone = GetEntityBonePosition(entity, "head", player.headPos);
+            // spine_3 is the stable upper-neck/shoulder joint used by the
+            // existing skeleton chain immediately below head. It provides a
+            // non-head aim point for Anti-Frog without inventing an offset.
+            player.hasNeckBone = GetEntityBonePosition(
+                entity, "spine_3", player.neckPos);
             player.hasBodyBone = GetEntityBonePosition(entity, "spine_2", player.bodyPos);
             if (!player.hasBodyBone) {
                 player.hasBodyBone = GetEntityBonePosition(
                     entity, "spine_0", player.bodyPos);
             }
+            player.hasLeftArmBone = GetEntityBonePosition(
+                entity, "arm_upper_L", player.leftArmPos);
+            player.hasRightArmBone = GetEntityBonePosition(
+                entity, "arm_upper_R", player.rightArmPos);
+            player.hasLeftLegBone = GetEntityBonePosition(
+                entity, "leg_upper_L", player.leftLegPos);
+            player.hasRightLegBone = GetEntityBonePosition(
+                entity, "leg_upper_R", player.rightLegPos);
             if (drawBones) GetEntityBoneSkeleton(entity, player.bones);
         }
         player.health = health;
@@ -1385,7 +1693,7 @@ std::vector<PlayerData> GetPlayers() {
             if (lastLoggedUpgradeStates[entity] != state) {
                 lastLoggedUpgradeStates[entity] = state;
                 std::ofstream log(
-                    "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\ability_levels.log",
+                    Dll6Paths::DataFileA("ability_levels.log"),
                     std::ios::app);
                 if (log) log << state << '\n';
             }
@@ -1478,6 +1786,16 @@ void RenderESP(const std::vector<PlayerData>& players) {
     auto drawList = ImGui::GetBackgroundDrawList();
     const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
 
+    static float previousAntiFrogGameTime = 0.0f;
+    const float antiFrogGameTime = GetClientGameTime();
+    if ((previousAntiFrogGameTime > 0.0f && antiFrogGameTime <= 0.0f) ||
+        (previousAntiFrogGameTime > 10.0f &&
+         antiFrogGameTime + 2.0f < previousAntiFrogGameTime)) {
+        ResetAntiFrogStats();
+    }
+    if (antiFrogGameTime > 0.0f)
+        previousAntiFrogGameTime = antiFrogGameTime;
+
     const bool aimKeyDown = (GetAsyncKeyState(aimAssistKey) & 0x8000) != 0;
     const bool aimEnabled = aimAssist && (aimToggleMode ? aimToggleActive : aimKeyDown);
     const bool farmKeyDown = (GetAsyncKeyState(farmAssistKey) & 0x8000) != 0;
@@ -1497,6 +1815,23 @@ void RenderESP(const std::vector<PlayerData>& players) {
     drawList->AddText(ImVec2(statusPosition.x + 1.0f, statusPosition.y + 1.0f),
                       ImColor(0, 0, 0, 190), aimStatus);
     drawList->AddText(statusPosition, aimColor, aimStatus);
+    if (antiFrog) {
+        const float headshotPercent = GetAntiFrogHeadshotPercent();
+        const char* slot = GetAntiFrogSlotLabel();
+        char antiFrogText[64]{};
+        std::snprintf(antiFrogText, sizeof(antiFrogText),
+                      "HS%% %.1f%%  [%s]", headshotPercent, slot);
+        const ImColor antiFrogColor =
+            headshotPercent > antiFrogHsThreshold
+                ? ImColor(255, 90, 90, 235)
+                : ImColor(90, 235, 120, 235);
+        const ImVec2 antiFrogPosition(
+            10.0f, displaySize.y * 0.5f);
+        drawList->AddText(ImVec2(antiFrogPosition.x + 1.0f,
+                                 antiFrogPosition.y + 1.0f),
+                          ImColor(0, 0, 0, 210), antiFrogText);
+        drawList->AddText(antiFrogPosition, antiFrogColor, antiFrogText);
+    }
     if (farmAssist) {
         const char* farmStatus = farmEnabled ? "CREEP AIM  ON" : "CREEP AIM  OFF";
         const ImColor farmColor = farmEnabled ? ImColor(255, 190, 70, 235) : ImColor(180, 180, 180, 210);
@@ -1621,59 +1956,11 @@ void RenderESP(const std::vector<PlayerData>& players) {
         }
     }
     if (drawSpectatorList) {
-        static std::vector<std::string> cachedSpectators;
+        static std::vector<SpectatorEntry> cachedSpectators;
         static ULONGLONG lastSpectatorScan = 0;
         const ULONGLONG spectatorNow = GetTickCount64();
-        if (spectatorNow - lastSpectatorScan >= 1000) {
-            // Enumerate player controllers directly. Spectators use
-            // C_CitadelObserverPawn, which is intentionally not part of heroPawns.
-            std::vector<std::string> refreshedSpectators;
-            std::unordered_set<std::string> spectatorNames;
-            const uintptr_t entityRoot = clientBase
-                ? Read<uintptr_t>(clientBase + Offsets::GameEntitySystem) : 0;
-            if (entityRoot) {
-        const int reportedHighest = Read<int>(entityRoot + Offsets::HighestEntityIndex);
-        const uint32_t highestEntityIndex =
-            reportedHighest > 0 && reportedHighest <= static_cast<int>(Offsets::HandleIndexMask)
-                ? static_cast<uint32_t>(reportedHighest)
-                : Offsets::HandleIndexMask;
-        const uint32_t highestChunk = highestEntityIndex >> Offsets::HandleChunkShift;
-        for (uint32_t chunkIndex = 0;
-             chunkIndex <= highestChunk; ++chunkIndex) {
-            const uintptr_t chunk = Read<uintptr_t>(entityRoot + Offsets::EntityChunks +
-                Offsets::EntityChunkStride * chunkIndex);
-            if (!chunk) continue;
-            const uint32_t highestSlot = chunkIndex == highestChunk
-                ? (highestEntityIndex & Offsets::HandleChunkMask)
-                : Offsets::HandleChunkMask;
-            for (uint32_t slot = 0; slot <= highestSlot; ++slot) {
-                const uintptr_t identity = chunk + Offsets::EntityStride * slot;
-                const uint32_t handle = Read<uint32_t>(identity + Offsets::EntityHandleOffset);
-                const uint32_t expectedIndex = (chunkIndex << Offsets::HandleChunkShift) | slot;
-                if ((handle & Offsets::HandleIndexMask) != expectedIndex) continue;
-                const uintptr_t controller = Read<uintptr_t>(identity);
-                if (!controller) continue;
-                const std::string className = GetEntityClassName(controller);
-                if (className.find("PlayerController") == std::string::npos) continue;
-                const uintptr_t pawn = ResolveEntity(Read<uint32_t>(controller + Offsets::ControllerPawn));
-                if (!pawn || pawn == currentLocalPawn) continue;
-                const uintptr_t observerServices = Read<uintptr_t>(pawn + Offsets::ObserverServices);
-                if (!observerServices) continue;
-                const uint8_t observerMode = Read<uint8_t>(observerServices + Offsets::ObserverMode);
-                const uint32_t observerTarget = Read<uint32_t>(observerServices + Offsets::ObserverTarget);
-                if (observerMode == 0 || observerTarget == 0xFFFFFFFFu) continue;
-                // A spectator list must contain only controllers currently
-                // observing the local pawn. Previously every observer in the
-                // match was shown, regardless of their selected target.
-                const uintptr_t observedPawn = ResolveEntity(observerTarget);
-                if (!observedPawn || observedPawn != currentLocalPawn) continue;
-                std::string name = ReadPlayerName(controller);
-                if (name.empty()) name = "Unknown";
-                if (spectatorNames.insert(name).second) refreshedSpectators.push_back(std::move(name));
-            }
-        }
-            }
-            cachedSpectators = std::move(refreshedSpectators);
+        if (spectatorNow - lastSpectatorScan >= 250) {
+            cachedSpectators = CollectCurrentSpectators();
             lastSpectatorScan = spectatorNow;
         }
         const auto& spectators = cachedSpectators;
@@ -1692,11 +1979,14 @@ void RenderESP(const std::vector<PlayerData>& players) {
             drawList->AddText(ImVec2(statusPosition.x, spectatorY),
                               ImColor(180, 180, 180, 220), emptyText);
         } else {
-            for (const auto& name : spectators) {
+            for (const auto& spectator : spectators) {
                 drawList->AddText(ImVec2(statusPosition.x + 1.0f, spectatorY + 1.0f),
-                                  ImColor(0, 0, 0, 190), name.c_str());
+                                  ImColor(0, 0, 0, 190), spectator.name.c_str());
                 drawList->AddText(ImVec2(statusPosition.x, spectatorY),
-                                  ImColor(255, 255, 255, 235), name.c_str());
+                                  spectator.isEnemy
+                                      ? ImColor(255, 102, 102, 235)
+                                      : ImColor(102, 255, 102, 235),
+                                  spectator.name.c_str());
                 spectatorY += 17.0f;
             }
         }
@@ -1832,9 +2122,141 @@ void RenderESP(const std::vector<PlayerData>& players) {
         }
     }
 
-    // Ally creep ESP is an extension of the main creep ESP switch; it must
-    // never draw on its own when the parent feature is disabled.
-    if (creepEspEnabled && currentViewMatrixReady) {
+    if (campTimersEnabled && (campTimersOnScreen || campTimersOnMinimap)) {
+        std::vector<CampTimerData> timers;
+        { std::lock_guard lock(campTimersMutex); timers = campTimers; }
+        const float gameTime = GetCampGameTime();
+        std::sort(timers.begin(), timers.end(),
+                  [](const CampTimerData& left, const CampTimerData& right) {
+                      return left.respawnAt < right.respawnAt;
+                  });
+        struct ActiveCampLabel {
+            const CampTimerData* camp{};
+            std::string text;
+        };
+        std::vector<ActiveCampLabel> activeLabels;
+        const auto drawOutlinedText = [&](const ImVec2& position,
+                                          ImU32 color,
+                                          const char* text) {
+            const ImU32 outline = IM_COL32(4, 6, 8, 245);
+            drawList->AddText(ImVec2(position.x - 1.0f, position.y), outline, text);
+            drawList->AddText(ImVec2(position.x + 1.0f, position.y), outline, text);
+            drawList->AddText(ImVec2(position.x, position.y - 1.0f), outline, text);
+            drawList->AddText(ImVec2(position.x, position.y + 1.0f), outline, text);
+            drawList->AddText(position, color, text);
+        };
+        const ImU32 timerColor = ImColor(
+            campTimerColor[0], campTimerColor[1],
+            campTimerColor[2], campTimerColor[3]);
+        for (const CampTimerData& camp : timers) {
+            if (!std::isfinite(gameTime) || gameTime <= 0.0f ||
+                camp.respawnAt <= gameTime) continue;
+            const int seconds = static_cast<int>(std::ceil(camp.respawnAt - gameTime));
+            char label[32]{};
+            const char* tier = camp.campClass == 34 ? "T1" :
+                camp.campClass == 35 ? "T2" :
+                camp.campClass == 36 ? "T3" : "V";
+            std::snprintf(label, sizeof(label), "%s %d:%02d", tier,
+                          seconds / 60, seconds % 60);
+            activeLabels.push_back({&camp, label});
+            if (campTimersOnScreen && currentViewMatrixReady) {
+                Vector2 screen{};
+                if (WorldToScreen(camp.pos, screen, currentViewMatrix)) {
+                    const ImVec2 textSize = ImGui::CalcTextSize(label);
+                    drawOutlinedText(ImVec2(screen.x - textSize.x * 0.5f,
+                                            screen.y - 10.0f),
+                                     timerColor, label);
+                }
+            }
+        }
+
+        if (campTimersOnMinimap && !activeLabels.empty() &&
+            displaySize.x > 0.0f && displaySize.y > 0.0f) {
+            // Current Valve HUD layout (hud.css): minimap_persp is 440x440,
+            // minimap_container is 380x380 centred inside it, and
+            // HudMinimapContainer is 105% of that.  The parent clamp_width is
+            // capped at 2000px and centred, so its right edge differs from the
+            // physical display edge on ultrawide resolutions.
+            const float uiScale = displaySize.y / 1080.0f;
+            const float logicalDisplayWidth = displaySize.x / uiScale;
+            const float clampedWidth = (std::min)(logicalDisplayWidth, 2000.0f);
+            const float clampRight = displaySize.x * 0.5f +
+                clampedWidth * uiScale * 0.5f;
+            constexpr float outerSizeLogical = 440.0f;
+            constexpr float mapSizeLogical = 380.0f;
+            constexpr float bottomMarginLogical = 15.0f;
+            const float mapSize = mapSizeLogical * uiScale;
+            const float inset =
+                (outerSizeLogical - mapSizeLogical) * 0.5f * uiScale;
+            const float mapLeft =
+                clampRight - outerSizeLogical * uiScale + inset;
+            const float mapTop = displaySize.y -
+                (outerSizeLogical + bottomMarginLogical) * uiScale + inset;
+            const float hudSize = mapSize * 1.05f;
+            const float hudLeft = mapLeft - (hudSize - mapSize) * 0.5f;
+            const float hudTop = mapTop - (hudSize - mapSize) * 0.5f;
+
+            for (const ActiveCampLabel& active : activeLabels) {
+                const CampTimerData& camp = *active.camp;
+                float normalizedX = static_cast<float>(camp.mapX) / 255.0f;
+                float normalizedY = 1.0f -
+                    static_cast<float>(camp.mapY) / 255.0f;
+                if (camp.localTeam == 3) {
+                    normalizedX = 1.0f - normalizedX;
+                    normalizedY = 1.0f - normalizedY;
+                }
+
+                const ImVec2 center(hudLeft + normalizedX * hudSize,
+                                    hudTop + normalizedY * hudSize);
+                const char* countdown = active.text.c_str();
+                if (const char* separator = std::strchr(countdown, ' '))
+                    countdown = separator + 1;
+                ImFont* font = ImGui::GetFont();
+                const float fontSize = std::clamp(
+                    campTimerMinimapSize, 15.0f, 30.0f);
+                const ImVec2 textSize = font->CalcTextSizeA(
+                    fontSize, FLT_MAX, 0.0f, countdown);
+                const ImVec2 textPosition(center.x - textSize.x * 0.5f,
+                                          center.y - textSize.y * 0.5f);
+                const ImU32 outline = IM_COL32(4, 6, 8, 230);
+                drawList->AddText(font, fontSize,
+                    ImVec2(textPosition.x - 1.0f, textPosition.y),
+                    outline, countdown);
+                drawList->AddText(font, fontSize,
+                    ImVec2(textPosition.x + 1.0f, textPosition.y),
+                    outline, countdown);
+                drawList->AddText(font, fontSize,
+                    ImVec2(textPosition.x, textPosition.y - 1.0f),
+                    outline, countdown);
+                drawList->AddText(font, fontSize,
+                    ImVec2(textPosition.x, textPosition.y + 1.0f),
+                    outline, countdown);
+                drawList->AddText(font, fontSize, textPosition,
+                                  timerColor, countdown);
+            }
+        }
+
+        // A fixed HUD list keeps every cleared camp visible even when it is
+        // outside the camera frustum or on the other half of the map.
+        if (campTimersOnScreen && !activeLabels.empty()) {
+            const float x = displaySize.x - 175.0f;
+            const float y = 120.0f;
+            drawList->AddRectFilled(ImVec2(x - 10.0f, y - 8.0f),
+                                    ImVec2(displaySize.x - 12.0f,
+                                           y + 18.0f * (activeLabels.size() + 1)),
+                                    ImColor(8, 11, 16, 205), 4.0f);
+            drawList->AddText(ImVec2(x, y), ImColor(235, 235, 235, 245),
+                              "CAMP TIMERS");
+            for (size_t i = 0; i < activeLabels.size(); ++i)
+                drawList->AddText(ImVec2(x, y + 18.0f * (i + 1)),
+                                  timerColor, activeLabels[i].text.c_str());
+        }
+    }
+
+    // Each creep faction has an independent switch. This lets the Creep
+    // page selectively show enemy, ally, and neutral units.
+    if ((creepEspEnabled || allyCreepEspEnabled || neutralCreepEspEnabled) &&
+        currentViewMatrixReady) {
         struct SmoothedCreepBox {
             float left{}, top{}, right{}, bottom{};
             ULONGLONG lastSeen{};
@@ -1949,12 +2371,13 @@ void RenderESP(const std::vector<PlayerData>& players) {
                 : 0;
             const bool ally = localTeam != 0 && creep.team == localTeam;
             const bool neutral = creep.team == 4;
-            const bool drawThisCreep = neutral ? creepEspEnabled
+            const bool drawThisCreep = neutral ? neutralCreepEspEnabled
                                                : (ally ? allyCreepEspEnabled : creepEspEnabled);
-            const bool drawBoxes = neutral ? creepBoxesEnabled
-                                           : (ally ? allyCreepBoxesEnabled : creepBoxesEnabled);
-            const bool drawCornerBoxes = neutral ? creepCornerBoxesEnabled
-                                                  : (ally ? allyCreepCornerBoxesEnabled : creepCornerBoxesEnabled);
+            // Creep ESP intentionally uses one consistent box style. There
+            // is no separate Appearance control for creeps: every shown
+            // creep receives a corner box.
+            const bool drawBoxes = true;
+            const bool drawCornerBoxes = true;
             const bool drawDistance = neutral ? creepDistanceEnabled
                                               : (ally ? allyCreepDistanceEnabled : creepDistanceEnabled);
             const bool drawHealth = neutral ? creepHealthEnabled
@@ -2600,11 +3023,7 @@ static void RenderMenuLegacy(size_t playerCount) {
                 aimToggleLastDown = false;
             }
             ImGui::Checkbox("Visibility check", &aimVisibilityCheck);
-            int targetMode = static_cast<int>(aimTargetMode);
-            const char* targetModes[] = { "Head", "Body", "Closest" };
-            if (ImGui::Combo("Aim target", &targetMode, targetModes, IM_ARRAYSIZE(targetModes))) {
-                aimTargetMode = static_cast<AimTargetMode>(std::clamp(targetMode, 0, 2));
-            }
+            DrawAimBoneSelectorImGui();
             ImGui::SliderFloat("Aim FOV", &aimFov, 40.0f, 600.0f, "%.0f px");
             ImGui::SliderFloat("Aim smooth", &aimSmooth, 1.0f, 20.0f, "%.1f");
         }
@@ -2776,10 +3195,7 @@ static void RenderMenuV1(size_t playerCount) {
             aimSilentMode = mode == 1;
             aimMixedMode = mode == 2;
         }
-        int targetMode = static_cast<int>(aimTargetMode);
-        const char* targets[] = { "Head", "Body", "Closest" };
-        if (ImGui::Combo("Target", &targetMode, targets, IM_ARRAYSIZE(targets)))
-            aimTargetMode = static_cast<AimTargetMode>(std::clamp(targetMode, 0, 2));
+        DrawAimBoneSelectorImGui();
         ImGui::SliderFloat("FOV", &aimFov, 40.0f, 600.0f, "%.0f px");
         int selectionMode = static_cast<int>(aimSelectionMode);
         const char* selections[] = { "Crosshair", "Distance", "Health" };
@@ -2789,7 +3205,12 @@ static void RenderMenuV1(size_t playerCount) {
         ImGui::SliderFloat("Yaw smooth", &aimYawSmooth, 1.0f, 20.0f, "%.1f");
         ImGui::Checkbox("Only Yaw", &aimOnlyYaw);
         ImGui::Checkbox("Lock Target", &aimLockTarget);
+        ImGui::Checkbox("Prediction", &aimPrediction);
         ImGui::SliderFloat("Hitchance", &aimHitchance, 0.0f, 100.0f, "%.0f%%");
+        ImGui::Checkbox("Anti-Frog", &antiFrog);
+        if (antiFrog)
+            ImGui::SliderFloat("HS threshold", &antiFrogHsThreshold,
+                               1.0f, 99.0f, "%.0f%%");
         ImGui::Spacing();
         if (ImGui::Button(aimKeyCapture ? "Press a key..." : AimKeyName(aimAssistKey), ImVec2(170, 0)))
             aimKeyCapture = true;
@@ -3163,10 +3584,7 @@ static void RenderMenuV2(size_t playerCount) {
 
             ImGui::TableNextColumn();
             BeginPanel("##aim_target", "Targeting", "Selection and precision", 490);
-            int targetMode = static_cast<int>(aimTargetMode);
-            const char* targets[] = { "Head", "Body", "Closest point" };
-            Combo("Target point", &targetMode, targets, 3);
-            aimTargetMode = static_cast<AimTargetMode>(std::clamp(targetMode, 0, 2));
+            DrawAimBoneSelectorImGui();
             Slider("Aim FOV", &aimFov, 40.0f, 600.0f, "%.0f px");
             Slider("Smoothing", &aimSmooth, 1.0f, 20.0f, "%.1f");
             Toggle("Draw FOV", "Show active target radius", &drawFovCircle);
@@ -3717,10 +4135,7 @@ void RenderMenu(size_t playerCount) {
             Toggle("FOV circle", &drawFovCircle, teammateBoxColor);
             Slider("FOV opacity", &fovCircleAlpha, 0.0f, 255.0f, "%.0f");
         } else if (activeTab == 1) {
-            int target = static_cast<int>(aimTargetMode);
-            const char* targets[] = { "Head", "Body", "Closest" };
-            Combo("Target point", &target, targets, 3);
-            aimTargetMode = static_cast<AimTargetMode>(std::clamp(target, 0, 2));
+            DrawAimBoneSelectorImGui();
             Slider("Aim FOV", &aimFov, 40.0f, 600.0f, "%.0f px");
             Slider("Smoothing", &aimSmooth, 1.0f, 20.0f, "%.1f");
             Toggle("Draw FOV circle", &drawFovCircle, nullptr);

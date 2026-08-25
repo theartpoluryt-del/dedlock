@@ -1,4 +1,5 @@
 #include "shared.h"
+#include "portable_paths.h"
 
 #include <fstream>
 #include <sstream>
@@ -361,6 +362,7 @@ bool InitializeLiveSchemaOffsets(size_t& loaded, size_t required) {
     loaded += SetRuntimeField("C_BasePlayerPawn", "m_pObserverServices", Offsets::ObserverServices);
     loaded += SetRuntimeField("CPlayer_ObserverServices", "m_iObserverMode", Offsets::ObserverMode);
     loaded += SetRuntimeField("CPlayer_ObserverServices", "m_hObserverTarget", Offsets::ObserverTarget);
+    loaded += SetRuntimeField("CCitadelPlayer_ObserverServices", "m_vTargetCameraPos", Offsets::ObserverTargetCameraPos);
     loaded += SetRuntimeField("CBasePlayerController", "m_iszPlayerName", Offsets::PlayerName);
     loaded += SetRuntimeField("CCitadelPlayerController", "m_PlayerDataGlobal", Offsets::ControllerPlayerData);
     loaded += SetRuntimeField("PlayerDataGlobal_t", "m_iHealthMax", Offsets::PlayerDataHealthMax);
@@ -400,6 +402,10 @@ bool InitializeLiveSchemaOffsets(size_t& loaded, size_t required) {
                     Offsets::GameRulesMinimapMins);
     SetRuntimeField("C_CitadelGameRules", "m_vMinimapMaxs",
                     Offsets::GameRulesMinimapMaxs);
+    SetRuntimeField("C_GameRules", "m_bGamePaused",
+                    Offsets::GameRulesGamePaused);
+    SetRuntimeField("C_CitadelGameRules", "m_bServerPaused",
+                    Offsets::GameRulesServerPaused);
     const uintptr_t fowEntitySize = FindSchemaClassSize("STeamFOWEntity");
     if (fowEntitySize >= 0x40 && fowEntitySize <= 0x200)
         Offsets::TeamFOWEntitySize = fowEntitySize;
@@ -504,7 +510,7 @@ bool InitializePatternOffsets() {
         }
     }
     std::ofstream log(
-        "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\pattern_offsets.log",
+        Dll6Paths::DataFileA("pattern_offsets.log"),
         std::ios::trunc);
     if (log) {
         log << std::hex
@@ -625,6 +631,7 @@ bool WriteResolvedOffsetSnapshot() {
     DLL6_SNAPSHOT_OFFSET(ObserverServices);
     DLL6_SNAPSHOT_OFFSET(ObserverMode);
     DLL6_SNAPSHOT_OFFSET(ObserverTarget);
+    DLL6_SNAPSHOT_OFFSET(ObserverTargetCameraPos);
     DLL6_SNAPSHOT_OFFSET(PlayerName);
     DLL6_SNAPSHOT_OFFSET(EntityChunks);
     DLL6_SNAPSHOT_OFFSET(HighestEntityIndex);
@@ -712,7 +719,7 @@ std::string GetClientFingerprint() {
 }
 
 void WriteRuntimeLog(const std::filesystem::path& schemaDir, size_t loaded, size_t required) {
-    std::ofstream log("C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\runtime_offsets.log", std::ios::trunc);
+    std::ofstream log(Dll6Paths::DataFileA("runtime_offsets.log"), std::ios::trunc);
     if (!log) return;
     log << "client=" << runtimeBuildKey << "\n"
         << "schema=" << (schemaDir.empty() ? "not-found" : schemaDir.string()) << "\n"
@@ -788,6 +795,7 @@ bool InitializeRuntimeOffsets() {
         loaded += SetField(fields, "C_BasePlayerPawn.m_pObserverServices", Offsets::ObserverServices);
         loaded += SetField(fields, "CPlayer_ObserverServices.m_iObserverMode", Offsets::ObserverMode);
         loaded += SetField(fields, "CPlayer_ObserverServices.m_hObserverTarget", Offsets::ObserverTarget);
+        loaded += SetField(fields, "CCitadelPlayer_ObserverServices.m_vTargetCameraPos", Offsets::ObserverTargetCameraPos);
         loaded += SetField(fields, "CBasePlayerController.m_iszPlayerName", Offsets::PlayerName);
         loaded += SetField(fields, "CCitadelPlayerController.m_PlayerDataGlobal", Offsets::ControllerPlayerData);
         loaded += SetField(fields, "PlayerDataGlobal_t.m_iHealthMax", Offsets::PlayerDataHealthMax);

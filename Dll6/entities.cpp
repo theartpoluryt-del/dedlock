@@ -1,4 +1,5 @@
 #include "shared.h"
+#include "portable_paths.h"
 #include <fstream>
 #include <shared_mutex>
 #include <cctype>
@@ -18,7 +19,7 @@ std::string NormalizeEntityName(const std::string& name) {
 
 void LogNativeGlow(const char* message) {
     std::ofstream log(
-        "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\native_glow.log",
+        Dll6Paths::DataFileA("native_glow.log"),
         std::ios::app);
     if (log) log << message << '\n';
 }
@@ -1257,11 +1258,21 @@ void ApplyEnemyRadar(bool enabled) {
     }
 }
 
-float GetClientGameTime() {
+namespace {
+std::atomic<uintptr_t> campClockGameRules{0};
+std::mutex campClockMutex;
+std::mutex campAnchorMutex;
+std::unordered_map<uint64_t, Vector3> learnedCampWorldAnchor;
+std::unordered_map<uint64_t, Vector3> campMapWorldCenter;
+
+uintptr_t GetClientGlobalVars() {
     static uintptr_t globalVars = 0;
-    static bool searched = false;
-    if (!searched && clientBase) {
-        searched = true;
+    static uintptr_t searchedClientBase = 0;
+    if (searchedClientBase != clientBase) {
+        searchedClientBase = clientBase;
+        globalVars = 0;
+    }
+    if (!globalVars && clientBase) {
         MODULEINFO moduleInfo{};
         if (GetModuleInformation(GetCurrentProcess(), reinterpret_cast<HMODULE>(clientBase),
                                  &moduleInfo, sizeof(moduleInfo))) {
@@ -1280,7 +1291,396 @@ float GetClientGameTime() {
             }
         }
     }
-    return globalVars ? Read<float>(globalVars + 0x0C) : 0.0f;
+    return globalVars;
+}
+
+int GetClientGameTick() {
+    const uintptr_t globalVars = GetClientGlobalVars();
+    return globalVars ? Read<int>(globalVars + 0x48) : 0;
+}
+
+float GetClientIntervalPerTick() {
+    const uintptr_t globalVars = GetClientGlobalVars();
+    const float interval = globalVars ? Read<float>(globalVars + 0x4C) : 0.0f;
+    return std::isfinite(interval) && interval > 0.001f && interval < 0.1f
+        ? interval : (1.0f / 64.0f);
+}
+
+bool IsNeutralCampClass(uint32_t campClass) {
+    // Class_T in the current client: weak, medium, strong and vault camp.
+    return campClass >= 34 && campClass <= 37;
+}
+
+float NeutralCampRespawnSeconds(uint32_t campClass) {
+    switch (campClass) {
+        case 34: return 85.0f;
+        case 35: return 290.0f;
+        case 36: return 335.0f;
+        case 37: return 300.0f;
+        default: return 0.0f;
+    }
+}
+
+struct TrackedFowCamp {
+    CampTimerData data{};
+    bool initialized{};
+    bool wasActive{};
+    bool hasBeenActive{};
+    ULONGLONG lastSeenAt{};
+};
+
+void UpdateCampTimersFromFow(bool enabled) {
+    static std::vector<uintptr_t> teamEntities;
+    static uintptr_t gameRules = 0;
+    static std::unordered_map<uint64_t, TrackedFowCamp> tracked;
+    static ULONGLONG lastTeamScanAt = 0;
+    static float lastGameTime = 0.0f;
+
+    const auto publish = [&]() {
+        std::vector<CampTimerData> result;
+        result.reserve(tracked.size());
+        for (const auto& pair : tracked)
+            result.push_back(pair.second.data);
+        std::lock_guard lock(campTimersMutex);
+        campTimers = std::move(result);
+    };
+
+    if (!enabled || !clientBase || !currentLocalPawn) {
+        tracked.clear();
+        teamEntities.clear();
+        gameRules = 0;
+        campClockGameRules.store(0, std::memory_order_release);
+        lastTeamScanAt = 0;
+        lastGameTime = 0.0f;
+        publish();
+        return;
+    }
+
+    const float gameTime = GetCampGameTime();
+    if (!std::isfinite(gameTime) || gameTime <= 0.0f) {
+        publish();
+        return;
+    }
+    // A new match/loading transition makes the server clock jump backwards.
+    if (lastGameTime > 10.0f && gameTime + 2.0f < lastGameTime) {
+        tracked.clear();
+        std::lock_guard anchorLock(campAnchorMutex);
+        learnedCampWorldAnchor.clear();
+        campMapWorldCenter.clear();
+    }
+    lastGameTime = gameTime;
+
+    const int localTeam = static_cast<int>(
+        Read<uint8_t>(currentLocalPawn + Offsets::Team));
+    if (localTeam != 2 && localTeam != 3) {
+        publish();
+        return;
+    }
+
+    const ULONGLONG now = GetTickCount64();
+    if (teamEntities.empty() &&
+        (lastTeamScanAt == 0 || now - lastTeamScanAt >= 750)) {
+        lastTeamScanAt = now;
+        std::unordered_set<uintptr_t> seen;
+        const uintptr_t roots[] = {
+            Read<uintptr_t>(clientBase + Offsets::GameEntitySystem),
+            clientBase + Offsets::GameEntitySystem
+        };
+        const uintptr_t tableOffsets[] = {
+            Offsets::EntityChunks, 0, 0x110, 0x100, 0x20
+        };
+        for (const uintptr_t root : roots) {
+            if (!root) continue;
+            for (const uintptr_t tableOffset : tableOffsets) {
+                for (uint32_t chunkIndex = 0;
+                     chunkIndex <= (Offsets::MaxEntityIndex >>
+                                    Offsets::HandleChunkShift);
+                     ++chunkIndex) {
+                    const uintptr_t chunk = Read<uintptr_t>(
+                        root + tableOffset +
+                        Offsets::EntityChunkStride * chunkIndex);
+                    if (!chunk) continue;
+                    for (uint32_t slot = 0; slot <= Offsets::HandleChunkMask;
+                         ++slot) {
+                        const uintptr_t entity = Read<uintptr_t>(
+                            chunk + Offsets::EntityStride * slot);
+                        if (!entity || !seen.insert(entity).second) continue;
+                        const std::string className = GetEntityClassName(entity);
+                        if (className.find("C_CitadelTeam") !=
+                            std::string::npos)
+                            teamEntities.push_back(entity);
+                        else if (className.find("C_CitadelGameRulesProxy") !=
+                                 std::string::npos)
+                            gameRules = Read<uintptr_t>(
+                                entity + Offsets::GameRulesProxyRules);
+                    }
+                }
+            }
+        }
+        std::sort(teamEntities.begin(), teamEntities.end());
+        teamEntities.erase(std::unique(teamEntities.begin(), teamEntities.end()),
+                           teamEntities.end());
+    }
+    if (gameRules)
+        campClockGameRules.store(gameRules, std::memory_order_release);
+
+    const uintptr_t stride = Offsets::TeamFOWEntitySize;
+    if (stride < 0x53 || stride > 0x200) {
+        publish();
+        return;
+    }
+
+    bool validVectorSeen = false;
+    const int currentTick = GetClientGameTick();
+    const float intervalPerTick = GetClientIntervalPerTick();
+    const float rawGameTime = GetClientGameTime();
+    const Vector3 minimapMins = gameRules
+        ? Read<Vector3>(gameRules + Offsets::GameRulesMinimapMins)
+        : Vector3{};
+    const Vector3 minimapMaxs = gameRules
+        ? Read<Vector3>(gameRules + Offsets::GameRulesMinimapMaxs)
+        : Vector3{};
+    const bool haveMinimapBounds =
+        std::isfinite(minimapMins.x) && std::isfinite(minimapMins.y) &&
+        std::isfinite(minimapMaxs.x) && std::isfinite(minimapMaxs.y) &&
+        minimapMaxs.x - minimapMins.x > 100.0f &&
+        minimapMaxs.y - minimapMins.y > 100.0f;
+    for (const uintptr_t teamEntity : teamEntities) {
+        if (!teamEntity) continue;
+        // C_CitadelTeam inherits the normal entity team number. Only the
+        // local team's vector represents the exact state shown by its HUD.
+        const int ownerTeam = static_cast<int>(
+            Read<uint8_t>(teamEntity + Offsets::Team));
+        if (ownerTeam != localTeam) continue;
+        const uintptr_t vector = teamEntity + Offsets::CitadelTeamFOWEntities;
+        const int count = Read<int>(vector);
+        const uintptr_t data = Read<uintptr_t>(vector + 0x08);
+        if (!data || count <= 0 || count > 4096) continue;
+        validVectorSeen = true;
+
+        for (int index = 0; index < count; ++index) {
+            const uintptr_t entry = data + static_cast<uintptr_t>(index) * stride;
+            const uint32_t campClass = Read<uint32_t>(
+                entry + Offsets::TeamFOWClass);
+            if (!IsNeutralCampClass(campClass)) continue;
+
+            const uint8_t mapX = Read<uint8_t>(
+                entry + Offsets::TeamFOWPositionX);
+            const uint8_t mapY = Read<uint8_t>(
+                entry + Offsets::TeamFOWPositionY);
+            // Coordinates and tier form a stable camp identity even when its
+            // network entity index is recycled after a respawn.
+            const uint64_t key = (static_cast<uint64_t>(campClass) << 32) |
+                (static_cast<uint64_t>(mapX) << 8) | mapY;
+            TrackedFowCamp& camp = tracked[key];
+            camp.lastSeenAt = now;
+            camp.data.id = key;
+            camp.data.campClass = campClass;
+            camp.data.mapX = mapX;
+            camp.data.mapY = mapY;
+            camp.data.localTeam = static_cast<uint8_t>(localTeam);
+            camp.data.respawnSeconds = NeutralCampRespawnSeconds(campClass);
+            if (haveMinimapBounds) {
+                Vector3 mapCenter{};
+                mapCenter.x = minimapMins.x +
+                    (minimapMaxs.x - minimapMins.x) *
+                    (static_cast<float>(mapX) / 255.0f);
+                mapCenter.y = minimapMins.y +
+                    (minimapMaxs.y - minimapMins.y) *
+                    (static_cast<float>(mapY) / 255.0f);
+                std::lock_guard anchorLock(campAnchorMutex);
+                campMapWorldCenter[key] = mapCenter;
+                const auto learned = learnedCampWorldAnchor.find(key);
+                if (learned != learnedCampWorldAnchor.end()) {
+                    camp.data.pos = learned->second;
+                } else {
+                    camp.data.pos = mapCenter;
+                    camp.data.pos.z = 220.0f;
+                }
+            }
+
+            // Panorama gives neutral map buttons the `active` class from this
+            // replicated presentation gate. Unlike NPC dormancy, it updates
+            // for every clear on the map and does not depend on local PVS.
+            const bool active = Read<bool>(
+                entry + Offsets::TeamFOWVisibleOnMap);
+            camp.data.occupied = active;
+
+            const int hiddenTick = Read<int>(
+                entry + Offsets::TeamFOWTickHidden);
+            const auto deadlineFromHiddenTick = [&]() -> float {
+                if (hiddenTick <= 0) return 0.0f;
+
+                float elapsed = -1.0f;
+                // GameTick_t is networked in the same simulation clock domain
+                // as CGlobalVarsBase::curtime. This path does not depend on a
+                // build-specific tick-count member offset and therefore also
+                // reconstructs camps cleared before this DLL was injected.
+                if (std::isfinite(rawGameTime) && rawGameTime > 0.0f) {
+                    const float hiddenTime =
+                        static_cast<float>(hiddenTick) * intervalPerTick;
+                    const float fromGameClock = rawGameTime - hiddenTime;
+                    if (std::isfinite(fromGameClock) && fromGameClock >= 0.0f &&
+                        fromGameClock <= camp.data.respawnSeconds + 2.0f)
+                        elapsed = fromGameClock;
+                }
+                // Keep the direct tick delta as a compatibility fallback for
+                // sessions whose render curtime uses a different epoch.
+                if (elapsed < 0.0f && currentTick > 0 &&
+                    hiddenTick <= currentTick) {
+                    const float fromTickDelta = static_cast<float>(
+                        currentTick - hiddenTick) * intervalPerTick;
+                    if (std::isfinite(fromTickDelta) &&
+                        fromTickDelta >= 0.0f &&
+                        fromTickDelta <= camp.data.respawnSeconds + 2.0f)
+                        elapsed = fromTickDelta;
+                }
+                if (!std::isfinite(elapsed) || elapsed < 0.0f ||
+                    elapsed > camp.data.respawnSeconds + 2.0f)
+                    return 0.0f;
+                return gameTime + (std::max)(0.0f,
+                    camp.data.respawnSeconds - elapsed);
+            };
+
+            if (!camp.initialized) {
+                camp.initialized = true;
+                camp.wasActive = active;
+                camp.hasBeenActive = active;
+                // Never reconstruct an already-dead camp on injection. The
+                // DLL must first observe this camp alive in the current run;
+                // only its next live-to-dead transition starts a timer.
+                camp.data.respawnAt = 0.0f;
+            } else if (camp.hasBeenActive && camp.wasActive && !active) {
+                const float reconstructed = deadlineFromHiddenTick();
+                camp.data.respawnAt = reconstructed > gameTime
+                    ? reconstructed : gameTime + camp.data.respawnSeconds;
+            } else if (active) {
+                camp.hasBeenActive = true;
+                camp.data.respawnAt = 0.0f;
+            }
+            camp.wasActive = active;
+        }
+    }
+
+    if (!validVectorSeen && !teamEntities.empty()) {
+        teamEntities.clear();
+        gameRules = 0;
+        campClockGameRules.store(0, std::memory_order_release);
+        lastTeamScanAt = 0;
+    }
+    for (auto it = tracked.begin(); it != tracked.end();) {
+        if (now - it->second.lastSeenAt > 5000)
+            it = tracked.erase(it);
+        else
+            ++it;
+    }
+    publish();
+}
+
+void UpdateCampTimerWorldHeights(const std::vector<FarmTarget>& targets) {
+    std::lock_guard lock(campTimersMutex);
+    struct AnchorAccumulator {
+        std::vector<float> x;
+        std::vector<float> y;
+        std::vector<float> z;
+    };
+    std::unordered_map<uint64_t, AnchorAccumulator> anchors;
+    std::lock_guard anchorLock(campAnchorMutex);
+
+    // Assign every neutral to exactly one camp. The previous per-camp radius
+    // search allowed the same rooftop neutral to set the Z of several nearby
+    // camps, which made their timer anchors look artificially identical.
+    for (const FarmTarget& target : targets) {
+        if (target.team != 4) continue;
+        CampTimerData* nearest = nullptr;
+        float nearestDistance = FLT_MAX;
+        for (CampTimerData& camp : campTimers) {
+            // Learn only from camps that the replicated FOW state says are
+            // currently occupied. A neutral pulled through an empty camp must
+            // not overwrite that empty camp's saved floor height.
+            if (!camp.occupied) continue;
+            const auto centerIt = campMapWorldCenter.find(camp.id);
+            if (centerIt == campMapWorldCenter.end()) continue;
+            const Vector3& center = centerIt->second;
+            const float dx = target.pos.x - center.x;
+            const float dy = target.pos.y - center.y;
+            const float distance = dx * dx + dy * dy;
+            if (distance < nearestDistance) {
+                nearestDistance = distance;
+                nearest = &camp;
+            }
+        }
+        // Camp icons are close to their spawner. The old 1600-unit radius
+        // reached neighbouring camps and different vertical floors.
+        if (!nearest || nearestDistance > 850.0f * 850.0f) continue;
+        AnchorAccumulator& anchor = anchors[nearest->id];
+        anchor.x.push_back(target.pos.x);
+        anchor.y.push_back(target.pos.y);
+        anchor.z.push_back(target.pos.z);
+    }
+
+    for (CampTimerData& camp : campTimers) {
+        const auto found = anchors.find(camp.id);
+        if (found == anchors.end() || found->second.z.empty()) continue;
+        AnchorAccumulator& anchor = found->second;
+        const auto median = [](std::vector<float>& values) {
+            const size_t middle = values.size() / 2;
+            std::nth_element(values.begin(), values.begin() + middle,
+                             values.end());
+            return values[middle];
+        };
+        // Median Z rejects airborne, displaced, and stale neutral positions.
+        // It preserves the independent floor level of every camp.
+        camp.pos.x = median(anchor.x);
+        camp.pos.y = median(anchor.y);
+        camp.pos.z = median(anchor.z) + 60.0f;
+        learnedCampWorldAnchor[camp.id] = camp.pos;
+    }
+}
+}
+
+float GetClientGameTime() {
+    const uintptr_t globalVars = GetClientGlobalVars();
+    // +0x30 is CGlobalVarsBase::m_flCurrentTime. +0x0C is only the
+    // absolute frame-start timestamp and was the cause of frozen timers.
+    return globalVars ? Read<float>(globalVars + 0x30) : 0.0f;
+}
+
+float GetCampGameTime() {
+    std::lock_guard lock(campClockMutex);
+    static float adjustedTime = 0.0f;
+    static float previousRawTime = 0.0f;
+    static ULONGLONG previousWallTick = 0;
+    static bool wasPaused = false;
+
+    const float rawTime = GetClientGameTime();
+    if (!std::isfinite(rawTime) || rawTime <= 0.0f)
+        return adjustedTime;
+    const ULONGLONG wallTick = GetTickCount64();
+    const uintptr_t gameRules = campClockGameRules.load(
+        std::memory_order_acquire);
+    const bool paused = gameRules &&
+        (Read<bool>(gameRules + Offsets::GameRulesGamePaused) ||
+         Read<bool>(gameRules + Offsets::GameRulesServerPaused));
+
+    if (previousRawTime <= 0.0f || previousWallTick == 0 ||
+        rawTime + 2.0f < previousRawTime) {
+        adjustedTime = rawTime;
+        previousWallTick = wallTick;
+    } else if (!paused && !wasPaused) {
+        // Curtime can be corrected or interpolated by the client. Countdown
+        // seconds must still last exactly one real second, so accumulate the
+        // monotonic Windows clock while the match is not paused.
+        const ULONGLONG elapsedMs = wallTick - previousWallTick;
+        if (elapsedMs <= 5000)
+            adjustedTime += static_cast<float>(elapsedMs) / 1000.0f;
+    }
+    // Sampling both clocks throughout the pause discards the paused interval;
+    // the first unpaused frame deliberately contributes no delta.
+    previousRawTime = rawTime;
+    previousWallTick = wallTick;
+    wasPaused = paused;
+    return adjustedTime;
 }
 
 bool IsXpOrbAttackable(uintptr_t entity, uint32_t handle) {
@@ -1456,7 +1856,7 @@ bool NotifyOrbEntityAdded(uint32_t handle) {
     }
     orbTargets.push_back({ entity, position, designerName.empty() ? className : designerName, handle,
                            Read<uint8_t>(entity + Offsets::Team) });
-    std::ofstream log("C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\orb_runtime.log", std::ios::app);
+    std::ofstream log(Dll6Paths::DataFileA("orb_runtime.log"), std::ios::app);
     if (log) log << "event add class=" << className << " designer=" << designerName << " handle=0x"
                 << std::hex << handle << std::dec << "\n";
     return true;
@@ -1471,7 +1871,7 @@ void NotifyOrbEntityRemoved(uint32_t handle) {
                  (orb.handle & Offsets::HandleIndexMask) ==
                  (handle & Offsets::HandleIndexMask));
         }), orbTargets.end());
-    std::ofstream log("C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\orb_runtime.log", std::ios::app);
+    std::ofstream log(Dll6Paths::DataFileA("orb_runtime.log"), std::ios::app);
     if (log) log << "event remove handle=0x" << std::hex << handle << std::dec << "\n";
 }
 
@@ -1499,14 +1899,18 @@ void RefreshFarmTargets() {
     const bool farmActive = farmAssist &&
         (farmToggleMode ? farmToggleActive : configuredFarmKeyDown);
     const bool trooperChamsActive = enemyTrooperChams || allyTrooperChams || neutralChams;
-    const bool worldEntityScanActive = powerupEspEnabled || talonEspEnabled || campTimersEnabled;
+    const bool worldEntityScanActive = powerupEspEnabled || talonEspEnabled;
+    // Camp state is a replicated HUD/FOW property. Refresh it independently
+    // from the expensive live-NPC scan so it keeps working across the map.
+    UpdateCampTimersFromFow(campTimersEnabled);
     // `drawCreepEsp` is used by the established Aim-page control.  Keep it
     // wired to the scanner alongside the newer per-team Visuals controls;
     // otherwise that control reports enabled while the worker clears every
     // target before Creep ESP/Aim can consume it.
     if (!farmActive && !drawCreepEsp && !creepEspEnabled && !allyCreepEspEnabled && !neutralCreepEspEnabled &&
         !autoLastHitOrbs && !drawOrbEsp && !trooperChamsActive &&
-        !trooperChamsWereActive && !worldEntityScanActive) {
+        !trooperChamsWereActive && !worldEntityScanActive &&
+        !campTimersEnabled) {
         {
             std::lock_guard<std::mutex> eventLock(pendingOrbEventsMutex);
             pendingOrbEvents.clear();
@@ -1653,7 +2057,7 @@ void RefreshFarmTargets() {
                     if (possibleOrbClass) {
                         static std::unordered_set<std::string> loggedCandidates;
                         if (loggedCandidates.insert(className).second) {
-                            std::ofstream log("C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\orb_candidates.log", std::ios::app);
+                            std::ofstream log(Dll6Paths::DataFileA("orb_candidates.log"), std::ios::app);
                             if (log) log << className << "\n";
                         }
                     }
@@ -1678,7 +2082,7 @@ void RefreshFarmTargets() {
                             Read<uint8_t>(entity + Offsets::Team) });
                         static std::unordered_set<std::string> loggedOrbClasses;
                         if (loggedOrbClasses.insert(className).second) {
-                            std::ofstream log("C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\orb_runtime.log", std::ios::app);
+                            std::ofstream log(Dll6Paths::DataFileA("orb_runtime.log"), std::ios::app);
                             if (log) log << "class=" << className << " entity=0x" << std::hex << entity
                                          << std::dec << "\n";
                         }
@@ -1689,7 +2093,11 @@ void RefreshFarmTargets() {
                     ++trooperClasses;
                     if (className.find("TrooperBoss") != std::string::npos) continue;
                     const uintptr_t sceneNode = Read<uintptr_t>(entity + Offsets::GameSceneNode);
-                    if (!sceneNode || Read<uint8_t>(sceneNode + Offsets::SceneNodeDormant) != 0) continue;
+                    if (!sceneNode) continue;
+                    // Camp members can be outside the render PVS while still
+                    // alive. Dormancy only means "not drawn", never "dead";
+                    // treating it as death produced false timers that vanished
+                    // as soon as the player approached a camp.
                     ++trooperWithSceneNode;
                     const int health = Read<int>(entity + Offsets::Health);
                     if (health <= 0 || health > 100000 || Read<uint8_t>(entity + Offsets::LifeState) != 0) continue;
@@ -1758,6 +2166,8 @@ void RefreshFarmTargets() {
             }
         }
     }
+    if (campTimersEnabled)
+        UpdateCampTimerWorldHeights(found);
     std::lock_guard lock(farmTargetsMutex);
     farmTargets = std::move(found);
     {
@@ -1772,7 +2182,7 @@ void RefreshFarmTargets() {
     if ((drawCreepEsp || creepEspEnabled || allyCreepEspEnabled || neutralCreepEspEnabled || farmActive) &&
         now - lastCreepScanLog >= 1000) {
         lastCreepScanLog = now;
-        std::ofstream log("C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\creep_scan.log",
+        std::ofstream log(Dll6Paths::DataFileA("creep_scan.log"),
                           std::ios::app);
         if (log) {
             log << "entities=" << scannedEntities << " npc=" << npcClasses
