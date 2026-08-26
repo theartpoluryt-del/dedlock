@@ -31,28 +31,9 @@ void SetMenuOpen(bool open) {
 namespace {
 
 const char* AimKeyName(int key) {
-    switch (key) {
-        case VK_LBUTTON: return "LMB";
-        case VK_RBUTTON: return "RMB";
-        case VK_MBUTTON: return "MMB";
-        case VK_XBUTTON1: return "Mouse 4";
-        case VK_XBUTTON2: return "Mouse 5";
-        case VK_SHIFT: return "Shift";
-        case VK_CONTROL: return "Ctrl";
-        case VK_MENU: return "Alt";
-        case VK_SPACE: return "Space";
-        case VK_TAB: return "Tab";
-        default: {
-            static char name[16];
-            if (key >= 'A' && key <= 'Z') {
-                name[0] = static_cast<char>(key);
-                name[1] = '\0';
-                return name;
-            }
-            std::snprintf(name, sizeof(name), "VK 0x%02X", key & 0xFF);
-            return name;
-        }
-    }
+    static thread_local std::string name;
+    name = GetVirtualKeyDisplayName(key);
+    return name.c_str();
 }
 
 std::string HeroNameFromId(uint32_t heroId) {
@@ -1040,11 +1021,83 @@ bool ReadCurrentViewMatrix(Matrix4x4& matrix) {
     return false;
 }
 
-bool ReadCameraWorldPosition(Vector3& position) {
+bool ReadCameraWorldPosition(const Matrix4x4& viewProjection,
+                             Vector3& position) {
+    Matrix4x4 inverse{};
+    if (InvertMatrix(viewProjection, inverse)) {
+        const auto unproject = [&inverse](float clipX, float clipY,
+                                           float clipZ, Vector3& world) {
+            const float x = inverse.m[0][0] * clipX +
+                inverse.m[0][1] * clipY + inverse.m[0][2] * clipZ +
+                inverse.m[0][3];
+            const float y = inverse.m[1][0] * clipX +
+                inverse.m[1][1] * clipY + inverse.m[1][2] * clipZ +
+                inverse.m[1][3];
+            const float z = inverse.m[2][0] * clipX +
+                inverse.m[2][1] * clipY + inverse.m[2][2] * clipZ +
+                inverse.m[2][3];
+            const float w = inverse.m[3][0] * clipX +
+                inverse.m[3][1] * clipY + inverse.m[3][2] * clipZ +
+                inverse.m[3][3];
+            if (!std::isfinite(w) || std::fabs(w) < 1e-6f) return false;
+            world = {x / w, y / w, z / w};
+            return std::isfinite(world.x) && std::isfinite(world.y) &&
+                std::isfinite(world.z);
+        };
+
+        // A perspective camera is the intersection of any two unprojected
+        // screen rays. Recover it from the same coherent VP publication used
+        // by WorldToScreen instead of the obsolete, currently zeroed +0xC0
+        // CameraOrigin slot.
+        Vector3 a0{}, a1{}, b0{}, b1{};
+        if (unproject(0.0f, 0.0f, 0.0f, a0) &&
+            unproject(0.0f, 0.0f, 0.5f, a1) &&
+            unproject(0.5f, 0.0f, 0.0f, b0) &&
+            unproject(0.5f, 0.0f, 0.5f, b1)) {
+            const Vector3 u{a1.x - a0.x, a1.y - a0.y, a1.z - a0.z};
+            const Vector3 v{b1.x - b0.x, b1.y - b0.y, b1.z - b0.z};
+            const Vector3 w{a0.x - b0.x, a0.y - b0.y, a0.z - b0.z};
+            const auto dot = [](const Vector3& left, const Vector3& right) {
+                return static_cast<double>(left.x) * right.x +
+                    static_cast<double>(left.y) * right.y +
+                    static_cast<double>(left.z) * right.z;
+            };
+            const double uu = dot(u, u);
+            const double uv = dot(u, v);
+            const double vv = dot(v, v);
+            const double uw = dot(u, w);
+            const double vw = dot(v, w);
+            const double denominator = uu * vv - uv * uv;
+            if (std::isfinite(denominator) &&
+                std::fabs(denominator) > 1e-12) {
+                const double ta = (uv * vw - vv * uw) / denominator;
+                const double tb = (uu * vw - uv * uw) / denominator;
+                const Vector3 onA{
+                    a0.x + u.x * static_cast<float>(ta),
+                    a0.y + u.y * static_cast<float>(ta),
+                    a0.z + u.z * static_cast<float>(ta)};
+                const Vector3 onB{
+                    b0.x + v.x * static_cast<float>(tb),
+                    b0.y + v.y * static_cast<float>(tb),
+                    b0.z + v.z * static_cast<float>(tb)};
+                position = {(onA.x + onB.x) * 0.5f,
+                            (onA.y + onB.y) * 0.5f,
+                            (onA.z + onB.z) * 0.5f};
+                if (std::isfinite(position.x) &&
+                    std::isfinite(position.y) &&
+                    std::isfinite(position.z))
+                    return true;
+            }
+        }
+    }
+
     if (!clientBase) return false;
     position = Read<Vector3>(
         clientBase + Offsets::ViewMatrix + Offsets::CameraOrigin);
-    return std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z);
+    return std::isfinite(position.x) && std::isfinite(position.y) &&
+        std::isfinite(position.z) &&
+        std::fabs(position.x) + std::fabs(position.y) +
+            std::fabs(position.z) > 0.001f;
 }
 
 bool GetCurrentCameraForwardImpl(Vector3& forward) {
@@ -1452,7 +1505,8 @@ std::vector<PlayerData> GetPlayers() {
     Vector3 localPos{};
     Vector3 cameraPosition{};
     Vector3 distanceOrigin{};
-    const bool cameraPositionFound = ReadCameraWorldPosition(cameraPosition);
+    const bool cameraPositionFound = ReadCameraWorldPosition(
+        viewMatrix, cameraPosition);
     currentCameraPosition = cameraPosition;
     currentCameraPositionReady = cameraPositionFound;
     uintptr_t localPawn = 0;
@@ -1509,7 +1563,8 @@ std::vector<PlayerData> GetPlayers() {
     const bool farmNeedsBones = farmAssist &&
         (farmToggleMode ? farmToggleActive : farmKeyDown);
     const bool needPlayerBones = drawBones || enemyBonesEnabled || allyBonesEnabled ||
-        aimNeedsBones || farmNeedsBones || HeroScriptsNeedPlayerBones();
+        aimNeedsBones || farmNeedsBones || aimLockedTarget != 0 ||
+        HeroScriptsNeedPlayerBones();
     for (const uintptr_t entity : pawns) {
         // World snapshots may contain the local third-person pawn. It must
         // never be treated as an ESP target: its render skeleton is updated
@@ -1710,10 +1765,19 @@ std::vector<PlayerData> GetPlayers() {
         // AbsOrigin and the camera matrix are sampled in this fenced Present.
         // This matches the proven c3 ESP path without adding screen-space
         // smoothing, so starts/stops remain exact and stable.
-        if (currentViewMatrixReady && GetEntityScreenBounds(
-                entity, pos, viewMatrix,
-                player.boxLeft, player.boxTop,
-                player.boxRight, player.boxBottom)) {
+        const bool hasScreenBounds = currentViewMatrixReady &&
+            GetEntityScreenBounds(entity, pos, viewMatrix,
+                                  player.boxLeft, player.boxTop,
+                                  player.boxRight, player.boxBottom);
+        if (hasScreenBounds || entity == aimLockedTarget) {
+            if (!hasScreenBounds) {
+                // Keep the locked pawn in the gameplay snapshot through the
+                // rear hemisphere. Zero bounds are deliberately invalid for
+                // ESP/candidate selection but its world position and bones
+                // remain available to all aim paths.
+                player.boxLeft = player.boxTop = 0.0f;
+                player.boxRight = player.boxBottom = 0.0f;
+            }
             players.push_back(player);
         }
     }
@@ -1815,12 +1879,35 @@ void RenderESP(const std::vector<PlayerData>& players) {
     drawList->AddText(ImVec2(statusPosition.x + 1.0f, statusPosition.y + 1.0f),
                       ImColor(0, 0, 0, 190), aimStatus);
     drawList->AddText(statusPosition, aimColor, aimStatus);
+    float nextStatusY = statusPosition.y + 18.0f;
+    if (aimLockedTarget) {
+        static uintptr_t cachedLockEntity = 0;
+        static std::string cachedLockHero;
+        if (cachedLockEntity != aimLockedTarget) {
+            cachedLockEntity = aimLockedTarget;
+            cachedLockHero.clear();
+        }
+        for (const PlayerData& player : players) {
+            if (player.entity == aimLockedTarget && !player.heroName.empty()) {
+                cachedLockHero = player.heroName;
+                break;
+            }
+        }
+        const std::string lockText = "Lock Target: " +
+            (cachedLockHero.empty() ? std::string("Enemy") : cachedLockHero);
+        drawList->AddText(ImVec2(statusPosition.x + 1.0f, nextStatusY + 1.0f),
+                          ImColor(0, 0, 0, 200), lockText.c_str());
+        drawList->AddText(ImVec2(statusPosition.x, nextStatusY),
+                          ImColor(255, 205, 65, 245), lockText.c_str());
+        nextStatusY += 18.0f;
+    }
     if (antiFrog) {
         const float headshotPercent = GetAntiFrogHeadshotPercent();
         const char* slot = GetAntiFrogSlotLabel();
         char antiFrogText[64]{};
         std::snprintf(antiFrogText, sizeof(antiFrogText),
-                      "HS%% %.1f%%  [%s]", headshotPercent, slot);
+                      "HS%% %.1f%% / %.0f%%  [%s]", headshotPercent,
+                      antiFrogHsThreshold, slot);
         const ImColor antiFrogColor =
             headshotPercent > antiFrogHsThreshold
                 ? ImColor(255, 90, 90, 235)
@@ -1835,18 +1922,20 @@ void RenderESP(const std::vector<PlayerData>& players) {
     if (farmAssist) {
         const char* farmStatus = farmEnabled ? "CREEP AIM  ON" : "CREEP AIM  OFF";
         const ImColor farmColor = farmEnabled ? ImColor(255, 190, 70, 235) : ImColor(180, 180, 180, 210);
-        drawList->AddText(ImVec2(statusPosition.x + 1.0f, statusPosition.y + 19.0f),
+        drawList->AddText(ImVec2(statusPosition.x + 1.0f, nextStatusY + 1.0f),
                           ImColor(0, 0, 0, 190), farmStatus);
-        drawList->AddText(ImVec2(statusPosition.x, statusPosition.y + 18.0f), farmColor, farmStatus);
+        drawList->AddText(ImVec2(statusPosition.x, nextStatusY), farmColor, farmStatus);
+        nextStatusY += 18.0f;
     }
     if (autoLastHitOrbs) {
         const char* orbStatus = autoLastHitOrbsActive ? "ORB AIM  ON" : "ORB AIM  OFF";
         const ImColor orbStatusColor = autoLastHitOrbsActive
             ? ImColor(80, 220, 120, 235) : ImColor(180, 180, 180, 210);
-        drawList->AddText(ImVec2(statusPosition.x + 1.0f, statusPosition.y + 37.0f),
+        drawList->AddText(ImVec2(statusPosition.x + 1.0f, nextStatusY + 1.0f),
                           ImColor(0, 0, 0, 190), orbStatus);
-        drawList->AddText(ImVec2(statusPosition.x, statusPosition.y + 36.0f),
+        drawList->AddText(ImVec2(statusPosition.x, nextStatusY),
                           orbStatusColor, orbStatus);
+        nextStatusY += 18.0f;
     }
     if (freeCam) {
         const char* freeCamStatus = freeCamActive
@@ -1855,10 +1944,11 @@ void RenderESP(const std::vector<PlayerData>& players) {
         const ImColor freeCamColor = freeCamActive
             ? ImColor(80, 220, 120, 235)
             : ImColor(120, 190, 255, 235);
-        drawList->AddText(ImVec2(statusPosition.x + 1.0f, statusPosition.y + 55.0f),
+        drawList->AddText(ImVec2(statusPosition.x + 1.0f, nextStatusY + 1.0f),
                           ImColor(0, 0, 0, 190), freeCamStatus);
-        drawList->AddText(ImVec2(statusPosition.x, statusPosition.y + 54.0f),
+        drawList->AddText(ImVec2(statusPosition.x, nextStatusY),
                           freeCamColor, freeCamStatus);
+        nextStatusY += 18.0f;
     }
     if (movementDiagnostics && false) {
         const auto processCalls = movementProcessCalls.load(std::memory_order_relaxed);
@@ -1965,7 +2055,7 @@ void RenderESP(const std::vector<PlayerData>& players) {
         }
         const auto& spectators = cachedSpectators;
     if (drawSpectatorList) {
-        float spectatorY = statusPosition.y + (freeCam ? 78.0f : 58.0f);
+        float spectatorY = nextStatusY + 4.0f;
         const char* title = "SPECTATOR LIST";
         drawList->AddText(ImVec2(statusPosition.x + 1.0f, spectatorY + 1.0f),
                           ImColor(0, 0, 0, 190), title);
@@ -2626,9 +2716,15 @@ void RenderESP(const std::vector<PlayerData>& players) {
         const bool teamAbilities = ally ? allyAbilitiesEnabled : enemyAbilitiesEnabled;
         const float teamMaxDistance = ally ? allyEspMaxDistance : enemyEspMaxDistance;
         const bool teamSnaplines = ally ? allySnaplinesEnabled : enemySnaplinesEnabled;
+        const bool lockCandidateMarker = !ally && aimLockTarget &&
+            !aimLockedTarget && player.entity == aimLockCandidate;
+        const bool lockedTargetMarker = !ally && aimLockTarget &&
+            player.entity == aimLockedTarget;
+        const bool lockMarker = lockCandidateMarker || lockedTargetMarker;
         // Snaplines belong to the same team ESP channel. Do this gate before
         // both the off-screen and on-screen snapline paths below.
-        if (!teamEsp || player.distance > teamMaxDistance) continue;
+        if ((!teamEsp && !lockMarker) ||
+            (player.distance > teamMaxDistance && !lockMarker)) continue;
         // worldPos and box bounds use the fenced AbsOrigin sample. Bones are
         // rebuilt from the same completed frame before they are projected.
         const Vector3 visualOrigin = player.worldPos;
@@ -2687,6 +2783,54 @@ void RenderESP(const std::vector<PlayerData>& players) {
         const float screenY = frameBottom;
         const float boxTop = frameTop;
         const float boxHeight = frameBottom - frameTop;
+        if (lockMarker) {
+            // A small reticle beside the top-right box corner is easier to
+            // read than the old flag and does not overlap a name or health.
+            // Red means the bind will select this target; gold means locked.
+            // Scale it from the box height so its size follows the ESP target
+            // at every distance instead of staying a fixed screen-pixel size.
+            const float indicatorScale = std::clamp(
+                boxHeight / 160.0f, 0.78f, 1.45f);
+            const auto scaled = [indicatorScale](float value) {
+                return value * indicatorScale;
+            };
+            const ImColor accent = lockedTargetMarker
+                ? ImColor(255, 198, 54, 255)
+                : ImColor(244, 67, 76, 255);
+            const ImVec2 center(frameRight + scaled(11.0f),
+                                boxTop + scaled(9.0f));
+            const float radius = scaled(6.0f);
+            drawList->AddCircleFilled(center, radius + scaled(1.8f),
+                                      ImColor(9, 12, 18, 220), 16);
+            drawList->AddCircle(center, radius, accent, 16, scaled(1.3f));
+            drawList->AddLine(ImVec2(center.x - radius - scaled(2.0f), center.y),
+                              ImVec2(center.x - radius + scaled(0.5f), center.y),
+                              accent, scaled(1.1f));
+            drawList->AddLine(ImVec2(center.x + radius - scaled(0.5f), center.y),
+                              ImVec2(center.x + radius + scaled(2.0f), center.y),
+                              accent, scaled(1.1f));
+            drawList->AddLine(ImVec2(center.x, center.y - radius - scaled(2.0f)),
+                              ImVec2(center.x, center.y - radius + scaled(0.5f)),
+                              accent, scaled(1.1f));
+            drawList->AddLine(ImVec2(center.x, center.y + radius - scaled(0.5f)),
+                              ImVec2(center.x, center.y + radius + scaled(2.0f)),
+                              accent, scaled(1.1f));
+            if (lockedTargetMarker) {
+                // Lock state gets a positive, unambiguous center tick.
+                drawList->AddLine(ImVec2(center.x - scaled(2.2f), center.y),
+                                  ImVec2(center.x - scaled(0.6f),
+                                         center.y + scaled(1.8f)),
+                                  ImColor(255, 255, 255, 255), scaled(1.3f));
+                drawList->AddLine(ImVec2(center.x - scaled(0.6f),
+                                         center.y + scaled(1.8f)),
+                                  ImVec2(center.x + scaled(2.8f),
+                                         center.y - scaled(2.1f)),
+                                  ImColor(255, 255, 255, 255), scaled(1.3f));
+            } else {
+                drawList->AddCircleFilled(center, scaled(1.3f), accent, 8);
+            }
+        }
+        if (!teamEsp) continue;
         if (teamSnaplines) {
             const ImVec2 lineStart = snaplineOrigin;
             const int alpha = static_cast<int>(

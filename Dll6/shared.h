@@ -37,6 +37,8 @@ inline uintptr_t EntityChunks=0x10, HighestEntityIndex=0x20A0,
     EntityHandleOffset=0x10;
 }
 struct Vector3 { float x,y,z; }; struct Vector2 { float x,y; }; struct Matrix4x4 { float m[4][4]; }; struct ColorRGBA { uint8_t r,g,b,a; };
+std::wstring GetVirtualKeyDisplayNameW(int key);
+std::string GetVirtualKeyDisplayName(int key);
 struct BoneSegment { Vector3 start; Vector3 end; };
 struct AbilityEspData { int level{}; float cooldown{}; float cooldownDuration{}; bool valid{}; };
 struct PlayerData { uintptr_t entity{}; Vector3 pos; Vector3 worldPos; Vector3 visualAnchor; Vector3 headPos; Vector3 neckPos; Vector3 bodyPos; Vector3 leftArmPos; Vector3 rightArmPos; Vector3 leftLegPos; Vector3 rightLegPos; bool hasVisualAnchor=false; bool hasHeadBone=false; bool hasNeckBone=false; bool hasBodyBone=false; bool hasLeftArmBone=false; bool hasRightArmBone=false; bool hasLeftLegBone=false; bool hasRightLegBone=false; std::vector<BoneSegment> bones; float boxLeft,boxTop,boxRight,boxBottom; float modelMinZ,modelMaxZ,modelHeight; int health,maxHealth,team; float distance; std::array<AbilityEspData,4> abilities{}; std::string heroName; std::string playerName; };
@@ -97,6 +99,9 @@ extern std::mutex movementDebugWishMutex; extern Vector3 movementDebugWishDirect
 bool GetCurrentCameraForward(Vector3& forward);
 extern float aimFov,aimSmooth,farmAimSmooth; extern bool aimVisibilityCheck,aimToggleMode,aimToggleActive,aimToggleLastDown,farmSilentMode,farmMixedMode,humanAimTargetFound; extern ID3D11Texture2D* depthStaging; extern UINT depthWidth,depthHeight; extern DXGI_FORMAT depthFormat; extern bool depthSnapshotReady; extern int depthDiagnosticState; extern Matrix4x4 currentViewMatrix; extern bool currentViewMatrixReady;
 extern bool aimMixedMode, aimOnlyYaw, aimLockTarget, aimPrediction;
+extern int aimLockKey;
+extern bool aimLockKeyCapture, aimLockKeyLastDown;
+extern uintptr_t aimLockCandidate, aimLockedTarget;
 extern bool antiFrog;
 extern float antiFrogHsThreshold;
 extern bool aimNormalActive, farmNormalActive;
@@ -180,7 +185,8 @@ void NotifyParrySound(int entityIndex, const char* soundName);
 void ApplyCurrentCameraAim(const Vector3& worldTarget);
 void ApplyHeroScriptCameraAim(const Vector3& worldTarget,
                               float pitchSmooth, float yawSmooth);
-void QueueHeroSilentAngles(const Vector3& angles, bool attack);
+void QueueHeroSilentAngles(const Vector3& angles, bool attack,
+                           bool overridePrimaryAim = false);
 void ClearHeroSilentAngles();
 void FlushCurrentCameraAim();
 void UpdateVisibleAimCamera();
@@ -188,6 +194,7 @@ extern ID3D11Device* pDevice; extern ID3D11DeviceContext* pContext; extern ID3D1
 template<typename T> T Read(uintptr_t address) { T value{}; if (!address) return value; __try { value=*reinterpret_cast<T*>(address); } __except(EXCEPTION_EXECUTE_HANDLER) { value=T{}; } return value; }
 template<typename T> void Write(uintptr_t address,const T& value) { if (!address) return; __try { *reinterpret_cast<T*>(address)=value; } __except(EXCEPTION_EXECUTE_HANDLER) {} }
  bool WorldToScreen(const Vector3&,Vector2&,const Matrix4x4&); void ArmGameDepthCapture(); void TrackGameDepthStencil(ID3D11DepthStencilView*); bool CaptureDepthSnapshot(); bool ReadDepthAt(float,float,float&); bool IsDepthBufferPopulated(); bool GetEntityBonePosition(uintptr_t,const char*,Vector3&); bool GetEntityBoneSkeleton(uintptr_t,std::vector<BoneSegment>&); bool GetEntityPreviewSkeleton(uintptr_t,std::array<Vector3,18>&,std::array<bool,18>&); bool GetAimPointScreen(const PlayerData&,float,Vector2&); bool GetAimAnglesFromScreen(float,float,Vector3&); bool IsAimPointVisible(const PlayerData&,float,float,float); bool IsWorldAimPointVisible(const Vector3&,uintptr_t=0); void ProcessAimVisibilityTraces(); void AimAtClosestEnemy(const std::vector<PlayerData>&); void FarmAimAssist(const std::vector<PlayerData>&); void AutoLastHitOrbs(); void AutoParry(const std::vector<PlayerData>&); void ReleaseAimResources();
+void UpdateAimTargetLock(const std::vector<PlayerData>& players);
 Vector3 PredictPlayerAimPoint(uintptr_t target, const Vector3& point,
                               const Vector3& targetOrigin);
 void NotifyAntiFrogDamage(int attackerEntityIndex, int victimEntityIndex,

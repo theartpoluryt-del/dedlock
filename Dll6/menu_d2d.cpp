@@ -345,23 +345,7 @@ void InnerGlow(const D2D1_RECT_F& r, float radius) {
 }
 
 std::wstring KeyName(int key) {
-    switch (key) {
-        case VK_LBUTTON: return L"LMB";
-        case VK_RBUTTON: return L"RMB";
-        case VK_MBUTTON: return L"MMB";
-        case VK_XBUTTON1: return L"Mouse 4";
-        case VK_XBUTTON2: return L"Mouse 5";
-        case VK_SHIFT: return L"Shift";
-        case VK_CONTROL: return L"Ctrl";
-        case VK_MENU: return L"Alt";
-        case VK_SPACE: return L"Space";
-        case VK_TAB: return L"Tab";
-        default:
-            if (key >= 'A' && key <= 'Z') return std::wstring(1, static_cast<wchar_t>(key));
-            wchar_t buffer[20]{};
-            std::swprintf(buffer, 20, L"VK %02X", key & 0xFF);
-            return buffer;
-    }
+    return GetVirtualKeyDisplayNameW(key);
 }
 
 bool Clicked(const Layout& l, const D2D1_RECT_F& r) {
@@ -722,16 +706,22 @@ void DrawHeroCombo(const Layout& l, int id, float x, float y, float width,
 }
 
 void DrawScriptHeroSelector(const Layout& l, float x, float y, float width) {
-    static constexpr int heroIds[]{3, 13, 19};
-    static constexpr const wchar_t* names[]{L"Vindicta", L"Haze", L"Shiv"};
+    static constexpr int heroIds[]{3, 13, 19, 15, 64};
+    static constexpr const wchar_t* names[]{L"Vindicta", L"Haze", L"Shiv",
+                                            L"Bebop", L"Drifter"};
     const bool enabled[]{vindictaAutoSnipeEnabled, hazeSleepDaggerEnabled,
-                         shivSerratedKnivesEnabled};
+                         shivSerratedKnivesEnabled, bebopAbility3Enabled,
+                         drifterAbility2Enabled};
     constexpr float gap = 8.0f;
     const float itemWidth = (width - gap * 2.0f) / 3.0f;
-    g.scriptHero = std::clamp(g.scriptHero, 0, 2);
-    for (int index = 0; index < 3; ++index) {
-        const float left = x + index * (itemWidth + gap);
-        const D2D1_RECT_F card = Rect(left, y, left + itemWidth, y + 112.0f);
+    constexpr float cardHeight = 98.0f;
+    g.scriptHero = std::clamp(g.scriptHero, 0, 4);
+    for (int index = 0; index < 5; ++index) {
+        const int row = index / 3;
+        const int column = index % 3;
+        const float left = x + column * (itemWidth + gap);
+        const float top = y + row * (cardHeight + gap);
+        const D2D1_RECT_F card = Rect(left, top, left + itemWidth, top + cardHeight);
         const bool selected = g.scriptHero == index;
         if (!g.colorPopup && !g.openCombo && Clicked(l, card)) {
             g.scriptHero = index;
@@ -745,8 +735,8 @@ void DrawScriptHeroSelector(const Layout& l, float x, float y, float width) {
         const int portraitIndex = PreviewHeroIndex(heroIds[index]);
         if (g.previewHeroPortraits[portraitIndex]) {
             g.target->DrawBitmap(g.previewHeroPortraits[portraitIndex].Get(),
-                                 Rect(left + 13, y + 8,
-                                      left + itemWidth - 13, y + 78),
+                                 Rect(left + 13, top + 8,
+                                      left + itemWidth - 13, top + 66),
                                  selected ? 1.0f : 0.76f,
                                  D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         }
@@ -755,10 +745,10 @@ void DrawScriptHeroSelector(const Layout& l, float x, float y, float width) {
         g.target->FillEllipse(D2D1::Ellipse(
             D2D1::Point2F(card.right - 12.0f, card.top + 12.0f), 3.5f, 3.5f),
             g.brush.Get());
-        Text(names[index], Rect(left + 2, y + 80, left + itemWidth - 2, y + 108),
+        Text(names[index], Rect(left + 2, top + 70, left + itemWidth - 2, top + 94),
              g.centered.Get(), selected ? White() : Muted());
         if (selected)
-            FillRounded(Rect(left + 14, y + 108, left + itemWidth - 14, y + 110),
+            FillRounded(Rect(left + 14, top + 94, left + itemWidth - 14, top + 96),
                         1.0f, Red(0.92f));
     }
 }
@@ -2877,20 +2867,28 @@ void RenderD2DMenu(std::size_t playerCount) {
         DrawSlider(l, leftX, firstY + 363, columnWidth, L"Hitchance",
                    &aimHitchance, 0.0f, 100.0f, L"%.0f%%");
         DrawToggle(l, leftX, firstY + 441, columnWidth, L"Anti-Frog",
-                   L"Control headshot rate with neck and body aim", &antiFrog);
-        if (antiFrog)
-            DrawSlider(l, leftX, firstY + 495, columnWidth, L"HS threshold",
+                   L"Keep the real headshot rate near the target percentage", &antiFrog);
+        float leftBehaviorY = firstY + 507.0f;
+        if (antiFrog) {
+            DrawSlider(l, leftX, leftBehaviorY, columnWidth, L"HS threshold",
                        &antiFrogHsThreshold, 1.0f, 99.0f, L"%.0f%%");
+            leftBehaviorY += 66.0f;
+        }
+        DrawToggle(l, leftX, leftBehaviorY, columnWidth, L"Lock Target",
+                   L"Bind and lock the nearest crosshair target", &aimLockTarget);
+        leftBehaviorY += 66.0f;
+        if (aimLockTarget) {
+            DrawKeyBind(l, leftX, leftBehaviorY, columnWidth,
+                        aimLockKeyCapture, aimLockKey, &aimLockKeyCapture);
+        }
         DrawSectionHeading(rightX, firstY + 390, rightColumnWidth, L"Behavior");
         DrawToggle(l, rightX, firstY + 431, rightColumnWidth, L"Only Yaw",
                    L"Adjust horizontal aim only", &aimOnlyYaw);
-        DrawToggle(l, rightX, firstY + 485, rightColumnWidth, L"Lock Target",
-                   L"Keep the current target while valid", &aimLockTarget);
-        DrawToggle(l, rightX, firstY + 539, rightColumnWidth, L"Prediction",
+        DrawToggle(l, rightX, firstY + 485, rightColumnWidth, L"Prediction",
                    L"Lead moving targets using live bullet speed", &aimPrediction);
-        DrawToggle(l, rightX, firstY + 593, rightColumnWidth, L"Draw FOV circle",
+        DrawToggle(l, rightX, firstY + 539, rightColumnWidth, L"Draw FOV circle",
                    L"Show active target radius", &drawFovCircle);
-        DrawSlider(l, rightX, firstY + 647, rightColumnWidth, L"FOV opacity",
+        DrawSlider(l, rightX, firstY + 593, rightColumnWidth, L"FOV opacity",
                    &fovCircleAlpha, 0.0f, 255.0f, L"%.0f");
         }
         } else if (g.aimSubtab == 99) {
@@ -2973,18 +2971,23 @@ void RenderD2DMenu(std::size_t playerCount) {
     } else if (g.tab == 3) {
         DrawSectionHeading(leftX, firstY + 18, columnWidth, L"Heroes");
         DrawScriptHeroSelector(l, leftX, firstY + 58, columnWidth);
-        DrawSectionHeading(leftX, firstY + 202, columnWidth, L"Scripts");
-        const wchar_t* scriptNames[]{L"Auto Snipe", L"Sleep Dagger", L"Serrated Knives"};
+        DrawSectionHeading(leftX, firstY + 300, columnWidth, L"Scripts");
+        const wchar_t* scriptNames[]{L"Auto Snipe", L"Sleep Dagger", L"Serrated Knives",
+                                     L"Ability 3", L"Ability 2"};
         const wchar_t* descriptionLine1[]{
             L"Auto-fires lethal Snipe.",
             L"Predicts dagger flight.",
-            L"Aims Serrated Knives."};
+            L"Predicts Serrated Knives.",
+            L"Predicts Bebop Ability 3.",
+            L"Predicts Drifter Ability 2."};
         const wchar_t* descriptionLine2[]{
             L"Uses live damage values.",
             L"Targets nearest to crosshair.",
-            L"Casts when aligned."};
-        const D2D1_RECT_F scriptCard = Rect(leftX, firstY + 246,
-                                            leftX + columnWidth, firstY + 352);
+            L"Silently casts at the target.",
+            L"Silently casts at the target.",
+            L"Silently casts at the target."};
+        const D2D1_RECT_F scriptCard = Rect(leftX, firstY + 344,
+                                            leftX + columnWidth, firstY + 450);
         FillRounded(scriptCard, 7, Color(Red().r, Red().g, Red().b, 0.12f));
         StrokeRounded(scriptCard, 7, Red(0.58f), 1.0f);
         SetBrush(Red());
@@ -3007,13 +3010,21 @@ void RenderD2DMenu(std::size_t playerCount) {
         DrawSectionHeading(rightX, firstY + 18, rightColumnWidth, L"Settings");
         bool* enabled = g.scriptHero == 0 ? &vindictaAutoSnipeEnabled :
                         g.scriptHero == 1 ? &hazeSleepDaggerEnabled :
-                                            &shivSerratedKnivesEnabled;
+                        g.scriptHero == 2 ? &shivSerratedKnivesEnabled :
+                        g.scriptHero == 3 ? &bebopAbility3Enabled :
+                                            &drifterAbility2Enabled;
         float* fov = g.scriptHero == 0 ? &vindictaSnipeFov :
-                     g.scriptHero == 1 ? &hazeDaggerFov : &shivKnivesFov;
+                     g.scriptHero == 1 ? &hazeDaggerFov :
+                     g.scriptHero == 2 ? &shivKnivesFov :
+                     g.scriptHero == 3 ? &bebopAbility3Fov : &drifterAbility2Fov;
         float* smoothX = g.scriptHero == 0 ? &vindictaSnipeSmoothX :
-                         g.scriptHero == 1 ? &hazeDaggerSmoothX : &shivKnivesSmoothX;
+                         g.scriptHero == 1 ? &hazeDaggerSmoothX :
+                         g.scriptHero == 2 ? &shivKnivesSmoothX :
+                         g.scriptHero == 3 ? &bebopAbility3SmoothX : &drifterAbility2SmoothX;
         float* smoothY = g.scriptHero == 0 ? &vindictaSnipeSmoothY :
-                         g.scriptHero == 1 ? &hazeDaggerSmoothY : &shivKnivesSmoothY;
+                         g.scriptHero == 1 ? &hazeDaggerSmoothY :
+                         g.scriptHero == 2 ? &shivKnivesSmoothY :
+                         g.scriptHero == 3 ? &bebopAbility3SmoothY : &drifterAbility2SmoothY;
         DrawToggle(l, rightX, firstY + 58, rightColumnWidth,
                    L"Enabled", L"Enable this hero script", enabled);
         DrawToggle(l, rightX, firstY + 112, rightColumnWidth,

@@ -19,6 +19,9 @@ namespace {
 // Camera-relative movement is intentionally disabled. Silent aim must not
 // alter the player's normal movement basis.
 constexpr bool kCameraRelativeMovement = false;
+constexpr bool kSilentCommandMovementCorrection = true;
+constexpr bool kSilentMovementYawIsolation = false;
+constexpr bool kSilentMoveDataYawIsolation = false;
 
 uintptr_t FindLocalPawnFromController() {
     if (!clientBase) return 0;
@@ -106,6 +109,7 @@ std::atomic<unsigned long long> silentAppliedCalls{0};
 std::atomic<unsigned long long> createMoveCalls{0};
 std::atomic<unsigned long long> userCmdResolvedCalls{0};
 UserCmdFunctionAddresses runtimeUserCmdFunctions{};
+bool pendingHeroSilentOverridesPrimary = false;
 
 using CreateMoveFn = void(__fastcall*)(uintptr_t, uint32_t, char);
 using GetUserCmdTickFn = void(__fastcall*)(uintptr_t, int32_t*);
@@ -155,6 +159,7 @@ constexpr uintptr_t ProcessMovementRva = 0x7A61A0;
 using ProcessMovementFn = uintptr_t(__fastcall*)(uintptr_t, uintptr_t);
 ProcessMovementFn originalProcessMovement = nullptr;
 void* processMovementTarget = nullptr;
+bool EnsureProcessMovementHook(uintptr_t pawn);
 
 // IDA: sub_18078CC00 builds the final world-space wish direction in a3.
 constexpr uintptr_t BuildWishDirectionRva = 0x78CC00;
@@ -950,8 +955,10 @@ int RotateSubtickMovement(CBaseUserCmdPB* base, float cosine, float sine) {
     return patched;
 }
 
-void RemoveDigitalMovementFromSilentCommand(CUserCmd* command,
-                                            CBaseUserCmdPB* base) {
+void RemapDigitalMovementForSilentCommand(CUserCmd* command,
+                                          CBaseUserCmdPB* base,
+                                          float forward,
+                                          float left) {
     if (!command || !base) return;
 
     const std::uint64_t movementMask =
@@ -959,20 +966,38 @@ void RemoveDigitalMovementFromSilentCommand(CUserCmd* command,
         static_cast<std::uint64_t>(InputBitMask::Back) |
         static_cast<std::uint64_t>(InputBitMask::MoveLeft) |
         static_cast<std::uint64_t>(InputBitMask::MoveRight);
-    const std::uint64_t keepMask = ~movementMask;
+    std::uint64_t correctedMask = 0;
+    constexpr float MovementEpsilon = 0.001f;
+    if (forward > MovementEpsilon)
+        correctedMask |= static_cast<std::uint64_t>(InputBitMask::Forward);
+    else if (forward < -MovementEpsilon)
+        correctedMask |= static_cast<std::uint64_t>(InputBitMask::Back);
+    if (left > MovementEpsilon)
+        correctedMask |= static_cast<std::uint64_t>(InputBitMask::MoveLeft);
+    else if (left < -MovementEpsilon)
+        correctedMask |= static_cast<std::uint64_t>(InputBitMask::MoveRight);
 
-    // Digital W/A/S/D would make prediction reconstruct a cardinal movement
-    // vector in the silent-yaw basis and override the rotated analog vector.
-    // Keep every non-movement button (including Attack) untouched.
-    command->buttonStates.buttonState1 &= keepMask;
-    command->buttonStates.buttonState2 &= keepMask;
-    command->buttonStates.buttonState3 &= keepMask;
+    // Source 2 can rebuild the analog vector from held buttons after reading
+    // forwardmove/leftmove. Preserve each button-state phase, but replace its
+    // movement bits with the directions of the corrected vector. Clearing all
+    // four bits makes held keyboard movement stop completely.
+    const auto remapState = [movementMask, correctedMask](std::uint64_t state) {
+        const bool carriedMovement = (state & movementMask) != 0;
+        return (state & ~movementMask) |
+            (carriedMovement ? correctedMask : 0);
+    };
+    command->buttonStates.buttonState1 =
+        remapState(command->buttonStates.buttonState1);
+    command->buttonStates.buttonState2 =
+        remapState(command->buttonStates.buttonState2);
+    command->buttonStates.buttonState3 =
+        remapState(command->buttonStates.buttonState3);
 
     if (base->has_buttons_pb()) {
         auto* buttons = base->mutable_buttons_pb();
-        buttons->set_buttonstate1(buttons->buttonstate1() & keepMask);
-        buttons->set_buttonstate2(buttons->buttonstate2() & keepMask);
-        buttons->set_buttonstate3(buttons->buttonstate3() & keepMask);
+        buttons->set_buttonstate1(remapState(buttons->buttonstate1()));
+        buttons->set_buttonstate2(remapState(buttons->buttonstate2()));
+        buttons->set_buttonstate3(remapState(buttons->buttonstate3()));
     }
 
     const int count = base->subtick_moves_size();
@@ -980,8 +1005,10 @@ void RemoveDigitalMovementFromSilentCommand(CUserCmd* command,
     for (int i = 0; i < count; ++i) {
         auto* step = base->mutable_subtick_moves(i);
         if (!step || !step->has_button()) continue;
-        if ((step->button() & movementMask) != 0)
-            step->set_button(0);
+        if ((step->button() & movementMask) != 0) {
+            step->set_button(
+                (step->button() & ~movementMask) | correctedMask);
+        }
     }
 }
 
@@ -993,6 +1020,23 @@ bool UserCmdHasAttack(const CUserCmd* command) {
     const auto& base = command->cmd.base();
     return base.has_buttons_pb() &&
         (base.buttons_pb().buttonstate1() & attackMask) != 0;
+}
+
+bool UserCmdHasAnyMask(const CUserCmd* command, std::uint64_t mask) {
+    if (!command || !mask) return false;
+    if (((command->buttonStates.buttonState1 |
+          command->buttonStates.buttonState2 |
+          command->buttonStates.buttonState3) & mask) != 0) {
+        return true;
+    }
+    if (!command->cmd.has_base() ||
+        !command->cmd.base().has_buttons_pb()) {
+        return false;
+    }
+    const auto& buttons = command->cmd.base().buttons_pb();
+    return ((buttons.buttonstate1() |
+             buttons.buttonstate2() |
+             buttons.buttonstate3()) & mask) != 0;
 }
 
 bool GetPendingSilentInputAngle(Vector3& angles) {
@@ -1035,18 +1079,38 @@ void ApplyPendingUserCmdAngles(uintptr_t userCmd) {
     bool originalPitchReady = false;
     bool attack = false;
     bool ready = false;
-    bool humanReady = false;
     {
+        // A hero ability owns the aim angle of the command that activates it.
+        // Otherwise held primary fire replaces Haze's queued dagger angle
+        // before the command is sent.
+        constexpr std::uint64_t HeroAbilityAimMask =
+            0x0000000200000000ull | // Ability 1 (Haze/Shiv)
+            0x0000000400000000ull | // Ability 2 (Drifter)
+            0x0000000800000000ull | // Ability 3 (Bebop)
+            0x0000001000000000ull;  // Ability 4 (Vindicta)
+        const bool heroAbilityCommand =
+            UserCmdHasAnyMask(command, HeroAbilityAimMask);
+        {
+            std::lock_guard<std::mutex> lock(silentAnglesMutex);
+            if (pendingSilentAnglesReady &&
+                (heroAbilityCommand ||
+                 pendingHeroSilentOverridesPrimary)) {
+                angles = pendingSilentAngles;
+                attack = pendingSilentAttack;
+                pendingSilentAttack = false;
+                ready = true;
+            }
+        }
+
         // A held player shot has priority over autonomous orb/farm helpers.
         // Keep the selected angle alive for every CreateMove command while the
         // render-side target remains valid; consuming it once left later
         // subtick shots with the old camera angle.
-        if (aimSilentActive && commandHasAttack) {
+        if (!ready && aimSilentActive && commandHasAttack) {
             std::lock_guard<std::mutex> lock(humanSilentMutex);
             if (pendingHumanReady) {
                 angles = pendingHumanAngles;
                 ready = true;
-                humanReady = true;
             }
         }
         // Hero scripts use this same pending-command path as ordinary silent
@@ -1093,14 +1157,39 @@ void ApplyPendingUserCmdAngles(uintptr_t userCmd) {
     // camera-relative movement without synthesizing keyboard input.
     bool movementCorrected = false;
     const PawnUserCmdSnapshot pawnSnapshot = ReadLatestPawnUserCmd();
-    if (kCameraRelativeMovement && command->cmd.has_base() &&
+    if (kSilentCommandMovementCorrection && command->cmd.has_base() &&
         command->cmd.has_ang_camera_angles() &&
         std::isfinite(angles.y)) {
         auto* base = command->cmd.mutable_base();
-        const float cameraYaw = command->cmd.ang_camera_angles().y();
+        float cameraYaw = command->cmd.ang_camera_angles().y();
+        Vector3 cameraForward{};
+        if (GetCurrentCameraForward(cameraForward)) {
+            const float horizontal = std::hypot(
+                cameraForward.x, cameraForward.y);
+            if (std::isfinite(horizontal) && horizontal > 0.001f) {
+                cameraYaw = std::atan2(cameraForward.y, cameraForward.x) *
+                    57.29577951308232f;
+            }
+        }
         if (base && std::isfinite(cameraYaw)) {
-            const float sourceForward = base->forwardmove();
-            const float sourceLeft = base->leftmove();
+            const bool forwardDown =
+                (GetAsyncKeyState('W') & 0x8000) != 0;
+            const bool backDown =
+                (GetAsyncKeyState('S') & 0x8000) != 0;
+            const bool leftDown =
+                (GetAsyncKeyState('A') & 0x8000) != 0;
+            const bool rightDown =
+                (GetAsyncKeyState('D') & 0x8000) != 0;
+            const bool keyboardMovement =
+                forwardDown || backDown || leftDown || rightDown;
+            const float sourceForward = keyboardMovement
+                ? (forwardDown ? 1.0f : 0.0f) -
+                    (backDown ? 1.0f : 0.0f)
+                : base->forwardmove();
+            const float sourceLeft = keyboardMovement
+                ? (leftDown ? 1.0f : 0.0f) -
+                    (rightDown ? 1.0f : 0.0f)
+                : base->leftmove();
             const float radians =
                 (cameraYaw - angles.y) *
                 0.017453292519943295f;
@@ -1115,7 +1204,10 @@ void ApplyPendingUserCmdAngles(uintptr_t userCmd) {
 
             base->set_forwardmove(correctedForward);
             base->set_leftmove(correctedLeft);
-            RotateSubtickMovement(base, cosine, sine);
+            if (!keyboardMovement)
+                RotateSubtickMovement(base, cosine, sine);
+            RemapDigitalMovementForSilentCommand(
+                command, base, correctedForward, correctedLeft);
             movementCorrected = true;
         }
     }
@@ -1205,8 +1297,22 @@ void CorrectMovementBeforeLocalApply(uintptr_t input, uintptr_t userCmd) {
 
     auto* base = command->cmd.mutable_base();
     if (!base) return;
-    const float sourceForward = base->forwardmove();
-    const float sourceLeft = base->leftmove();
+
+    // Keyboard movement is carried primarily by digital button bits here;
+    // forwardmove/leftmove can legitimately still be zero. Reconstruct the
+    // visible-camera vector from the physical keys before removing those bits.
+    const bool forwardDown = (GetAsyncKeyState('W') & 0x8000) != 0;
+    const bool backDown = (GetAsyncKeyState('S') & 0x8000) != 0;
+    const bool leftDown = (GetAsyncKeyState('A') & 0x8000) != 0;
+    const bool rightDown = (GetAsyncKeyState('D') & 0x8000) != 0;
+    const bool keyboardMovement =
+        forwardDown || backDown || leftDown || rightDown;
+    const float sourceForward = keyboardMovement
+        ? (forwardDown ? 1.0f : 0.0f) - (backDown ? 1.0f : 0.0f)
+        : base->forwardmove();
+    const float sourceLeft = keyboardMovement
+        ? (leftDown ? 1.0f : 0.0f) - (rightDown ? 1.0f : 0.0f)
+        : base->leftmove();
     if (!std::isfinite(sourceForward) || !std::isfinite(sourceLeft)) return;
 
     const float radians =
@@ -1232,6 +1338,7 @@ void CorrectMovementBeforeLocalApply(uintptr_t input, uintptr_t userCmd) {
                 << " cmd=0x" << userCmd << std::dec
                 << " cameraYaw=" << cameraYaw
                 << " silentYaw=" << silentAngles.y
+                << " keyboard=" << keyboardMovement
                 << " source=" << sourceForward << ',' << sourceLeft
                 << " corrected=" << correctedForward << ',' << correctedLeft
                 << '\n';
@@ -1244,7 +1351,13 @@ void CorrectMovementBeforeLocalApply(uintptr_t input, uintptr_t userCmd) {
     // freshly built command before the local movement consumer sees it.
     base->set_forwardmove(correctedForward);
     base->set_leftmove(correctedLeft);
-    RotateSubtickMovement(base, cosine, sine);
+    if (!keyboardMovement)
+        RotateSubtickMovement(base, cosine, sine);
+    // The engine can rebuild movement from held W/A/S/D after reading the
+    // analog vector. Remove those bits only from this silent command so the
+    // corrected vector is not replaced in the hidden-yaw basis.
+    RemapDigitalMovementForSilentCommand(
+        command, base, correctedForward, correctedLeft);
 }
 
 void __fastcall hkApplyInputCommand(uintptr_t input, uintptr_t userCmd) {
@@ -1264,8 +1377,6 @@ void __fastcall hkApplyInputCommand(uintptr_t input, uintptr_t userCmd) {
             PatchInputHistory(userCmd, {value.x(), value.y(), value.z()});
         }
     }
-    if (kCameraRelativeMovement)
-        CorrectMovementBeforeLocalApply(input, userCmd);
     if (originalApplyInputCommand)
         originalApplyInputCommand(input, userCmd);
 }
@@ -1336,8 +1447,41 @@ void __fastcall hkPawnProcessUserCmd(uintptr_t pawn, uintptr_t userCmd) {
         lastLog = now;
         LogPawnUserCmd("before", pawn, userCmd);
     }
+    Vector3 silentAngles{};
+    bool isolatedMovementYaw = false;
+    auto* command = reinterpret_cast<CUserCmd*>(userCmd);
+    if (command && command->cmd.has_ang_camera_angles() &&
+        GetPendingSilentInputAngle(silentAngles)) {
+        Vector3 cameraForward{};
+        if (GetCurrentCameraForward(cameraForward)) {
+            const float horizontal = std::hypot(
+                cameraForward.x, cameraForward.y);
+            if (std::isfinite(horizontal) && horizontal > 0.001f) {
+                constexpr float RadToDeg = 57.29577951308232f;
+                const float visibleYaw = std::atan2(
+                    cameraForward.y, cameraForward.x) * RadToDeg;
+                if (std::isfinite(visibleYaw)) {
+                    command->cmd.mutable_ang_camera_angles()->set_y(
+                        visibleYaw);
+                    isolatedMovementYaw = true;
+                }
+            }
+        }
+    }
+
     if (originalPawnProcessUserCmd)
         originalPawnProcessUserCmd(pawn, userCmd);
+
+    if (isolatedMovementYaw && command &&
+        command->cmd.has_ang_camera_angles()) {
+        auto* restored = command->cmd.mutable_ang_camera_angles();
+        restored->set_x(silentAngles.x);
+        restored->set_y(silentAngles.y);
+        restored->set_z(silentAngles.z);
+        command->cmd.clear_view_delta_x();
+        command->cmd.clear_view_delta_y();
+        PatchInputHistory(userCmd, silentAngles);
+    }
 
     // Camera angles are populated by the original pawn callback. Keep the
     // latest complete command for the next ProcessMovement tick; never erase
@@ -1694,8 +1838,10 @@ void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3
         const uintptr_t resolvedPawn = FindLocalPawnFromController();
         if (resolvedPawn) currentLocalPawn = resolvedPawn;
     }
-    if (kCameraRelativeMovement)
+    if (kSilentMovementYawIsolation)
         EnsurePawnProcessUserCmdHook(currentLocalPawn);
+    if (kSilentMoveDataYawIsolation)
+        EnsureProcessMovementHook(currentLocalPawn);
     // CreateMove and the following local input stage can both append weapon
     // recoil. Bracket the stock call so the state is clear before a shot is
     // built and immediately clear any state it produced afterwards.
@@ -1712,8 +1858,10 @@ void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3
         const uintptr_t resolvedPawn = FindLocalPawnFromController();
         if (resolvedPawn) currentLocalPawn = resolvedPawn;
     }
-    if (kCameraRelativeMovement)
+    if (kSilentMovementYawIsolation)
         EnsurePawnProcessUserCmdHook(currentLocalPawn);
+    if (kSilentMoveDataYawIsolation)
+        EnsureProcessMovementHook(currentLocalPawn);
     const auto callCount = ++createMoveCalls;
     const uintptr_t userCmd = GetCurrentUserCmd();
     if (userCmd) ++userCmdResolvedCalls;
@@ -1817,68 +1965,67 @@ void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3
 uintptr_t __fastcall hkProcessMovement(uintptr_t movementServices,
                                        uintptr_t moveData) {
     ++movementProcessCalls;
+    const bool physicalAttack = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     bool corrected = false;
-    float cameraYaw = 0.0f;
-    float movementYaw = 0.0f;
     float silentYaw = 0.0f;
+    float visibleYaw = 0.0f;
     float sourceForward = 0.0f;
     float sourceLeft = 0.0f;
     float correctedForward = 0.0f;
     float correctedLeft = 0.0f;
-    float afterForward = 0.0f;
-    float afterLeft = 0.0f;
-
-    // Movement must not wait for the protobuf/network serializer.  That hook
-    // is not part of the local movement path and may not run for every tick.
-    // Once an attack is physically held, use the camera basis continuously;
-    // ProcessMovement already provides the character's current yaw.
-    const bool physicalAttack = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-    const bool movementCorrectionRequested =
-        (aimSilentActive && physicalAttack) ||
-        ((farmSilentMode || farmMixedMode) && physicalAttack) ||
-        (autoLastHitOrbs && autoLastHitOrbsActive && pendingOrbAttack);
-    const PawnUserCmdSnapshot pawnSnapshot = ReadLatestPawnUserCmd();
-    Vector3 movementSilentAngles{};
-    const bool hasSilentMovementBasis =
-        kCameraRelativeMovement && movementCorrectionRequested &&
-        GetPendingSilentInputAngle(movementSilentAngles) &&
-        std::isfinite(movementSilentAngles.y);
-    if (moveData && pawnSnapshot.valid && hasSilentMovementBasis &&
-        std::isfinite(pawnSnapshot.cameraYaw)) {
-        cameraYaw = pawnSnapshot.cameraYaw;
-        // IDA: sub_18078CC00 calls AngleVectors with MoveData + 0x14.
-        // Therefore +0x18 is the yaw that defines the actual movement basis.
-        movementYaw = Read<float>(moveData + 0x18);
-        silentYaw = movementSilentAngles.y;
-        sourceForward = Read<float>(moveData + 0x2C);
-        sourceLeft = Read<float>(moveData + 0x30);
-        if (std::isfinite(movementYaw) &&
-            std::isfinite(sourceForward) &&
-            std::isfinite(sourceLeft)) {
-            correctedForward = sourceForward;
-            correctedLeft = sourceLeft;
-            corrected = true;
+    if (moveData && aimSilentActive && physicalAttack) {
+        Vector3 cameraForward{};
+        Vector3 pendingSilentAngles{};
+        if (GetCurrentCameraForward(cameraForward) &&
+            GetPendingSilentInputAngle(pendingSilentAngles)) {
+            const float horizontal = std::hypot(
+                cameraForward.x, cameraForward.y);
+            silentYaw = pendingSilentAngles.y;
+            sourceForward = Read<float>(moveData + 0x2C);
+            sourceLeft = Read<float>(moveData + 0x30);
+            if (std::isfinite(horizontal) && horizontal > 0.001f &&
+                std::isfinite(silentYaw) &&
+                std::isfinite(sourceForward) &&
+                std::isfinite(sourceLeft)) {
+                constexpr float RadToDeg = 57.29577951308232f;
+                constexpr float DegToRad = 0.017453292519943295f;
+                visibleYaw = std::atan2(cameraForward.y, cameraForward.x) *
+                    RadToDeg;
+                if (std::isfinite(visibleYaw)) {
+                    // MoveData is already paired with the silent command yaw.
+                    // Rotate only its analog movement axes into that basis so
+                    // the resulting world direction remains relative to the
+                    // visible camera. Digital WASD state is deliberately left
+                    // untouched, otherwise Source 2 can suppress movement.
+                    const float radians = (visibleYaw - silentYaw) * DegToRad;
+                    const float cosine = std::cos(radians);
+                    const float sine = std::sin(radians);
+                    correctedForward =
+                        sourceForward * cosine - sourceLeft * sine;
+                    correctedLeft =
+                        sourceForward * sine + sourceLeft * cosine;
+                    Write<float>(moveData + 0x2C, correctedForward);
+                    Write<float>(moveData + 0x30, correctedLeft);
+                    corrected = true;
+                }
+            }
         }
     }
 
     const uintptr_t result = originalProcessMovement
         ? originalProcessMovement(movementServices, moveData) : 0;
-    if (moveData) {
-        afterForward = Read<float>(moveData + 0x20);
-        afterLeft = Read<float>(moveData + 0x24);
-        movementDiagAfterYaw.store(Read<float>(moveData + 0x18),
-                                   std::memory_order_relaxed);
-    }
     if (corrected) {
+        Write<float>(moveData + 0x2C, sourceForward);
+        Write<float>(moveData + 0x30, sourceLeft);
         ++movementCorrectionCalls;
-        movementDiagCameraYaw.store(cameraYaw, std::memory_order_relaxed);
-        movementDiagMovementYaw.store(movementYaw, std::memory_order_relaxed);
+        movementDiagCameraYaw.store(visibleYaw, std::memory_order_relaxed);
+        movementDiagMovementYaw.store(silentYaw, std::memory_order_relaxed);
         movementDiagRawForward.store(sourceForward, std::memory_order_relaxed);
         movementDiagRawLeft.store(sourceLeft, std::memory_order_relaxed);
-        movementDiagResultForward.store(correctedForward, std::memory_order_relaxed);
-        movementDiagResultLeft.store(correctedLeft, std::memory_order_relaxed);
-        movementDiagAfterForward.store(afterForward, std::memory_order_relaxed);
-        movementDiagAfterLeft.store(afterLeft, std::memory_order_relaxed);
+        movementDiagResultForward.store(correctedForward,
+                                         std::memory_order_relaxed);
+        movementDiagResultLeft.store(correctedLeft,
+                                      std::memory_order_relaxed);
     }
 
     static ULONGLONG lastLog = 0;
@@ -1899,16 +2046,76 @@ uintptr_t __fastcall hkProcessMovement(uintptr_t movementServices,
                 << " service=0x" << std::hex << movementServices
                 << " data=0x" << moveData << std::dec
                 << " corrected=" << corrected
-                << " cameraYaw=" << cameraYaw
-                << " movementYaw=" << movementYaw
+                << " visibleYaw=" << visibleYaw
                 << " silentYaw=" << silentYaw
                 << " source=" << sourceForward << ',' << sourceLeft
                 << " result=" << correctedForward << ','
-                << correctedLeft
-                << " after=" << afterForward << ',' << afterLeft << '\n';
+                << correctedLeft << '\n';
         }
     }
     return result;
+}
+
+bool EnsureProcessMovementHook(uintptr_t pawn) {
+    if (processMovementTarget && originalProcessMovement) return true;
+    if (!pawn) return false;
+
+    static uintptr_t movementServicesOffset = 0;
+    if (!movementServicesOffset) {
+        movementServicesOffset = ResolveRuntimeSchemaOffset(
+            "C_BasePlayerPawn", "m_pMovementServices");
+        // Current 2026-08-26 client: RTTI inspection of the live local pawn
+        // resolves CCitadelPlayer_MovementServices at +0xF28. Keep the live
+        // schema authoritative and use this only when SchemaSystem is not
+        // published during early injection.
+        if (!movementServicesOffset)
+            movementServicesOffset = 0xF28;
+    }
+    if (!movementServicesOffset) return false;
+
+    const uintptr_t movementServices = Read<uintptr_t>(
+        pawn + movementServicesOffset);
+    const uintptr_t vtable = Read<uintptr_t>(movementServices);
+    if (!movementServices || !vtable) return false;
+
+    constexpr uintptr_t ProcessMovementVtableSlot = 30;
+    const uintptr_t target = Read<uintptr_t>(
+        vtable + ProcessMovementVtableSlot * sizeof(uintptr_t));
+    if (!target) return false;
+    MEMORY_BASIC_INFORMATION memory{};
+    if (!VirtualQuery(reinterpret_cast<void*>(target), &memory,
+                      sizeof(memory)) ||
+        memory.State != MEM_COMMIT ||
+        (memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                           PAGE_EXECUTE_READWRITE |
+                           PAGE_EXECUTE_WRITECOPY)) == 0)
+        return false;
+
+    const MH_STATUS initStatus = MH_Initialize();
+    if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED)
+        return false;
+    void* targetAddress = reinterpret_cast<void*>(target);
+    const MH_STATUS createStatus = MH_CreateHook(
+        targetAddress, reinterpret_cast<void*>(&hkProcessMovement),
+        reinterpret_cast<void**>(&originalProcessMovement));
+    if (createStatus != MH_OK && createStatus != MH_ERROR_ALREADY_CREATED)
+        return false;
+    const MH_STATUS enableStatus = MH_EnableHook(targetAddress);
+    if (enableStatus != MH_OK && enableStatus != MH_ERROR_ENABLED) {
+        originalProcessMovement = nullptr;
+        return false;
+    }
+    processMovementTarget = targetAddress;
+    std::ofstream log(
+        Dll6Paths::DataFileA("process_movement_runtime.log"),
+        std::ios::app);
+    if (log) {
+        log << "installed schemaOffset=0x" << std::hex
+            << movementServicesOffset << " service=0x" << movementServices
+            << " target=0x" << target << " rva=0x"
+            << (target - clientBase) << std::dec << '\n';
+    }
+    return true;
 }
 
 uintptr_t __fastcall hkBuildWishDirection(uintptr_t movementServices,
@@ -2112,12 +2319,14 @@ void ApplyHeroScriptCameraAim(const Vector3& worldTarget,
     ApplyHeroScriptCameraAimInternal(worldTarget, pitchSmooth, yawSmooth);
 }
 
-void QueueHeroSilentAngles(const Vector3& angles, bool attack) {
+void QueueHeroSilentAngles(const Vector3& angles, bool attack,
+                           bool overridePrimaryAim) {
     if (!std::isfinite(angles.x) || !std::isfinite(angles.y)) return;
     std::lock_guard<std::mutex> lock(silentAnglesMutex);
     pendingSilentAngles = angles;
     pendingSilentAnglesReady = true;
     pendingSilentAttack = pendingSilentAttack || attack;
+    pendingHeroSilentOverridesPrimary = overridePrimaryAim;
 }
 
 void ClearHeroSilentAngles() {
@@ -2125,6 +2334,7 @@ void ClearHeroSilentAngles() {
     pendingSilentAngles = {};
     pendingSilentAnglesReady = false;
     pendingSilentAttack = false;
+    pendingHeroSilentOverridesPrimary = false;
 }
 
 void FlushCurrentCameraAim() {

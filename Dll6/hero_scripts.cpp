@@ -15,6 +15,8 @@
 bool vindictaAutoSnipeEnabled = false;
 bool hazeSleepDaggerEnabled = false;
 bool shivSerratedKnivesEnabled = false;
+bool bebopAbility3Enabled = false;
+bool drifterAbility2Enabled = false;
 bool heroScriptsShowFov = false;
 bool hazePredictionDot = true;
 float vindictaSnipeFov = 60.0f;
@@ -26,13 +28,23 @@ float hazeDaggerSmoothY = 4.0f;
 float shivKnivesFov = 120.0f;
 float shivKnivesSmoothX = 4.0f;
 float shivKnivesSmoothY = 4.0f;
+float bebopAbility3Fov = 120.0f;
+float bebopAbility3SmoothX = 4.0f;
+float bebopAbility3SmoothY = 4.0f;
+float drifterAbility2Fov = 120.0f;
+float drifterAbility2SmoothX = 4.0f;
+float drifterAbility2SmoothY = 4.0f;
 
 namespace {
 
 constexpr uint32_t kVindictaId = 3;
 constexpr uint32_t kHazeId = 13;
 constexpr uint32_t kShivId = 19;
+constexpr uint32_t kBebopId = 15;
+constexpr uint32_t kDrifterId = 64;
 constexpr uint64_t kAbility1Mask = 0x0000000200000000ull;
+constexpr uint64_t kAbility2Mask = 0x0000000400000000ull;
+constexpr uint64_t kAbility3Mask = 0x0000000800000000ull;
 constexpr uint64_t kAbility4Mask = 0x0000001000000000ull;
 constexpr uint64_t kAttackMask = 0x0000000000000001ull;
 constexpr float kRadiansToDegrees = 57.29577951308232f;
@@ -161,6 +173,18 @@ Vector3 CalculateAngles(const Vector3& source, const Vector3& destination) {
     return result;
 }
 
+bool ResolveHeroAimSource(uint32_t heroId, Vector3& source) {
+    if (currentCameraPositionReady) {
+        source = currentCameraPosition;
+        return true;
+    }
+    if (!currentLocalPositionReady) return false;
+    source = currentLocalPosition;
+    source.z += heroId == kHazeId ? kHeroProjectileOriginHeight : 64.0f;
+    return std::isfinite(source.x) && std::isfinite(source.y) &&
+        std::isfinite(source.z);
+}
+
 float AngularError(const Vector3& left, const Vector3& right) {
     const float pitch = NormalizeAngle(left.x - right.x);
     const float yaw = NormalizeAngle(left.y - right.y);
@@ -280,13 +304,31 @@ bool ScriptEnabled(uint32_t heroId) {
     if (heroId == kVindictaId) return vindictaAutoSnipeEnabled;
     if (heroId == kHazeId) return hazeSleepDaggerEnabled;
     if (heroId == kShivId) return shivSerratedKnivesEnabled;
+    if (heroId == kBebopId) return bebopAbility3Enabled;
+    if (heroId == kDrifterId) return drifterAbility2Enabled;
     return false;
 }
 
 float ScriptFov(uint32_t heroId) {
     if (heroId == kVindictaId) return vindictaSnipeFov;
     if (heroId == kHazeId) return hazeDaggerFov;
-    return shivKnivesFov;
+    if (heroId == kShivId) return shivKnivesFov;
+    if (heroId == kBebopId) return bebopAbility3Fov;
+    return drifterAbility2Fov;
+}
+
+int ScriptAbilitySlot(uint32_t heroId) {
+    if (heroId == kVindictaId) return 3;
+    if (heroId == kBebopId) return 2;
+    if (heroId == kDrifterId) return 1;
+    return 0;
+}
+
+uint64_t ScriptAbilityMask(uint32_t heroId) {
+    if (heroId == kVindictaId) return kAbility4Mask;
+    if (heroId == kBebopId) return kAbility3Mask;
+    if (heroId == kDrifterId) return kAbility2Mask;
+    return kAbility1Mask;
 }
 
 uintptr_t FindAbility(int wantedSlot) {
@@ -376,6 +418,38 @@ float AbilityProperty(uintptr_t ability, const char* name, float fallback) {
         value = std::numeric_limits<float>::quiet_NaN();
     }
     return std::isfinite(value) ? value : (liveBaseValid ? liveBase : fallback);
+}
+
+float BebopHookRange(uintptr_t ability) {
+    // The exact property label changed between client builds. Prefer the
+    // live VData entry, which includes ability upgrades and range modifiers,
+    // and keep 30 m (1200 Source units) as the base Hook range fallback.
+    static constexpr const char* kRangeProperties[]{
+        "CastRange", "AbilityCastRange", "HookRange", "Range"};
+    for (const char* name : kRangeProperties) {
+        if (FindAbilityProperty(ability, name)) {
+            const float value = AbilityProperty(ability, name, 0.0f);
+            if (std::isfinite(value) && value > 1.0f)
+                return value;
+        }
+    }
+    return 1200.0f;
+}
+
+bool BebopTargetInHookRange(uintptr_t ability, uintptr_t target) {
+    if (!ability || !target || !currentLocalPositionReady) return false;
+    const uintptr_t sceneNode = Read<uintptr_t>(target + Offsets::GameSceneNode);
+    const Vector3 targetPosition = sceneNode
+        ? Read<Vector3>(sceneNode + Offsets::SceneNodeAbsOrigin) : Vector3{};
+    if (!std::isfinite(targetPosition.x) || !std::isfinite(targetPosition.y) ||
+        !std::isfinite(targetPosition.z)) return false;
+    const float dx = targetPosition.x - currentLocalPosition.x;
+    const float dy = targetPosition.y - currentLocalPosition.y;
+    const float dz = targetPosition.z - currentLocalPosition.z;
+    // Preserve the hook's collision leeway at the edge of its range rather
+    // than rejecting a valid torso hit because the pawn origin is centered.
+    const float range = BebopHookRange(ability) + 40.0f;
+    return dx * dx + dy * dy + dz * dz <= range * range;
 }
 
 float EntityStat(int stat, uintptr_t entity) {
@@ -499,7 +573,8 @@ float VindictaHeadshotDamage(uintptr_t ability, int health, int maxHealth,
 
 bool FirstVisibleAimPoint(const PlayerData& player, uint32_t heroId,
                           float centerX, float centerY, float fov,
-                          int lockedBoneIndex, Vector3& point,
+                          int lockedBoneIndex, bool allowOffscreen,
+                          Vector3& point,
                           float& screenDistance, int& selectedBoneIndex) {
     struct BoneCandidate { bool valid; Vector3 point; };
     const std::array<BoneCandidate, 7> bones{{
@@ -511,21 +586,27 @@ bool FirstVisibleAimPoint(const PlayerData& player, uint32_t heroId,
         {player.hasLeftLegBone, player.leftLegPos},
         {player.hasRightLegBone, player.rightLegPos}}};
     const size_t first = heroId == kVindictaId ? 0 : 1;
-    const auto usable = [&](size_t index, Vector2& screen) {
+    const auto visible = [&](size_t index) {
         return index >= first && index < bones.size() && bones[index].valid &&
-            IsWorldAimPointVisible(bones[index].point, player.entity) &&
-            WorldToScreen(bones[index].point, screen, currentViewMatrix);
+            IsWorldAimPointVisible(bones[index].point, player.entity);
     };
     if (lockedBoneIndex >= static_cast<int>(first) &&
         lockedBoneIndex < static_cast<int>(bones.size())) {
         Vector2 screen{};
-        if (usable(static_cast<size_t>(lockedBoneIndex), screen)) {
-            const float dx = screen.x - centerX;
-            const float dy = screen.y - centerY;
+        const bool projected = WorldToScreen(
+            bones[lockedBoneIndex].point, screen, currentViewMatrix);
+        if (visible(static_cast<size_t>(lockedBoneIndex)) &&
+            (projected || allowOffscreen)) {
             point = bones[lockedBoneIndex].point;
-            screenDistance = dx * dx + dy * dy;
+            if (projected) {
+                const float dx = screen.x - centerX;
+                const float dy = screen.y - centerY;
+                screenDistance = dx * dx + dy * dy;
+            } else {
+                screenDistance = 0.0f;
+            }
             selectedBoneIndex = lockedBoneIndex;
-            return screenDistance < fov * fov;
+            return allowOffscreen || screenDistance < fov * fov;
         }
     }
     bool found = false;
@@ -535,8 +616,15 @@ bool FirstVisibleAimPoint(const PlayerData& player, uint32_t heroId,
             !IsWorldAimPointVisible(bones[index].point, player.entity))
             continue;
         Vector2 screen{};
-        if (!WorldToScreen(bones[index].point, screen, currentViewMatrix))
+        if (!WorldToScreen(bones[index].point, screen, currentViewMatrix)) {
+            if (allowOffscreen) {
+                point = bones[index].point;
+                screenDistance = 0.0f;
+                selectedBoneIndex = static_cast<int>(index);
+                return true;
+            }
             continue;
+        }
         const float dx = screen.x - centerX;
         const float dy = screen.y - centerY;
         const float distance = dx * dx + dy * dy;
@@ -824,18 +912,22 @@ bool TargetCenteredOnScreen(const TargetSnapshot& target) {
 }
 
 bool QueueSilentHeroTarget(const TargetSnapshot& target, bool attack) {
-    if (!currentViewMatrixReady)
-        return false;
-    Vector2 screen{};
-    Vector3 angles{};
-    if (!WorldToScreen(target.point, screen, currentViewMatrix) ||
-        !GetAimAnglesFromScreen(screen.x, screen.y, angles) ||
-        !std::isfinite(angles.x) || !std::isfinite(angles.y))
+    Vector3 source{};
+    if (!ResolveHeroAimSource(target.heroId, source)) return false;
+    const Vector3 angles = CalculateAngles(source, target.point);
+    if (!std::isfinite(angles.x) || !std::isfinite(angles.y))
         return false;
 
     const Vector3 silentAngles{
         std::clamp(angles.x, -89.0f, 89.0f), NormalizeAngle(angles.y), 0.0f};
-    QueueHeroSilentAngles(silentAngles, attack);
+    // Projectile casts launch after their animation, so their angle must keep
+    // priority over held primary fire until PostFire ends, not only on the
+    // initial Ability 1 command.
+    QueueHeroSilentAngles(silentAngles, attack,
+                          target.heroId == kHazeId ||
+                          target.heroId == kShivId ||
+                          target.heroId == kBebopId ||
+                          target.heroId == kDrifterId);
     return true;
 }
 
@@ -932,7 +1024,8 @@ Vector3 PredictPlayerAimPoint(uintptr_t target, const Vector3& point,
 
 bool HeroScriptsNeedPlayerBones() {
     return vindictaAutoSnipeEnabled || hazeSleepDaggerEnabled ||
-           shivSerratedKnivesEnabled;
+           shivSerratedKnivesEnabled || bebopAbility3Enabled ||
+           drifterAbility2Enabled;
 }
 
 void UpdateHeroScriptTargets(const std::vector<PlayerData>& players) {
@@ -940,7 +1033,7 @@ void UpdateHeroScriptTargets(const std::vector<PlayerData>& players) {
     const uint32_t heroId = CurrentHeroId();
     TargetSnapshot next{};
     if (menuOpen || !ScriptEnabled(heroId) || !currentViewMatrixReady ||
-        !currentLocalPawn || !currentCameraPositionReady) {
+        !currentLocalPawn || !currentLocalPositionReady) {
         std::lock_guard<std::mutex> lock(targetMutex);
         targetSnapshot = {};
         return;
@@ -953,13 +1046,19 @@ void UpdateHeroScriptTargets(const std::vector<PlayerData>& players) {
     const TargetSnapshot previous = ReadTarget();
     const Vector3 observedLocalVelocity = SampleTargetVelocity(
         currentLocalPawn, currentLocalPosition);
-    uintptr_t ability = FindAbility(heroId == kVindictaId ? 3 : 0);
+    uintptr_t ability = FindAbility(ScriptAbilitySlot(heroId));
     float bestDistance = fov * fov;
 
     for (const PlayerData& player : players) {
         if (!player.entity || player.health <= 0 || player.team == localTeam)
             continue;
+        const bool forcedTarget = aimLockedTarget &&
+            player.entity == aimLockedTarget;
+        if (aimLockedTarget && !forcedTarget) continue;
         if (heroId == kVindictaId && !VindictaCanKill(player, ability))
+            continue;
+        if (heroId == kBebopId &&
+            !BebopTargetInHookRange(ability, player.entity))
             continue;
         Vector3 point{};
         float distance = 0.0f;
@@ -967,17 +1066,22 @@ void UpdateHeroScriptTargets(const std::vector<PlayerData>& players) {
         // Vindicta's scope changes the projection scale sharply. A target
         // acquired before opening the scope must not be discarded solely
         // because it is now outside the pre-scope 60px circle.
-        const float candidateFov = heroId == kVindictaId &&
-            player.entity == previous.entity ? 2000.0f : fov;
+        const float candidateFov = forcedTarget ? 100000.0f :
+            (heroId == kVindictaId && player.entity == previous.entity
+                ? 2000.0f : fov);
         // Sleep Dagger must reacquire from scratch every frame. Reusing the
         // previous pawn's bone biases its screen distance and turns the first
         // selected enemy into a sticky target.
         const int lockedBoneIndex = heroId != kHazeId &&
             player.entity == previous.entity ? previous.boneIndex : -1;
         if (!FirstVisibleAimPoint(player, heroId, centerX, centerY,
-                                  candidateFov, lockedBoneIndex, point,
+                                  candidateFov, lockedBoneIndex, forcedTarget,
+                                  point,
                                   distance, boneIndex)) continue;
-        if (heroId == kHazeId) {
+        if (forcedTarget) {
+            // The shared player lock bypasses every aim FOV, including hero
+            // scripts. Visibility and each script's readiness rules remain.
+        } else if (heroId == kHazeId) {
             if (distance >= bestDistance) continue;
         } else if (player.entity != previous.entity &&
                    distance >= bestDistance) {
@@ -1000,7 +1104,9 @@ void UpdateHeroScriptTargets(const std::vector<PlayerData>& players) {
         next.health = player.health;
         next.maxHealth = player.maxHealth;
         next.updatedAt = GetTickCount64();
-        next.rawAngles = CalculateAngles(currentCameraPosition, point);
+        Vector3 aimSource{};
+        if (!ResolveHeroAimSource(heroId, aimSource)) continue;
+        next.rawAngles = CalculateAngles(aimSource, point);
         if (player.entity == previous.entity && previous.updatedAt) {
             next.angularVelocity.x = std::clamp(
                 NormalizeAngle(next.rawAngles.x - previous.rawAngles.x), -2.0f, 2.0f);
@@ -1073,6 +1179,13 @@ bool ProcessHeroScriptsUserCmd(CUserCmd* command, bool processInput,
     const TargetSnapshot target = ReadTarget();
     const float now = GetClientGameTime();
 
+    // A newly selected shared lock must take effect immediately. Do not let a
+    // script finish an old scope/aim state against a different pawn.
+    if (aimLockedTarget && commandState.lockedEntity &&
+        commandState.lockedEntity != aimLockedTarget) {
+        ResetCommandState(true);
+    }
+
     if (heroId == kVindictaId) {
         const uintptr_t ability = FindAbility(3);
         const bool scoped = ability && offsets.scopeStartTime &&
@@ -1128,25 +1241,30 @@ bool ProcessHeroScriptsUserCmd(CUserCmd* command, bool processInput,
             ResetCommandState();
         }
     } else {
-        const bool held = CommandHasMask(command, kAbility1Mask);
+        const uint64_t abilityMask = ScriptAbilityMask(heroId);
+        const bool held = CommandHasMask(command, abilityMask);
         const bool freshPress = held && !commandState.wasAbility1Held;
         commandState.wasAbility1Held = held;
-        const uintptr_t ability = FindAbility(0);
+        const uintptr_t ability = FindAbility(ScriptAbilitySlot(heroId));
         const bool requireCharge = heroId == kShivId;
         if (freshPress)
             LogDiagnostics("ability1-press", heroId, ability, target.entity,
                            AbilityReady(ability, requireCharge) ? 1 : 0);
         if (commandState.state == ScriptState::Idle && freshPress &&
-            TargetUsable(target, heroId) && AbilityReady(ability, requireCharge)) {
+            TargetUsable(target, heroId) && AbilityReady(ability, requireCharge) &&
+            (heroId != kBebopId ||
+             BebopTargetInHookRange(ability, target.entity))) {
             commandState.state = ScriptState::Aiming;
             commandState.lockedEntity = target.entity;
         }
         if (commandState.state == ScriptState::Aiming) {
-            commandState.clearMask |= kAbility1Mask;
+            commandState.clearMask |= abilityMask;
             if (!TargetUsable(target, heroId) ||
                 (heroId != kHazeId &&
                  target.entity != commandState.lockedEntity) ||
-                !AbilityReady(ability, requireCharge)) {
+                !AbilityReady(ability, requireCharge) ||
+                (heroId == kBebopId &&
+                 !BebopTargetInHookRange(ability, target.entity))) {
                 ResetCommandState(true);
                 return false;
             }
@@ -1174,27 +1292,27 @@ bool ProcessHeroScriptsUserCmd(CUserCmd* command, bool processInput,
                     0.0f, 1.0f);
                 commandState.nextActionTime = now + castDelay + 0.05f;
             } else {
-            bool aligned = false;
-            const float smoothX = shivKnivesSmoothX;
-            const float smoothY = shivKnivesSmoothY;
-            const float threshold = 0.8f;
-            SetCommandAngles(command, target, smoothX, smoothY, threshold,
-                             aligned, input);
-            if (aligned) {
-                commandState.tapMask |= kAbility1Mask;
+                // Shiv, Bebop Ability 3, and Drifter Ability 2 use the same
+                // silent projectile-command path as Sleep Dagger. The target
+                // snapshot already contains the live intercept, so do not
+                // rotate the visible camera or wait for smoothing.
+                if (!QueueSilentHeroTarget(target, false))
+                    return false;
+                commandState.tapMask |= abilityMask;
                 commandState.state = ScriptState::PostFire;
-                commandState.nextActionTime = now + 0.2f;
-            }
+                const float castDelay = std::clamp(AbilityProperty(
+                    ability, "AbilityCastDelay", 0.0f), 0.0f, 1.0f);
+                commandState.nextActionTime = now + castDelay + 0.05f;
             }
         } else if (commandState.state == ScriptState::Firing) {
-            commandState.clearMask |= kAbility1Mask;
+            commandState.clearMask |= abilityMask;
             if (!TargetUsable(target, heroId) ||
                 target.entity != commandState.lockedEntity ||
                 !AbilityReady(ability, false)) {
                 ResetCommandState(true);
                 return false;
             }
-            commandState.tapMask |= kAbility1Mask;
+            commandState.tapMask |= abilityMask;
             commandState.state = ScriptState::PostFire;
             commandState.nextActionTime = now + 0.2f;
         } else if (commandState.state == ScriptState::PostFire) {
@@ -1204,13 +1322,9 @@ bool ProcessHeroScriptsUserCmd(CUserCmd* command, bool processInput,
                 now < commandState.nextActionTime) {
                 if (heroId == kHazeId)
                     commandState.lockedEntity = target.entity;
-                bool ignored = false;
-                if (heroId == kHazeId) {
+                if (heroId == kHazeId || heroId == kShivId ||
+                    heroId == kBebopId || heroId == kDrifterId) {
                     QueueSilentHeroTarget(target, false);
-                } else {
-                    SetCommandAngles(command, target,
-                                     shivKnivesSmoothX, shivKnivesSmoothY,
-                                     0.0f, ignored, input);
                 }
             } else {
                 ResetCommandState(true);

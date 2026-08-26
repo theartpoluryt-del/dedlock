@@ -24,6 +24,55 @@ std::mutex movementDebugTargetMutex; Vector3 movementDebugTarget{}; bool movemen
 std::mutex movementDebugWishMutex; Vector3 movementDebugWishDirection{}; bool movementDebugWishReady=false;
 #include <fstream>
 #include <sstream>
+
+std::wstring GetVirtualKeyDisplayNameW(int key) {
+    if (key <= 0) return L"Not bound";
+    switch (key) {
+        case VK_LBUTTON: return L"LMB";
+        case VK_RBUTTON: return L"RMB";
+        case VK_MBUTTON: return L"MMB";
+        case VK_XBUTTON1: return L"Mouse 4";
+        case VK_XBUTTON2: return L"Mouse 5";
+        case VK_SHIFT: return L"Shift";
+        case VK_CONTROL: return L"Ctrl";
+        case VK_MENU: return L"Alt";
+        case VK_LWIN: return L"Left Windows";
+        case VK_RWIN: return L"Right Windows";
+    }
+
+    UINT scanCode = MapVirtualKeyW(static_cast<UINT>(key), MAPVK_VK_TO_VSC);
+    switch (key) {
+        case VK_INSERT: case VK_DELETE: case VK_HOME: case VK_END:
+        case VK_PRIOR: case VK_NEXT: case VK_LEFT: case VK_RIGHT:
+        case VK_UP: case VK_DOWN: case VK_NUMLOCK: case VK_DIVIDE:
+            scanCode |= 0x100;
+            break;
+    }
+    wchar_t name[64]{};
+    const LONG keyNameParam = static_cast<LONG>(scanCode << 16);
+    if (scanCode && GetKeyNameTextW(keyNameParam, name,
+                                    static_cast<int>(std::size(name))) > 0) {
+        return name;
+    }
+    wchar_t fallback[24]{};
+    std::swprintf(fallback, std::size(fallback), L"VK 0x%02X", key & 0xFF);
+    return fallback;
+}
+
+std::string GetVirtualKeyDisplayName(int key) {
+    const std::wstring wide = GetVirtualKeyDisplayNameW(key);
+    if (wide.empty()) return {};
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(),
+                                          static_cast<int>(wide.size()),
+                                          nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) return "Unknown";
+    std::string result(static_cast<size_t>(bytes), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(),
+                        static_cast<int>(wide.size()), result.data(), bytes,
+                        nullptr, nullptr);
+    return result;
+}
+
 volatile ULONGLONG lastSilentAttackAppliedAt = 0;
 volatile LONG autoOrbAttackAppliedCount = 0;
 uintptr_t clientBase=0; bool menuOpen=false,drawEsp=true,drawBoxes=true,drawHealth=true,drawHealthValues=true,drawNames=true,drawDistance=true,drawSnaplines=false,drawFovCircle=true,drawFarmFovCircle=false,drawBones=false,drawCreepEsp=false,farmAssist=false,autoLastHitOrbs=false,drawOrbEsp=false,drawSpectatorList=false,collisionDiagnostics=false,remSizedHull=false,glowEnabled=true,aimAssist=true,autoParry=true,imguiInitialized=false,consoleAttached=false; float aimFov=180.0f,farmFov=180.0f,aimSmooth=6.0f,fovCircleAlpha=110.0f,farmFovAlpha=110.0f,snaplineAlpha=180.0f; bool aimVisibilityCheck=true; Vector3 currentLocalPosition{}; bool currentLocalPositionReady=false; Vector3 currentCameraPosition{}; bool currentCameraPositionReady=false; uintptr_t currentLocalPawn=0; uint32_t currentLocalPawnHandle=0xFFFFFFFFu; std::mutex meleeObjectsMutex; std::vector<uintptr_t> meleeObjects; std::mutex silentAnglesMutex; Vector3 pendingSilentAngles{}; bool pendingSilentAnglesReady=false,pendingSilentAttack=false; std::mutex humanSilentMutex,creepSilentMutex,orbSilentMutex; Vector3 pendingHumanAngles{},pendingCreepAngles{},pendingOrbAngles{}; bool pendingHumanReady=false,pendingCreepReady=false,pendingOrbReady=false,pendingOrbAttack=false; std::mutex farmTargetsMutex; std::vector<FarmTarget> farmTargets; std::mutex orbTargetsMutex; std::vector<OrbTarget> orbTargets; std::mutex worldEspTargetsMutex; std::vector<WorldEspTarget> worldEspTargets;
@@ -37,6 +86,11 @@ bool farmNormalActive = false;
 bool aimSilentActive = false;
 bool aimOnlyYaw = false;
 bool aimLockTarget = false;
+int aimLockKey = 0;
+bool aimLockKeyCapture = false;
+bool aimLockKeyLastDown = false;
+uintptr_t aimLockCandidate = 0;
+uintptr_t aimLockedTarget = 0;
 bool aimPrediction = false;
 bool antiFrog = false;
 float antiFrogHsThreshold = 45.0f;
@@ -151,6 +205,54 @@ std::string ConfigPath() {
     return Dll6Paths::DataFileA("Dll6.ini");
 }
 
+bool TryMigrateLegacyConfig(const std::string& destination) {
+    auto tryCopy = [&destination](const std::string& source) {
+        if (source.empty() || _stricmp(source.c_str(), destination.c_str()) == 0)
+            return false;
+        const DWORD attributes = GetFileAttributesA(source.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES ||
+            (attributes & FILE_ATTRIBUTE_DIRECTORY))
+            return false;
+        return CopyFileA(source.c_str(), destination.c_str(), TRUE) != FALSE;
+    };
+
+    // LoadLibrary builds historically kept Dll6.ini beside the DLL.
+    char modulePath[32768]{};
+    if (moduleHandle) {
+        const DWORD length = GetModuleFileNameA(
+            moduleHandle, modulePath, static_cast<DWORD>(std::size(modulePath)));
+        if (length && length < std::size(modulePath)) {
+            std::string sibling(modulePath, length);
+            const size_t separator = sibling.find_last_of("\\/");
+            if (separator != std::string::npos) {
+                sibling.resize(separator + 1);
+                sibling += "Dll6.ini";
+                if (tryCopy(sibling)) return true;
+            }
+        }
+    }
+
+    // Compatibility with the stable fallback used by older manual-map builds.
+    return tryCopy(
+        "C:\\Users\\artpo\\source\\repos\\Dll6\\Dll6\\x64\\Release\\Dll6.ini");
+}
+
+void ApplyPendingConfigRestore(const std::string& destination) {
+    const std::string pending = Dll6Paths::DataFileA("Dll6.restore.ini");
+    const DWORD attributes = GetFileAttributesA(pending.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES ||
+        (attributes & FILE_ATTRIBUTE_DIRECTORY))
+        return;
+
+    // Keep the displaced file once for recovery, then atomically consume the
+    // prepared restore on the next injection. This also avoids fighting an
+    // older injected build that may still be autosaving while the game runs.
+    const std::string backup = Dll6Paths::DataFileA("Dll6.before_restore.ini");
+    CopyFileA(destination.c_str(), backup.c_str(), TRUE);
+    MoveFileExA(pending.c_str(), destination.c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+}
+
 bool ExtractBundledDefaultConfig(const std::string& path) {
     const HRSRC resource = FindResourceW(
         moduleHandle, MAKEINTRESOURCEW(IDR_DEFAULT_CONFIG), RT_RCDATA);
@@ -174,11 +276,13 @@ bool ExtractBundledDefaultConfig(const std::string& path) {
 
 void LoadConfig() {
     const std::string path = ConfigPath();
+    ApplyPendingConfigRestore(path);
     std::ifstream input(path);
     if (!input) {
         input.close();
         input.clear();
-        if (ExtractBundledDefaultConfig(path)) input.open(path);
+        if (TryMigrateLegacyConfig(path) || ExtractBundledDefaultConfig(path))
+            input.open(path);
         if (!input) {
             // Resource extraction can fail only when the target directory is
             // not writable. Preserve the compiled defaults in that case.
@@ -444,6 +548,7 @@ void LoadConfig() {
         else if (key == "aimMixedMode") aimMixedMode = value;
         else if (key == "aimOnlyYaw") aimOnlyYaw = value;
         else if (key == "aimLockTarget") aimLockTarget = value;
+        else if (key == "aimLockKey") aimLockKey = static_cast<int>(number);
         else if (key == "aimPrediction") aimPrediction = value;
         else if (key == "antiFrog") antiFrog = value;
         else if (key == "antiFrogHsThreshold")
@@ -479,6 +584,8 @@ void LoadConfig() {
         else if (key == "vindictaAutoSnipeEnabled") vindictaAutoSnipeEnabled = value;
         else if (key == "hazeSleepDaggerEnabled") hazeSleepDaggerEnabled = value;
         else if (key == "shivSerratedKnivesEnabled") shivSerratedKnivesEnabled = value;
+        else if (key == "bebopAbility3Enabled") bebopAbility3Enabled = value;
+        else if (key == "drifterAbility2Enabled") drifterAbility2Enabled = value;
         else if (key == "heroScriptsShowFov") heroScriptsShowFov = value;
         else if (key == "hazePredictionDot") hazePredictionDot = value;
         else if (key == "vindictaSnipeFov") vindictaSnipeFov = std::clamp(static_cast<float>(number), 10.0f, 500.0f);
@@ -490,6 +597,12 @@ void LoadConfig() {
         else if (key == "shivKnivesFov") shivKnivesFov = std::clamp(static_cast<float>(number), 10.0f, 500.0f);
         else if (key == "shivKnivesSmoothX") shivKnivesSmoothX = std::clamp(static_cast<float>(number), 1.0f, 30.0f);
         else if (key == "shivKnivesSmoothY") shivKnivesSmoothY = std::clamp(static_cast<float>(number), 1.0f, 30.0f);
+        else if (key == "bebopAbility3Fov") bebopAbility3Fov = std::clamp(static_cast<float>(number), 10.0f, 500.0f);
+        else if (key == "bebopAbility3SmoothX") bebopAbility3SmoothX = std::clamp(static_cast<float>(number), 1.0f, 30.0f);
+        else if (key == "bebopAbility3SmoothY") bebopAbility3SmoothY = std::clamp(static_cast<float>(number), 1.0f, 30.0f);
+        else if (key == "drifterAbility2Fov") drifterAbility2Fov = std::clamp(static_cast<float>(number), 10.0f, 500.0f);
+        else if (key == "drifterAbility2SmoothX") drifterAbility2SmoothX = std::clamp(static_cast<float>(number), 1.0f, 30.0f);
+        else if (key == "drifterAbility2SmoothY") drifterAbility2SmoothY = std::clamp(static_cast<float>(number), 1.0f, 30.0f);
     }
     // The aim mode is a three-way choice, even though compatibility with old
     // configs stores it as two booleans. Mixed wins if an old build saved an
@@ -744,6 +857,7 @@ void SaveConfig() {
            << "aimMixedMode " << aimMixedMode << '\n'
            << "aimOnlyYaw " << aimOnlyYaw << '\n'
            << "aimLockTarget " << aimLockTarget << '\n'
+           << "aimLockKey " << aimLockKey << '\n'
            << "aimPrediction " << aimPrediction << '\n'
            << "antiFrog " << antiFrog << '\n'
            << "antiFrogHsThreshold " << antiFrogHsThreshold << '\n'
@@ -769,6 +883,8 @@ void SaveConfig() {
     output << "vindictaAutoSnipeEnabled " << vindictaAutoSnipeEnabled << '\n'
            << "hazeSleepDaggerEnabled " << hazeSleepDaggerEnabled << '\n'
            << "shivSerratedKnivesEnabled " << shivSerratedKnivesEnabled << '\n'
+           << "bebopAbility3Enabled " << bebopAbility3Enabled << '\n'
+           << "drifterAbility2Enabled " << drifterAbility2Enabled << '\n'
            << "heroScriptsShowFov " << heroScriptsShowFov << '\n'
            << "hazePredictionDot " << hazePredictionDot << '\n'
            << "vindictaSnipeFov " << vindictaSnipeFov << '\n'
@@ -780,4 +896,10 @@ void SaveConfig() {
            << "shivKnivesFov " << shivKnivesFov << '\n'
            << "shivKnivesSmoothX " << shivKnivesSmoothX << '\n'
            << "shivKnivesSmoothY " << shivKnivesSmoothY << '\n';
+    output << "bebopAbility3Fov " << bebopAbility3Fov << '\n'
+           << "bebopAbility3SmoothX " << bebopAbility3SmoothX << '\n'
+           << "bebopAbility3SmoothY " << bebopAbility3SmoothY << '\n'
+           << "drifterAbility2Fov " << drifterAbility2Fov << '\n'
+           << "drifterAbility2SmoothX " << drifterAbility2SmoothX << '\n'
+           << "drifterAbility2SmoothY " << drifterAbility2SmoothY << '\n';
 }

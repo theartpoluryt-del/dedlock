@@ -632,6 +632,35 @@ bool GetAimAnglesFromScreen(float screenX, float screenY, Vector3& angles) {
     return std::isfinite(angles.x) && std::isfinite(angles.y);
 }
 
+bool GetAimAnglesToWorldPoint(const Vector3& point, Vector3& angles) {
+    Vector3 source{};
+    bool sourceReady = currentCameraPositionReady;
+    if (sourceReady) source = currentCameraPosition;
+    if (!sourceReady && currentLocalPositionReady) {
+        source = currentLocalPosition;
+        source.z += 64.0f;
+        sourceReady = true;
+    }
+    if (!sourceReady) return false;
+
+    const float dx = point.x - source.x;
+    const float dy = point.y - source.y;
+    const float dz = point.z - source.z;
+    const float horizontal = std::sqrt(dx * dx + dy * dy);
+    if (!std::isfinite(horizontal) || horizontal < 1e-5f ||
+        !std::isfinite(dz))
+        return false;
+
+    constexpr float RadToDeg = 57.29577951308232f;
+    angles = {
+        std::clamp(-std::atan2(dz, horizontal) * RadToDeg, -89.0f, 89.0f),
+        std::atan2(dy, dx) * RadToDeg,
+        0.0f
+    };
+    angles = NormalizeAimAngles(angles);
+    return std::isfinite(angles.x) && std::isfinite(angles.y);
+}
+
 bool GetCameraTraceStart(Vector3& start) {
     if (!currentViewMatrixReady || !currentLocalPositionReady) return false;
     Matrix4x4 inverse{};
@@ -1308,7 +1337,6 @@ bool IsWorldAimPointVisible(const Vector3& point, uintptr_t targetEntity) {
 
 namespace {
 
-uintptr_t lockedAimTarget = 0;
 Vector3 cachedVisibleAimPoint{};
 bool cachedVisibleAimReady = false;
 
@@ -1316,9 +1344,15 @@ std::mutex antiFrogStateMutex;
 int antiFrogDamageHits = 0;
 int antiFrogHeadHits = 0;
 float antiFrogHeadshotPercent = 0.0f;
+bool antiFrogHeadSlot = true;
 bool antiFrogBodySlot = false;
 bool antiFrogNeckSlot = false;
 int antiFrogSlotRemaining = 0;
+
+bool AntiFrogUsesHeadSlot() {
+    std::lock_guard<std::mutex> lock(antiFrogStateMutex);
+    return antiFrogHeadSlot;
+}
 
 bool AntiFrogUsesBodySlot() {
     std::lock_guard<std::mutex> lock(antiFrogStateMutex);
@@ -1335,11 +1369,75 @@ bool RollHitchance() {
 
 }
 
+void UpdateAimTargetLock(const std::vector<PlayerData>& players) {
+    if (!aimLockTarget) {
+        aimLockCandidate = 0;
+        aimLockedTarget = 0;
+        aimLockKeyLastDown = false;
+        return;
+    }
+
+    // A lock survives leaving the configured FOV and briefly leaving the
+    // screen. Only death, invalidation, or changing team releases it.
+    if (aimLockedTarget) {
+        const int health = Read<int>(aimLockedTarget + Offsets::Health);
+        const uint8_t lifeState = Read<uint8_t>(
+            aimLockedTarget + Offsets::LifeState);
+        const uint8_t targetTeam = Read<uint8_t>(
+            aimLockedTarget + Offsets::Team);
+        const uint8_t localTeam = currentLocalPawn
+            ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
+        if (health <= 0 || lifeState != 0 ||
+            (localTeam && targetTeam == localTeam)) {
+            aimLockedTarget = 0;
+        }
+    }
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const float centerX = display.x * 0.5f;
+    const float centerY = display.y * 0.5f;
+    const uint8_t localTeam = currentLocalPawn
+        ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
+    float bestDistance = FLT_MAX;
+    aimLockCandidate = 0;
+    for (const PlayerData& player : players) {
+        if (!player.entity || player.health <= 0 ||
+            (localTeam && player.team == localTeam)) {
+            continue;
+        }
+        const float screenX = (player.boxLeft + player.boxRight) * 0.5f;
+        const float screenY = (player.boxTop + player.boxBottom) * 0.5f;
+        if (!std::isfinite(screenX) || !std::isfinite(screenY) ||
+            player.boxRight <= player.boxLeft ||
+            player.boxBottom <= player.boxTop)
+            continue;
+        const float dx = screenX - centerX;
+        const float dy = screenY - centerY;
+        const float distance = dx * dx + dy * dy;
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            aimLockCandidate = player.entity;
+        }
+    }
+
+    const bool keyDown = aimLockKey > 0 &&
+        (GetAsyncKeyState(aimLockKey) & 0x8000) != 0;
+    const bool keyPressed = keyDown && !aimLockKeyLastDown;
+    aimLockKeyLastDown = keyDown;
+    if (!menuOpen && keyPressed) {
+        if (aimLockedTarget)
+            aimLockedTarget = 0;
+        else if (aimLockCandidate)
+            aimLockedTarget = aimLockCandidate;
+    }
+}
+
 void ResetAntiFrogStats() {
     std::lock_guard<std::mutex> lock(antiFrogStateMutex);
     antiFrogDamageHits = 0;
     antiFrogHeadHits = 0;
     antiFrogHeadshotPercent = 0.0f;
+    antiFrogHeadSlot = true;
     antiFrogBodySlot = false;
     antiFrogNeckSlot = false;
     antiFrogSlotRemaining = 0;
@@ -1380,36 +1478,39 @@ void NotifyAntiFrogDamage(int attackerEntityIndex, int victimEntityIndex,
         return;
 
     const float threshold = std::clamp(antiFrogHsThreshold, 1.0f, 99.0f);
-    const float ratio = antiFrogHeadshotPercent / threshold;
+    const float targetRatio = threshold / 100.0f;
+    const float currentRatio = antiFrogHeadshotPercent / 100.0f;
     thread_local std::mt19937 generator(std::random_device{}());
     std::uniform_real_distribution<float> probability(0.0f, 1.0f);
     const float roll = probability(generator);
+    antiFrogHeadSlot = false;
     antiFrogBodySlot = false;
     antiFrogNeckSlot = false;
 
-    if (ratio >= 0.8f && ratio < 1.0f) {
-        const float neckChance = (ratio - 0.8f) / 0.2f * 0.35f;
-        antiFrogNeckSlot = roll < neckChance;
-    } else if (ratio >= 1.0f && ratio < 1.2f) {
-        const float neckChance = 0.35f +
-            (ratio - 1.0f) / 0.2f * 0.30f;
-        const float bodyChance =
-            (ratio - 1.0f) / 0.2f * 0.20f;
-        if (roll < bodyChance)
+    // Use the observed hit ratio as feedback. Below the requested percentage
+    // Head is preferred; above it, Neck/Body become more likely. The chance
+    // stays bounded so no slot is ever completely forbidden.
+    const float correction = (targetRatio - currentRatio) * 1.35f;
+    const float headChance = std::clamp(
+        targetRatio + correction, 0.08f, 0.92f);
+    if (roll < headChance) {
+        antiFrogHeadSlot = true;
+    } else {
+        const float overTarget = (std::max)(
+            0.0f, currentRatio - targetRatio);
+        const float bodyChance = std::clamp(
+            0.20f + overTarget * 1.50f, 0.20f, 0.75f);
+        if (probability(generator) < bodyChance)
             antiFrogBodySlot = true;
-        else if (roll < bodyChance + neckChance)
-            antiFrogNeckSlot = true;
-    } else if (ratio >= 1.2f) {
-        if (roll < 0.75f)
-            antiFrogBodySlot = true;
-        else if (roll < 0.90f)
+        else
             antiFrogNeckSlot = true;
     }
 
+    std::uniform_int_distribution<int> headLength(1, 2);
     std::uniform_int_distribution<int> bodyLength(2, 4);
-    std::uniform_int_distribution<int> neckLength(3, 5);
-    antiFrogSlotRemaining = antiFrogBodySlot
-        ? bodyLength(generator) : neckLength(generator);
+    std::uniform_int_distribution<int> neckLength(2, 4);
+    antiFrogSlotRemaining = antiFrogHeadSlot ? headLength(generator)
+        : (antiFrogBodySlot ? bodyLength(generator) : neckLength(generator));
 }
 
 float GetAntiFrogHeadshotPercent() {
@@ -1419,9 +1520,7 @@ float GetAntiFrogHeadshotPercent() {
 
 const char* GetAntiFrogSlotLabel() {
     std::lock_guard<std::mutex> lock(antiFrogStateMutex);
-    // The reference removes Head unconditionally while Anti-Frog is enabled;
-    // its light slot therefore resolves to Neck even when its old overlay
-    // called that state HEAD.
+    if (antiFrogHeadSlot) return "HEAD";
     return antiFrogBodySlot ? "BODY" : "NECK";
 }
 
@@ -1451,7 +1550,6 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         aimSilentActive = false;
         aimNormalActive = false;
         ClearPendingSilentAngles();
-        if (!aimLockTarget) lockedAimTarget = 0;
         return;
     }
     // Do not bypass the visibility predicate when the GPU snapshot is not
@@ -1473,6 +1571,9 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
 
     for (const auto& player : players) {
         if (localTeam != 0 && player.team == localTeam) continue;
+        const bool forcedTarget = aimLockedTarget &&
+            player.entity == aimLockedTarget;
+        if (aimLockedTarget && !forcedTarget) continue;
         const float modelHeight = player.modelHeight > 20.0f ? player.modelHeight : 80.0f;
         const float modelMinZ = std::isfinite(player.modelMinZ) ? player.modelMinZ : 0.0f;
         const float fallbackHead = modelMinZ + modelHeight * 0.92f;
@@ -1491,13 +1592,17 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         if (!effectiveMask)
             effectiveMask = AimBoneHead;
         if (antiFrog) {
-            // Match Andromeda: Anti-Frog never aims at Head. A heavy slot also
-            // removes Neck, leaving the user's selected body/limb points.
-            effectiveMask &= ~AimBoneHead;
-            if (AntiFrogUsesBodySlot())
-                effectiveMask &= ~AimBoneNeck;
-            if (!effectiveMask)
-                effectiveMask = AimBoneAll & ~AimBoneHead;
+            // Adaptive Anti-Frog keeps Head available while the real HS%% is
+            // below the configured target. Above target it temporarily uses
+            // Neck/Body, then returns to Head as the measured ratio drops.
+            // Use the selected slot directly so additional manual bones
+            // cannot accidentally turn a Body correction into an arm hit.
+            if (AntiFrogUsesHeadSlot())
+                effectiveMask = AimBoneHead;
+            else if (AntiFrogUsesBodySlot())
+                effectiveMask = AimBoneTorso;
+            else
+                effectiveMask = AimBoneNeck;
         }
         if (effectiveMask & AimBoneHead) {
             candidates[candidateCount++] = { player.hasHeadBone ? player.headPos : fallbackHeadPoint, player.hasHeadBone };
@@ -1546,11 +1651,15 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
                 }
             }
             Vector2 aimScreen{};
-            if (!GetWorldAimPointScreen(point, aimScreen)) continue;
-            const float dx = aimScreen.x - cx;
-            const float dy = aimScreen.y - cy;
-            const float distance = dx * dx + dy * dy;
-            if (distance >= fovDistance) continue;
+            const bool projected = GetWorldAimPointScreen(point, aimScreen);
+            if (!projected && !forcedTarget) continue;
+            float distance = 0.0f;
+            if (projected) {
+                const float dx = aimScreen.x - cx;
+                const float dy = aimScreen.y - cy;
+                distance = dx * dx + dy * dy;
+            }
+            if (!forcedTarget && distance >= fovDistance) continue;
             ++testedTargets;
             if (useDepthWallCheck && (candidates[candidateIndex].bone
                 ? !IsWorldAimPointVisible(point, player.entity)
@@ -1569,11 +1678,9 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
                 selectionScore = player.distance;
             else if (aimSelectionMode == AimSelectionMode::Health)
                 selectionScore = static_cast<float>(player.health);
-            const bool locked = aimLockTarget && lockedAimTarget &&
-                                player.entity == lockedAimTarget;
-            if (locked) selectionScore = -FLT_MAX;
-            const bool better = locked || selectionScore < bestSelectionScore;
-            if (better && (aimSelectionMode != AimSelectionMode::Crosshair ||
+            if (forcedTarget) selectionScore = -FLT_MAX;
+            const bool better = forcedTarget || selectionScore < bestSelectionScore;
+            if (better && (forcedTarget || aimSelectionMode != AimSelectionMode::Crosshair ||
                            visibleDistance < aimFov * aimFov)) {
                 bestSelectionScore = selectionScore;
                 best = &player;
@@ -1588,12 +1695,10 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         ResetNormalMouseAim();
         ClearPendingSilentAngles();
         aimNormalActive = false;
-        if (!aimLockTarget) lockedAimTarget = 0;
         std::lock_guard<std::mutex> lock(movementDebugTargetMutex);
         movementDebugTargetReady = false;
         return;
     }
-    if (aimLockTarget) lockedAimTarget = best->entity;
     if (!RollHitchance()) {
         ResetNormalMouseAim();
         ClearPendingSilentAngles();
@@ -1627,12 +1732,12 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     // Previously Normal only moved the render camera, so the command used to
     // create a bullet could retain the game's upward recoil pitch.
     if (silentPass || visibleMouseAim) {
-        Vector2 commandScreen{};
         Vector3 commandAngles{};
-        const bool haveCommandAngles = GetWorldAimPointScreen(
-                cachedVisibleAimPoint, commandScreen) &&
-            GetAimAnglesFromScreen(
-                commandScreen.x, commandScreen.y, commandAngles);
+        // A locked pawn may be anywhere around the player. Derive command
+        // angles from world coordinates so targets behind the camera do not
+        // depend on WorldToScreen and remain valid across the full 360°.
+        const bool haveCommandAngles = GetAimAnglesToWorldPoint(
+            cachedVisibleAimPoint, commandAngles);
         if (haveCommandAngles) {
             std::lock_guard<std::mutex> lock(humanSilentMutex);
             pendingHumanAngles = commandAngles;

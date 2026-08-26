@@ -343,6 +343,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     // Never retain a previous visual frame. At 144 Hz, the old 150 ms grace
     // period could redraw the same moving position for more than 20 Presents.
     visualSnapshot = GetPlayers();
+    UpdateAimTargetLock(visualSnapshot);
     UpdateHeroScriptTargets(visualSnapshot);
     // Human aim follows the same coherent visual sample every render frame.
     // A fixed 16 ms acquisition gate visibly stair-steps on 120/144/240 Hz.
@@ -483,6 +484,24 @@ LRESULT __stdcall hkWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 else if (uMsg == WM_MBUTTONDOWN) aimAssistKey = VK_MBUTTON;
                 else aimAssistKey = HIWORD(wParam) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2;
                 aimKeyCapture = false;
+                return 1;
+            }
+        }
+        if (aimLockKeyCapture) {
+            const bool keyboardKey = uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN;
+            const bool mouseKey = uMsg == WM_LBUTTONDOWN || uMsg == WM_RBUTTONDOWN ||
+                                  uMsg == WM_MBUTTONDOWN || uMsg == WM_XBUTTONDOWN;
+            if (keyboardKey || mouseKey) {
+                if (keyboardKey) aimLockKey = static_cast<int>(wParam);
+                else if (uMsg == WM_LBUTTONDOWN) aimLockKey = VK_LBUTTON;
+                else if (uMsg == WM_RBUTTONDOWN) aimLockKey = VK_RBUTTON;
+                else if (uMsg == WM_MBUTTONDOWN) aimLockKey = VK_MBUTTON;
+                else aimLockKey = HIWORD(wParam) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2;
+                // The new bind is still held during capture. Suppress that
+                // first edge so binding cannot immediately lock a target.
+                aimLockKeyLastDown = true;
+                aimLockKeyCapture = false;
+                SaveConfig();
                 return 1;
             }
         }
