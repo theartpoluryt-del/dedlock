@@ -9,7 +9,10 @@
 enum class InputBitMask : std::uint64_t {
     None       = 0x0000000000000000ull,
     Attack     = 0x0000000000000001ull,
-    Jump       = 0x0000000000000002ull,
+    // Current Deadlock emits both of these action bits for physical Space.
+    // The legacy Source IN_JUMP bit (0x2) is no longer the jump action in the
+    // Citadel command by the time CreateMove publishes the native state.
+    Jump       = 0x0101000000000000ull,
     Duck       = 0x0000000000000004ull,
     Forward    = 0x0000000000000008ull,
     Back       = 0x0000000000000010ull,
@@ -18,6 +21,7 @@ enum class InputBitMask : std::uint64_t {
     MoveRight  = 0x0000000000000400ull,
     Attack2    = 0x0000000000000800ull,
     Reload     = 0x0000000000002000ull,
+    Speed      = 0x0000000000020000ull,
 };
 
 struct CInButtonState {

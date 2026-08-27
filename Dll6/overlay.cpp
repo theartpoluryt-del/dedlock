@@ -71,8 +71,10 @@ void RestorePresentHook() {
 }
 
 void ShutdownOverlay() {
+#ifndef DLL6_MOVEMENT_ONLY
     SaveConfig();
     RestoreWorldVisuals();
+#endif
     freeCam = false;
     freeCamActive = false;
 
@@ -124,16 +126,23 @@ void ShutdownOverlay() {
         Write<float>(entity + Offsets::GlowBackfaceMult, 1.0f);
     }
 
+#ifndef DLL6_MOVEMENT_ONLY
     ResetHeroScripts();
+#endif
     RemoveUserCmdHook();
+    RemoveDrifterDarknessHooks();
     RemoveInputLockHooks();
     RemoveSoundEventHook();
+#ifndef DLL6_MOVEMENT_ONLY
     RemoveModelGlowHook();
     RemoveOrbEntityHooks();
     RemoveMeleeStateMonitor();
+#endif
     RemoveDepthCaptureHook();
+#ifndef DLL6_MOVEMENT_ONLY
     ShutdownPanoramaPreview();
     ShutdownD2DMenu();
+#endif
     // All project hooks have been disabled and removed above. Reset MinHook
     // itself so a later reinjection cannot retain trampolines into this DLL.
     MH_Uninitialize();
@@ -183,15 +192,28 @@ void ShutdownOverlay() {
 }
 
 DWORD WINAPI UnloadThread(LPVOID) {
-    // ShutdownOverlay has disabled every entry point. Give the Present and
-    // render-worker stacks time to return through their already-running
-    // detours, then actually remove this image so reinjection starts with one
-    // clean set of globals, materials and trampolines.
-    Sleep(2000);
+    // Present and every MinHook entry point were detached before this thread
+    // was created. Let callbacks which entered just before that barrier leave
+    // the image before destroying their originals and renderer resources.
+    Sleep(1000);
+    ShutdownOverlay();
+
+    // Leave an additional quiet interval for callbacks posted by the engine
+    // before the detours were disabled. Only then release the image. The
+    // mutex is process-owned, so close it explicitly to permit hot reinject.
+    Sleep(1000);
+    if (moduleReadyEvent) {
+        CloseHandle(moduleReadyEvent);
+        moduleReadyEvent = nullptr;
+    }
+    if (moduleInstanceGuard) {
+        CloseHandle(moduleInstanceGuard);
+        moduleInstanceGuard = nullptr;
+    }
     HMODULE self = moduleHandle;
     moduleHandle = nullptr;
     if (self) FreeLibraryAndExitThread(self, 0);
-    ExitThread(0);
+    return 0;
 }
 
 void RequestUnload() {
@@ -218,8 +240,17 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     }
 
     if (InterlockedCompareExchange(&unloadRequested, 0, 0) != 0) {
-        ShutdownOverlay();
+        // Phase one is deliberately tiny and happens on the owning Present
+        // thread: stop dispatching into this image first. Cleanup and the
+        // actual FreeLibrary happen later on UnloadThread after in-flight
+        // detours have drained.
         RestorePresentHook();
+        MH_DisableHook(MH_ALL_HOOKS);
+        if (gameWindow && oWndProc) {
+            SetWindowLongPtr(gameWindow, GWLP_WNDPROC,
+                             reinterpret_cast<LONG_PTR>(oWndProc));
+            oWndProc = nullptr;
+        }
 
         const HRESULT result = oPresent(pSwapChain, SyncInterval, Flags);
         if (InterlockedCompareExchange(&unloadThreadStarted, 1, 0) == 0) {
@@ -233,11 +264,13 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     // the normal DLL shutdown path. This is deliberately infrequent so it
     // cannot affect frame time or continuously write to disk.
     static ULONGLONG lastConfigSaveAt = 0;
+#ifndef DLL6_MOVEMENT_ONLY
     const ULONGLONG configSaveNow = GetTickCount64();
     if (configSaveNow - lastConfigSaveAt >= 2000) {
         lastConfigSaveAt = configSaveNow;
         SaveConfig();
     }
+#endif
 
     if (!pDevice) {
         HRESULT hr = pSwapChain->GetDevice(__uuidof(ID3D11Device), (void**)&pDevice);
@@ -260,7 +293,9 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         }
         overlaySwapChain = pSwapChain;
         gameWindow = desc.OutputWindow;
+#ifndef DLL6_MOVEMENT_ONLY
         InstallDepthCaptureHook();
+#endif
 
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
@@ -305,10 +340,16 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
                 SetWindowLongPtr(gameWindow, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(hkWndProc)));
         }
         imguiInitialized = true;
+#ifdef DLL6_MOVEMENT_ONLY
+        SetMenuOpen(false);
+#else
         SetMenuOpen(menuOpen);
+#endif
         // The model hook is installed during initialization, but the DX11
         // draw hooks can only be attached after the immediate context exists.
+#ifndef DLL6_MOVEMENT_ONLY
         InstallModelGlowHook();
+#endif
     }
 
     if (!imguiInitialized) return oPresent(pSwapChain, SyncInterval, Flags);
@@ -336,15 +377,22 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     static ULONGLONG lastAuxiliaryUpdate = 0;
     std::vector<PlayerData> visualSnapshot;
     const ULONGLONG now = GetTickCount64();
+#ifndef DLL6_MOVEMENT_ONLY
     CaptureDepthSnapshot();
     ArmGameDepthCapture();
+#endif
     // Rebuild the visual snapshot on every Present so ESP positions are
     // refreshed once per rendered frame, including 144 Hz displays.
     // Never retain a previous visual frame. At 144 Hz, the old 150 ms grace
     // period could redraw the same moving position for more than 20 Presents.
     visualSnapshot = GetPlayers();
+#ifdef DLL6_MOVEMENT_ONLY
+    DrawMovementReplayOverlay();
+#else
     UpdateAimTargetLock(visualSnapshot);
     UpdateHeroScriptTargets(visualSnapshot);
+    UpdateMovementBotInputText(visualSnapshot);
+    UpdateMovementProbe(visualSnapshot);
     // Human aim follows the same coherent visual sample every render frame.
     // A fixed 16 ms acquisition gate visibly stair-steps on 120/144/240 Hz.
     AimAtClosestEnemy(visualSnapshot);
@@ -359,6 +407,9 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     // Target acquisition and visibility tracing are bounded above. Camera
     // interpolation remains per-frame; the gameplay camera hook consumes it.
     UpdateVisibleAimCamera();
+    // Movement replay owns the visible camera while active, so publish it
+    // after normal aim has had its chance to queue a target.
+    DrawMovementReplayOverlay();
     const bool d2dMenuReady = PrepareD2DMenu(pSwapChain);
     const bool softwareD2DMenu = d2dMenuReady && UsesSoftwareD2DMenu();
     float previewLeft = 0.0f, previewTop = 0.0f;
@@ -375,6 +426,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     SetPanoramaCampTimersEnabled(false);
     ApplyEnemyRadar(enemyRadarEnabled);
     UpdateWorldVisuals();
+    MaintainDrifterDarknessSuppression();
     std::size_t sessionPlayerCount = 0;
     {
         std::lock_guard<std::mutex> lock(heroPawnsMutex);
@@ -393,16 +445,19 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         RenderMenu(sessionPlayerCount);
     else if (softwareD2DMenu)
         RenderD2DMenu(sessionPlayerCount);
+#endif
 
     ImGui::EndFrame();
     ImGui::Render();
 
     pContext->OMSetRenderTargets(1, &pRenderTargetView, nullptr);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    #ifndef DLL6_MOVEMENT_ONLY
     if (d2dMenuReady && !softwareD2DMenu) {
         pContext->OMSetRenderTargets(0, nullptr, nullptr);
         RenderD2DMenu(visualSnapshot.size());
     }
+    #endif
 
     return oPresent(pSwapChain, SyncInterval, Flags);
 }
@@ -431,20 +486,48 @@ LRESULT __stdcall hkWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
 
-    if (uMsg == WM_KEYUP && wParam == VK_DELETE) {
-        // Keep a keyboard-only unload path for hot-reload workflows.  It uses
-        // the same orderly shutdown path as the Misc page button.
+    if (uMsg == WM_APP + 0x6D6) {
+        // Private launcher IPC used for hot-reload. Physical Delete is never
+        // treated as an unload key, preventing accidental shutdown in-game.
         RequestUnload();
         return 0;
     }
 
+#ifndef DLL6_MOVEMENT_ONLY
     if (uMsg == WM_KEYUP &&
         (wParam == VK_INSERT || wParam == VK_PRIOR)) {
         SetMenuOpen(!menuOpen);
         return 0;
     }
+#endif
 
     if (menuOpen && imguiInitialized && ImGui::GetCurrentContext()) {
+        const bool focusRestored = uMsg == WM_SETFOCUS ||
+            (uMsg == WM_ACTIVATEAPP && wParam != FALSE) ||
+            (uMsg == WM_ACTIVATE && LOWORD(wParam) != WA_INACTIVE) ||
+            (uMsg == WM_SIZE && wParam != SIZE_MINIMIZED);
+        if (focusRestored) SetMenuOpen(true);
+        if (uMsg == WM_KILLFOCUS ||
+            (uMsg == WM_ACTIVATEAPP && wParam == FALSE) ||
+            (uMsg == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE))
+            ReleaseCapture();
+    }
+
+    if (menuOpen && imguiInitialized && ImGui::GetCurrentContext()) {
+        if (HandleD2DMenuTextInput(uMsg, wParam)) return 1;
+        const bool modifierMessage =
+            uMsg == WM_KEYDOWN || uMsg == WM_KEYUP ||
+            uMsg == WM_SYSKEYDOWN || uMsg == WM_SYSKEYUP;
+        const bool layoutModifier =
+            wParam == VK_SHIFT || wParam == VK_LSHIFT || wParam == VK_RSHIFT ||
+            wParam == VK_MENU || wParam == VK_LMENU || wParam == VK_RMENU;
+        const bool bindingKey = farmKeyCapture || autoLastHitOrbsKeyCapture ||
+            aimKeyCapture || aimLockKeyCapture || freeCamKeyCapture;
+        if (modifierMessage && layoutModifier && !bindingKey) {
+            ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
+            return oWndProc ? CallWindowProc(oWndProc, hWnd, uMsg, wParam, lParam)
+                            : DefWindowProc(hWnd, uMsg, wParam, lParam);
+        }
         if (farmKeyCapture) {
             const bool keyboardKey = uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN;
             const bool mouseKey = uMsg == WM_LBUTTONDOWN || uMsg == WM_RBUTTONDOWN ||
@@ -520,7 +603,9 @@ LRESULT __stdcall hkWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             }
         }
         if (uMsg == WM_SETCURSOR) {
-            SetCursor(LoadCursor(nullptr, IDC_ARROW));
+            // The D2D menu uses ImGui's software cursor. Keeping the Win32
+            // arrow visible here produced two independent pointers.
+            SetCursor(nullptr);
             return TRUE;
         }
 

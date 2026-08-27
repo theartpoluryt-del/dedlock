@@ -53,6 +53,9 @@
     <ClCompile Include="hero_scripts.cpp">
       <Filter>Исходные файлы</Filter>
     </ClCompile>
+    <ClCompile Include="movement_probe.cpp">
+      <Filter>Исходные файлы</Filter>
+    </ClCompile>
     <ClCompile Include="imgui-1.92.8\backends\imgui_impl_dx11.cpp">
       <Filter>Исходные файлы</Filter>
     </ClCompile>

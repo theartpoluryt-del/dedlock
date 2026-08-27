@@ -2,6 +2,8 @@
 #include "portable_paths.h"
 
 #include <MinHook.h>
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <atomic>
 
 // The protobuf type and its generated implementation are kept in the work
 // tree supplied with this project. They are the same CMsgSosStartSoundEvent
@@ -29,10 +32,155 @@ void* parseMessageTarget = nullptr;
 bool soundHookInstalled = false;
 volatile LONG soundParsingDisabled = 0;
 volatile LONG damageParsingDisabled = 0;
+volatile LONG networkDumpDisabled = 0;
 std::mutex soundLogMutex;
+std::mutex networkDumpMutex;
 std::mutex soundCacheMutex;
 std::unordered_map<uint32_t, bool> meleeSoundHashCache;
+struct NetworkMessageStats {
+    uint64_t count = 0;
+    uint64_t lastPayloadHash = 0;
+    uint32_t loggedPayloads = 0;
+};
+std::unordered_map<std::string, NetworkMessageStats> networkMessageStats;
+uint64_t networkDumpLines = 0;
 constexpr char kMeleeChargeSound[] = "Player.Melee.Hold.Shared";
+constexpr uint64_t kMaxNetworkDumpLines = 50000;
+constexpr uint32_t kMaxPayloadsPerType = 2000;
+constexpr size_t kMaxNetworkPayloadChars = 8192;
+bool IsReadable(uintptr_t address, size_t size = sizeof(uintptr_t));
+std::atomic<uint64_t> packetEntitiesSequence{0};
+std::atomic<int32_t> latestServerTick{-1};
+std::atomic<bool> packetEntitiesSchemaLogged{false};
+
+struct PacketEntitiesMetadata {
+    bool valid = false;
+    int32_t serverTick = -1;
+    int32_t deltaFrom = -1;
+    int32_t updatedEntries = -1;
+    uint32_t entityDataBytes = 0;
+    uint64_t entityDataHash = 0;
+};
+
+uint64_t HashBytes(const std::string& value) {
+    // FNV-1a is deterministic across processes, unlike std::hash.
+    uint64_t hash = 1469598103934665603ull;
+    for (const unsigned char byte : value) {
+        hash ^= byte;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+bool ReadIntegralField(const google::protobuf::Message& message,
+                       const google::protobuf::FieldDescriptor* field,
+                       int64_t& value) {
+    if (!field || field->is_repeated()) return false;
+    const auto* reflection = message.GetReflection();
+    if (!reflection || !reflection->HasField(message, field)) return false;
+    using CppType = google::protobuf::FieldDescriptor::CppType;
+    switch (field->cpp_type()) {
+        case CppType::CPPTYPE_INT32:
+            value = reflection->GetInt32(message, field); return true;
+        case CppType::CPPTYPE_UINT32:
+            value = reflection->GetUInt32(message, field); return true;
+        case CppType::CPPTYPE_INT64:
+            value = reflection->GetInt64(message, field); return true;
+        case CppType::CPPTYPE_UINT64:
+            value = static_cast<int64_t>(reflection->GetUInt64(message, field));
+            return true;
+        case CppType::CPPTYPE_BOOL:
+            value = reflection->GetBool(message, field) ? 1 : 0; return true;
+        case CppType::CPPTYPE_ENUM:
+            value = reflection->GetEnumValue(message, field); return true;
+        default:
+            return false;
+    }
+}
+
+bool ReadNamedIntegralField(const google::protobuf::Message& message,
+                            const char* name, int64_t& value) {
+    const auto* descriptor = message.GetDescriptor();
+    return descriptor && ReadIntegralField(
+        message, descriptor->FindFieldByName(name), value);
+}
+
+void ObserveNetworkTimingMessageUnsafe(uintptr_t netMessage) {
+    auto* message = reinterpret_cast<google::protobuf::Message*>(
+        netMessage + kParseMessageProtobufOffset);
+    const auto* descriptor = message->GetDescriptor();
+    if (!descriptor || descriptor->name() != "CNETMsg_Tick") return;
+    int64_t tick = -1;
+    if (ReadNamedIntegralField(*message, "tick", tick))
+        latestServerTick.store(static_cast<int32_t>(tick),
+                               std::memory_order_release);
+}
+
+PacketEntitiesMetadata ReadPacketEntitiesMetadataUnsafe(uintptr_t netMessage) {
+    PacketEntitiesMetadata metadata{};
+    auto* message = reinterpret_cast<google::protobuf::Message*>(
+        netMessage + kParseMessageProtobufOffset);
+    const auto* descriptor = message->GetDescriptor();
+    const auto* reflection = message->GetReflection();
+    if (!descriptor || !reflection ||
+        descriptor->name() != "CSVCMsg_PacketEntities") return metadata;
+
+    metadata.valid = true;
+    if (!packetEntitiesSchemaLogged.exchange(true,
+                                              std::memory_order_acq_rel)) {
+        std::ofstream schema(Dll6Paths::DataFileA(
+            "lockify_packet_entities_schema.log"), std::ios::trunc);
+        if (schema) {
+            schema << "message=" << descriptor->full_name() << '\n';
+            for (int index = 0; index < descriptor->field_count(); ++index) {
+                const auto* field = descriptor->field(index);
+                if (!field) continue;
+                schema << field->number() << ',' << field->name() << ','
+                       << field->type_name() << ',' << field->cpp_type_name()
+                       << ",repeated=" << field->is_repeated() << '\n';
+            }
+        }
+    }
+    metadata.serverTick = latestServerTick.load(std::memory_order_acquire);
+    int64_t value = 0;
+    if (ReadNamedIntegralField(*message, "server_tick", value))
+        metadata.serverTick = static_cast<int32_t>(value);
+    if (ReadNamedIntegralField(*message, "delta_from", value))
+        metadata.deltaFrom = static_cast<int32_t>(value);
+    if (ReadNamedIntegralField(*message, "updated_entries", value))
+        metadata.updatedEntries = static_cast<int32_t>(value);
+
+    const auto* entityData = descriptor->FindFieldByName("entity_data");
+    if (entityData && !entityData->is_repeated() &&
+        entityData->cpp_type() ==
+            google::protobuf::FieldDescriptor::CPPTYPE_STRING &&
+        reflection->HasField(*message, entityData)) {
+        std::string scratch;
+        const std::string& bytes = reflection->GetStringReference(
+            *message, entityData, &scratch);
+        metadata.entityDataBytes = static_cast<uint32_t>(
+            (std::min)(bytes.size(), static_cast<size_t>(UINT32_MAX)));
+        metadata.entityDataHash = HashBytes(bytes);
+    }
+    return metadata;
+}
+
+PacketEntitiesMetadata TryReadPacketEntitiesMetadata(uintptr_t serializer,
+                                                     uintptr_t netMessage) {
+    PacketEntitiesMetadata metadata{};
+    if (!movementProbeEnabled || !IsReadable(serializer, 0x2A) ||
+        !IsReadable(netMessage + kParseMessageProtobufOffset)) return metadata;
+    __try {
+        const uint16_t type = Read<uint16_t>(serializer + 0x28);
+        if (type == 4)
+            ObserveNetworkTimingMessageUnsafe(netMessage);
+        else if (type == 55)
+            metadata = ReadPacketEntitiesMetadataUnsafe(netMessage);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        metadata = {};
+    }
+    return metadata;
+}
 
 bool FindCachedMeleeSound(uint32_t hash, bool& isMeleeCharge) {
     std::lock_guard<std::mutex> lock(soundCacheMutex);
@@ -60,7 +208,7 @@ void LogSoundEvent(int sourceEntity, uint32_t hash, const char* soundName) {
     (void)soundName;
 }
 
-bool IsReadable(uintptr_t address, size_t size = sizeof(uintptr_t)) {
+bool IsReadable(uintptr_t address, size_t size) {
     if (!address || size == 0) return false;
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi))) return false;
@@ -236,12 +384,113 @@ void TryHandleDamageMessage(uintptr_t serializer, uintptr_t netMessage) {
     }
 }
 
+bool IsInterestingNetworkMessage(const std::string& fullName) {
+    std::string lowered = fullName;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+        [](unsigned char value) {
+            return static_cast<char>(std::tolower(value));
+        });
+    if (lowered.find("sosstartsound") != std::string::npos ||
+        lowered.find("damage") != std::string::npos) {
+        return false;
+    }
+    constexpr const char* needles[]{
+        "usermessage", "gameevent", "event", "custom", "text", "chat",
+        "command", "console", "script", "panorama", "hud"
+    };
+    for (const char* needle : needles) {
+        if (lowered.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+void DumpNetworkMessageUnsafe(uintptr_t serializer, uintptr_t netMessage) {
+    const uint16_t typeId = Read<uint16_t>(serializer + 0x28);
+    auto* message = reinterpret_cast<google::protobuf::Message*>(
+        netMessage + kParseMessageProtobufOffset);
+    const auto* descriptor = message->GetDescriptor();
+    if (!descriptor) return;
+
+    const std::string fullName = descriptor->full_name();
+    const bool interesting = IsInterestingNetworkMessage(fullName);
+    std::lock_guard<std::mutex> lock(networkDumpMutex);
+    NetworkMessageStats& stats = networkMessageStats[fullName];
+    ++stats.count;
+    if (networkDumpLines >= kMaxNetworkDumpLines) return;
+
+    // Keep a catalog entry for every decoded protobuf type. For likely
+    // Lockify control/user messages, also retain every changed payload.
+    if (!interesting) {
+        if (stats.count != 1) return;
+        std::ofstream catalog(
+            Dll6Paths::DataFileA("lockify_net_types.log"), std::ios::app);
+        if (catalog) {
+            catalog << GetTickCount64() << ",type=" << typeId
+                    << ",name=" << fullName
+                    << ",bytes=" << message->ByteSizeLong() << '\n';
+        }
+        return;
+    }
+    if (stats.loggedPayloads >= kMaxPayloadsPerType) return;
+
+    std::string payload = message->ShortDebugString();
+    const uint64_t payloadHash = static_cast<uint64_t>(
+        std::hash<std::string>{}(payload));
+    if (stats.loggedPayloads && payloadHash == stats.lastPayloadHash) return;
+    stats.lastPayloadHash = payloadHash;
+    ++stats.loggedPayloads;
+    ++networkDumpLines;
+    if (payload.size() > kMaxNetworkPayloadChars) {
+        payload.resize(kMaxNetworkPayloadChars);
+        payload += " ...<truncated>";
+    }
+    std::replace(payload.begin(), payload.end(), '\n', ' ');
+    std::replace(payload.begin(), payload.end(), '\r', ' ');
+
+    std::ofstream log(
+        Dll6Paths::DataFileA("lockify_net_messages.log"), std::ios::app);
+    if (log) {
+        log << GetTickCount64() << ",type=" << typeId
+            << ",name=" << fullName
+            << ",bytes=" << message->ByteSizeLong()
+            << ",payload=" << payload << '\n';
+    }
+}
+
+void TryDumpNetworkMessage(uintptr_t serializer, uintptr_t netMessage) {
+    if (!movementProbeEnabled ||
+        InterlockedCompareExchange(&networkDumpDisabled, 0, 0) != 0 ||
+        !IsReadable(serializer, 0x2A) ||
+        !IsReadable(netMessage + kParseMessageProtobufOffset)) {
+        return;
+    }
+    __try {
+        DumpNetworkMessageUnsafe(serializer, netMessage);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&networkDumpDisabled, 1);
+        LogSound("network protobuf dumper exception; capture disabled");
+    }
+}
+
 bool __fastcall HookParseMessage(uintptr_t demoRecorder, uintptr_t serializer, uintptr_t netMessage) {
+    PacketEntitiesMetadata packetMetadata{};
     if (serializer && netMessage) {
+        packetMetadata = TryReadPacketEntitiesMetadata(serializer, netMessage);
+        TryDumpNetworkMessage(serializer, netMessage);
         TryHandleSoundMessage(serializer, netMessage);
         TryHandleDamageMessage(serializer, netMessage);
     }
-    return originalParseMessage ? originalParseMessage(demoRecorder, serializer, netMessage) : false;
+    const bool result = originalParseMessage
+        ? originalParseMessage(demoRecorder, serializer, netMessage) : false;
+    if (result && packetMetadata.valid) {
+        const uint64_t sequence = packetEntitiesSequence.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        CaptureMovementPacketEntitySnapshot(
+            sequence, packetMetadata.serverTick, packetMetadata.deltaFrom,
+            packetMetadata.updatedEntries, packetMetadata.entityDataBytes,
+            packetMetadata.entityDataHash);
+    }
+    return result;
 }
 
 } // namespace
@@ -264,6 +513,23 @@ bool InstallSoundEventHook() {
     const MH_STATUS enableStatus = MH_EnableHook(parseMessageTarget);
     if (enableStatus != MH_OK && enableStatus != MH_ERROR_ENABLED) return false;
     soundHookInstalled = true;
+    {
+        std::lock_guard<std::mutex> lock(networkDumpMutex);
+        networkMessageStats.clear();
+        networkDumpLines = 0;
+        packetEntitiesSequence.store(0, std::memory_order_relaxed);
+        latestServerTick.store(-1, std::memory_order_relaxed);
+        packetEntitiesSchemaLogged.store(false, std::memory_order_relaxed);
+        InterlockedExchange(&networkDumpDisabled, 0);
+        std::ofstream types(
+            Dll6Paths::DataFileA("lockify_net_types.log"), std::ios::trunc);
+        if (types) types << "timestamp,type,name,bytes\n";
+        std::ofstream messages(
+            Dll6Paths::DataFileA("lockify_net_messages.log"),
+            std::ios::trunc);
+        if (messages)
+            messages << "timestamp,type,name,bytes,payload\n";
+    }
     LogSound("installed");
     return true;
 }
@@ -272,6 +538,19 @@ void RemoveSoundEventHook() {
     if (!soundHookInstalled) return;
     MH_DisableHook(parseMessageTarget);
     MH_RemoveHook(parseMessageTarget);
+    {
+        std::lock_guard<std::mutex> lock(networkDumpMutex);
+        std::ofstream summary(
+            Dll6Paths::DataFileA("lockify_net_summary.log"),
+            std::ios::trunc);
+        if (summary) {
+            summary << "name,count,logged_payloads\n";
+            for (const auto& [name, stats] : networkMessageStats)
+                summary << name << ',' << stats.count << ','
+                        << stats.loggedPayloads << '\n';
+        }
+        networkMessageStats.clear();
+    }
     parseMessageTarget = nullptr;
     originalParseMessage = nullptr;
     soundHookInstalled = false;

@@ -12,6 +12,8 @@ struct SkyState { ColorRGBA tint{}, lightTint{}; float brightness{1.f}; bool ena
 std::unordered_map<uintptr_t, SkyState> skyStates;
 uintptr_t drawSkybox{}, draw3dSkybox{};
 bool oldDrawSkybox{true}, oldDraw3dSkybox{true}, cvarsCaptured{};
+uintptr_t postProcessEnable{};
+bool oldPostProcessEnable{true}, postProcessCaptured{}, postProcessSuppressed{};
 EnvSkyUpdateFn updateSky{};
 ULONGLONG nextScan{};
 uintptr_t skyTint{}, skyLightTint{}, skyBrightness{}, skyEnabled{};
@@ -90,6 +92,26 @@ void ApplySky(uintptr_t entity) {
     NotifySky(entity);
 }
 
+}
+
+void SetDrifterPostProcessingSuppressed(bool suppressed) {
+    if (!postProcessEnable)
+        postProcessEnable = FindConVar("r_postprocess_enable");
+    if (!postProcessEnable) return;
+
+    if (suppressed) {
+        if (!postProcessSuppressed) {
+            oldPostProcessEnable = CVarBool(postProcessEnable);
+            postProcessCaptured = true;
+        }
+        SetCVarBool(postProcessEnable, false);
+        postProcessSuppressed = true;
+    } else if (postProcessSuppressed) {
+        if (postProcessCaptured)
+            SetCVarBool(postProcessEnable, oldPostProcessEnable);
+        postProcessSuppressed = false;
+        postProcessCaptured = false;
+    }
 }
 
 void RestoreWorldVisuals() {

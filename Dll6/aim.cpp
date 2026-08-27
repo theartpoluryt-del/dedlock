@@ -1081,7 +1081,6 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
         return;
     }
     const bool farmAiming = farmToggleMode ? farmToggleActive : configuredFarmKeyDown;
-    if (!farmSilentMode && !farmMixedMode) ClearPendingCreepAngles();
     if (menuOpen || !currentViewMatrixReady || !farmAiming) {
         ClearPendingCreepAngles();
         return;
@@ -1090,17 +1089,7 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     const float cx = display.x * 0.5f;
     const float cy = display.y * 0.5f;
-    // AimAtClosestEnemy runs immediately before this function and sets this
-    // only when it found a live target inside Human FOV (including its
-    // visibility rules). A player merely present on screen must not suppress
-    // creep aim.
-    if (humanAimTargetFound) {
-        ClearPendingCreepAngles();
-        return;
-    }
-
     FarmTarget best{};
-    Vector2 bestScreen{};
     Vector3 bestPoint{};
     float bestDistance = farmFov * farmFov;
     const uint8_t localTeam = currentLocalPawn
@@ -1118,17 +1107,40 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
     std::vector<FarmCandidate> candidates;
     candidates.reserve(targetSnapshot.size());
     for (const auto& target : targetSnapshot) {
-        if (localTeam != 0 && target.team == localTeam) continue;
         if (!target.entity || Read<int>(target.entity + Offsets::Health) <= 0 ||
             Read<uint8_t>(target.entity + Offsets::LifeState) != 0) continue;
+        const uintptr_t sceneNode =
+            Read<uintptr_t>(target.entity + Offsets::GameSceneNode);
+        if (!sceneNode || Read<uint8_t>(sceneNode + Offsets::SceneNodeDormant) != 0)
+            continue;
+        const std::string liveClassName = GetEntityClassName(target.entity);
+        if ((liveClassName.find("NPC_Trooper") == std::string::npos &&
+             liveClassName.find("C_NPC_Trooper") == std::string::npos) ||
+            liveClassName.find("TrooperBoss") != std::string::npos)
+            continue;
+        const uint8_t liveTeam =
+            Read<uint8_t>(target.entity + Offsets::Team);
+        if (liveTeam != 2 && liveTeam != 3 && liveTeam != 4) continue;
+        if (localTeam != 0 && liveTeam == localTeam) continue;
+        // The worker publishes positions asynchronously. Refresh the origin
+        // before selecting a target so a recycled/stale snapshot can never
+        // turn into an aim point somewhere else in the world.
+        Vector3 livePosition{};
+        if (!GetEntityPosition(target.entity, livePosition)) continue;
         Vector2 screen{};
-        const Vector3 approximatePoint{ target.pos.x, target.pos.y, target.pos.z + 24.0f };
+        const Vector3 approximatePoint{
+            livePosition.x, livePosition.y, livePosition.z + 64.0f };
         if (!WorldToScreen(approximatePoint, screen, currentViewMatrix)) continue;
         const float dx = screen.x - cx;
         const float dy = screen.y - cy;
         const float distance = dx * dx + dy * dy;
-        if (distance < farmFov * farmFov)
-            candidates.push_back({ distance, target });
+        if (distance < farmFov * farmFov) {
+            FarmTarget liveTarget = target;
+            liveTarget.pos = livePosition;
+            liveTarget.team = liveTeam;
+            liveTarget.className = liveClassName;
+            candidates.push_back({ distance, std::move(liveTarget) });
+        }
     }
     std::sort(candidates.begin(), candidates.end(),
         [](const FarmCandidate& left, const FarmCandidate& right) {
@@ -1138,10 +1150,11 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
     const bool depthAvailable =
         EnableNativeAimTrace ? clientBase != 0 : depthSnapshotReady;
     for (const auto& candidate : candidates) {
+        // Trooper head height is stable across the creep models and is also
+        // independent of the optional hero-bone resolver (which is not
+        // populated for every NPC_Trooper variant).
         Vector3 point{ candidate.target.pos.x, candidate.target.pos.y,
-                       candidate.target.pos.z + 24.0f };
-        // Only nearby screen candidates reach this expensive engine call.
-        GetEntityBonePosition(candidate.target.entity, "head", point);
+                       candidate.target.pos.z + 64.0f };
         if (aimVisibilityCheck && depthAvailable &&
             !IsWorldAimPointVisible(point, candidate.target.entity)) continue;
         Vector2 screen{};
@@ -1151,7 +1164,6 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
         const float distance = dx * dx + dy * dy;
         if (distance >= bestDistance) continue;
         best = candidate.target;
-        bestScreen = screen;
         bestPoint = point;
         bestDistance = distance;
         // Candidates are ordered by their inexpensive screen estimate. The
@@ -1164,13 +1176,18 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
         return;
     }
 
+    Vector3 commandAngles{};
+    // Publish the exact selected angle for Normal too. The visible camera and
+    // the firing command must agree even when another aim helper is enabled.
+    if (GetAimAnglesToWorldPoint(bestPoint, commandAngles)) {
+        std::lock_guard<std::mutex> lock(creepSilentMutex);
+        pendingCreepAngles = commandAngles;
+        pendingCreepReady = true;
+    } else {
+        ClearPendingCreepAngles();
+        return;
+    }
     if (farmSilentMode || farmMixedMode) {
-        Vector3 commandAngles{};
-        if (GetAimAnglesFromScreen(bestScreen.x, bestScreen.y, commandAngles)) {
-            std::lock_guard<std::mutex> lock(creepSilentMutex);
-            pendingCreepAngles = commandAngles;
-            pendingCreepReady = true;
-        }
         if (farmSilentMode)
             return;
     }
@@ -1178,7 +1195,6 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
     // Normal creep aim uses the same per-frame gameplay-camera path as the
     // current human Normal/Mixed aim. It never moves the OS cursor and uses
     // the same time-based pitch/yaw smoothing in FlushCurrentCameraAim.
-    ClearPendingCreepAngles();
     cachedFarmAimPoint = bestPoint;
     farmNormalActive = true;
 }
@@ -1765,7 +1781,7 @@ void UpdateVisibleAimCamera() {
     if ((!humanVisibleAim && !creepVisibleAim) || menuOpen ||
         !currentViewMatrixReady)
         return;
-    if (creepVisibleAim && !humanVisibleAim) {
+    if (creepVisibleAim) {
         ApplyCurrentCameraAim(cachedFarmAimPoint);
         return;
     }

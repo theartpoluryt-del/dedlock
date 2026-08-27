@@ -13,18 +13,26 @@ void SetMenuOpen(bool open) {
     menuOpen = open;
 
     if (imguiInitialized && ImGui::GetCurrentContext()) {
-        ImGui::GetIO().MouseDrawCursor = open;
+        ImGuiIO& io = ImGui::GetIO();
+        io.MouseDrawCursor = open;
+        if (open && gameWindow) {
+            POINT cursor{};
+            if (GetCursorPos(&cursor) && ScreenToClient(gameWindow, &cursor))
+                io.AddMousePosEvent(static_cast<float>(cursor.x),
+                                    static_cast<float>(cursor.y));
+        }
     }
 
     if (open) {
-        if (gameWindow) {
-            SetCapture(gameWindow);
-            SetFocus(gameWindow);
-        }
+        // ImGui draws the only visible cursor. Capturing the HWND here left
+        // Source 2's relative cursor active after Alt-Tab and produced a
+        // second, frozen pointer at the center of the screen.
+        ReleaseCapture();
         ClipCursor(nullptr);
-        SetCursor(LoadCursor(nullptr, IDC_ARROW));
+        SetCursor(nullptr);
     } else {
         ReleaseCapture();
+        SetCursor(nullptr);
     }
 }
 
@@ -1635,7 +1643,11 @@ std::vector<PlayerData> GetPlayers() {
                 entity, "leg_upper_L", player.leftLegPos);
             player.hasRightLegBone = GetEntityBonePosition(
                 entity, "leg_upper_R", player.rightLegPos);
-            if (drawBones) GetEntityBoneSkeleton(entity, player.bones);
+            const bool ally = localTeam != 0 && team == localTeam;
+            const bool skeletonEnabled = drawBones ||
+                (ally ? allyBonesEnabled : enemyBonesEnabled);
+            if (skeletonEnabled)
+                GetEntityBoneSkeleton(entity, player.bones);
         }
         player.health = health;
         player.maxHealth = Read<int>(entity + Offsets::MaxHealth);
@@ -2845,7 +2857,8 @@ void RenderESP(const std::vector<PlayerData>& players) {
         const bool teamNames = ally ? allyNamesEnabled : enemyNamesEnabled;
         const bool teamPlayerNames = ally ? allyPlayerNamesEnabled : enemyPlayerNamesEnabled;
         const bool teamDistance = ally ? allyDistanceEnabled : enemyDistanceEnabled;
-        const bool teamBones = ally ? allyBonesEnabled : enemyBonesEnabled;
+        const bool teamBones = drawBones ||
+            (ally ? allyBonesEnabled : enemyBonesEnabled);
         const ImColor boxColor = makeColor(ally ? teammateBoxColor : enemyBoxColor);
         const ImColor nameColor = makeColor(ally ? teammateNameColor : enemyNameColor);
         const ImColor skeletonColor = makeColor(
@@ -3775,6 +3788,13 @@ static void RenderMenuV2(size_t playerCount) {
             BeginPanel("##misc_utility", "Utility", "Gameplay convenience", 490);
             Toggle("Auto parry", "Automatically use parry", &autoParry);
             Toggle("Spectator list", "Show current observers", &drawSpectatorList);
+            Toggle("Disable Drifter Darkness",
+                   "Remove Darkness vision and minimap restrictions",
+                   &disableDrifterDarkness);
+            Toggle("Auto Active Reload",
+                   "Automatically hit the Active Reload window",
+                   &autoActiveReload);
+            Toggle("BunnyHop", "Keep jumping while Space is held", &bunnyHop);
             Toggle("Free camera", "Detach camera from player", &freeCam);
             Slider("Freecam speed", &freeCamSpeed, 50.0f, 5000.0f, "%.0f u/s");
             ImGui::TextColored(secondary, "Freecam key");
@@ -4260,6 +4280,9 @@ void RenderMenu(size_t playerCount) {
         } else {
             Toggle("Auto parry", &autoParry, nullptr);
             Toggle("Spectator list", &drawSpectatorList, nullptr);
+            Toggle("Disable Drifter Darkness", &disableDrifterDarkness, nullptr);
+            Toggle("Auto Active Reload", &autoActiveReload, nullptr);
+            Toggle("BunnyHop", &bunnyHop, nullptr);
             Toggle("Free camera", &freeCam, nullptr);
             Slider("Freecam speed", &freeCamSpeed, 50.0f, 5000.0f, "%.0f u/s");
             ImGui::TextColored(grey, "Freecam key");

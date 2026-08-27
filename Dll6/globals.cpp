@@ -3,7 +3,11 @@
 #include "panorama_preview.h"
 #include "portable_paths.h"
 #include "resource.h"
+#include <cwctype>
 bool freeCam=false;
+bool disableDrifterDarkness=false;
+bool autoActiveReload=false;
+bool bunnyHop=false;
 bool freeCamActive=false;
 bool movementDiagnostics=false;
 std::atomic<unsigned long long> movementProcessCalls{0};
@@ -77,7 +81,7 @@ volatile ULONGLONG lastSilentAttackAppliedAt = 0;
 volatile LONG autoOrbAttackAppliedCount = 0;
 uintptr_t clientBase=0; bool menuOpen=false,drawEsp=true,drawBoxes=true,drawHealth=true,drawHealthValues=true,drawNames=true,drawDistance=true,drawSnaplines=false,drawFovCircle=true,drawFarmFovCircle=false,drawBones=false,drawCreepEsp=false,farmAssist=false,autoLastHitOrbs=false,drawOrbEsp=false,drawSpectatorList=false,collisionDiagnostics=false,remSizedHull=false,glowEnabled=true,aimAssist=true,autoParry=true,imguiInitialized=false,consoleAttached=false; float aimFov=180.0f,farmFov=180.0f,aimSmooth=6.0f,fovCircleAlpha=110.0f,farmFovAlpha=110.0f,snaplineAlpha=180.0f; bool aimVisibilityCheck=true; Vector3 currentLocalPosition{}; bool currentLocalPositionReady=false; Vector3 currentCameraPosition{}; bool currentCameraPositionReady=false; uintptr_t currentLocalPawn=0; uint32_t currentLocalPawnHandle=0xFFFFFFFFu; std::mutex meleeObjectsMutex; std::vector<uintptr_t> meleeObjects; std::mutex silentAnglesMutex; Vector3 pendingSilentAngles{}; bool pendingSilentAnglesReady=false,pendingSilentAttack=false; std::mutex humanSilentMutex,creepSilentMutex,orbSilentMutex; Vector3 pendingHumanAngles{},pendingCreepAngles{},pendingOrbAngles{}; bool pendingHumanReady=false,pendingCreepReady=false,pendingOrbReady=false,pendingOrbAttack=false; std::mutex farmTargetsMutex; std::vector<FarmTarget> farmTargets; std::mutex orbTargetsMutex; std::vector<OrbTarget> orbTargets; std::mutex worldEspTargetsMutex; std::vector<WorldEspTarget> worldEspTargets;
 ID3D11Texture2D* depthStaging=nullptr; UINT depthWidth=0,depthHeight=0; DXGI_FORMAT depthFormat=DXGI_FORMAT_UNKNOWN; bool depthSnapshotReady=false; int depthDiagnosticState=-1; Matrix4x4 currentViewMatrix{}; bool currentViewMatrixReady=false;
-ID3D11Device* pDevice=nullptr; ID3D11DeviceContext* pContext=nullptr; ID3D11RenderTargetView* pRenderTargetView=nullptr; HWND gameWindow=nullptr; WNDPROC oWndProc=nullptr; HMODULE moduleHandle=nullptr; void** presentVTable=nullptr; volatile LONG unloadRequested=0,unloadThreadStarted=0; std::mutex glowMutex,heroPawnsMutex; std::unordered_set<uintptr_t> registeredGlows,queuedGlows; EspStatus espStatus; std::unordered_map<uintptr_t,bool> combatVTables; std::vector<uintptr_t> heroVTables,heroPawns; HANDLE heroDiscoveryThread=nullptr,glowApplyThread=nullptr,farmTargetThread=nullptr,stopHeroDiscoveryEvent=nullptr; PresentFn oPresent=nullptr;
+ID3D11Device* pDevice=nullptr; ID3D11DeviceContext* pContext=nullptr; ID3D11RenderTargetView* pRenderTargetView=nullptr; HWND gameWindow=nullptr; WNDPROC oWndProc=nullptr; HMODULE moduleHandle=nullptr; HANDLE moduleInstanceGuard=nullptr,moduleReadyEvent=nullptr; void** presentVTable=nullptr; volatile LONG unloadRequested=0,unloadThreadStarted=0; std::mutex glowMutex,heroPawnsMutex; std::unordered_set<uintptr_t> registeredGlows,queuedGlows; EspStatus espStatus; std::unordered_map<uintptr_t,bool> combatVTables; std::vector<uintptr_t> heroVTables,heroPawns; HANDLE heroDiscoveryThread=nullptr,glowApplyThread=nullptr,farmTargetThread=nullptr,stopHeroDiscoveryEvent=nullptr; PresentFn oPresent=nullptr;
 bool humanAimTargetFound = false;
 bool aimSilentMode = false;
 bool aimMixedMode = false;
@@ -136,6 +140,7 @@ bool enemyPlayerNamesEnabled = true, allyPlayerNamesEnabled = true;
 bool enemyDistanceEnabled = true, allyDistanceEnabled = true;
 bool enemySnaplinesEnabled = true, allySnaplinesEnabled = true;
 bool enemyBonesEnabled = true, allyBonesEnabled = true;
+float menuAccentColor[4] = {0.15f, 0.62f, 1.00f, 1.00f};
 float enemyBoxColor[4] = {0.20f, 1.00f, 0.10f, 1.00f};
 float teammateBoxColor[4] = {0.20f, 0.60f, 1.00f, 1.00f};
 float enemyPlayerNameColor[4] = {0.25f, 0.85f, 1.00f, 1.00f};
@@ -198,11 +203,50 @@ float campTimerColor[4] = {1.00f, 0.82f, 0.20f, 1.00f};
 float campTimerMinimapSize = 15.0f;
 std::mutex campTimersMutex; std::vector<CampTimerData> campTimers;
 namespace {
+std::string configPathOverride;
+
 std::string ConfigPath() {
+    if (!configPathOverride.empty()) return configPathOverride;
     // A manual-mapped image has no loader path. LOCALAPPDATA is available for
     // both LoadLibrary and manual-map injection and remains writable when the
     // game itself is installed below Program Files.
-    return Dll6Paths::DataFileA("Dll6.ini");
+    return Dll6Paths::DataFileA("menu.ini");
+}
+
+std::wstring NormalizeProfileName(std::wstring name) {
+    while (!name.empty() && iswspace(name.front())) name.erase(name.begin());
+    while (!name.empty() && iswspace(name.back())) name.pop_back();
+    if (name.size() > 48) name.resize(48);
+    if (name.size() > 4 && _wcsicmp(name.c_str() + name.size() - 4, L".ini") == 0)
+        name.resize(name.size() - 4);
+    while (!name.empty() && (iswspace(name.back()) || name.back() == L'.'))
+        name.pop_back();
+    if (name.empty() || name == L"." || name == L"..")
+        return {};
+    for (wchar_t character : name) {
+        if (character < 32 || wcschr(L"<>:\"/\\|?*", character)) return {};
+    }
+    return name;
+}
+
+std::string WideToAnsi(const std::wstring& value) {
+    if (value.empty()) return {};
+    const int length = WideCharToMultiByte(CP_ACP, 0, value.c_str(),
+                                            static_cast<int>(value.size()),
+                                            nullptr, 0, nullptr, nullptr);
+    if (length <= 0) return {};
+    std::string result(static_cast<size_t>(length), '\0');
+    WideCharToMultiByte(CP_ACP, 0, value.c_str(), static_cast<int>(value.size()),
+                        result.data(), length, nullptr, nullptr);
+    return result;
+}
+
+std::string ProfilePath(const std::wstring& rawName) {
+    const std::wstring name = NormalizeProfileName(rawName);
+    if (name.empty()) return {};
+    const std::string ansiName = WideToAnsi(name);
+    if (ansiName.empty()) return {};
+    return Dll6Paths::DataFileA((ansiName + ".ini").c_str());
 }
 
 bool TryMigrateLegacyConfig(const std::string& destination) {
@@ -215,6 +259,20 @@ bool TryMigrateLegacyConfig(const std::string& destination) {
             return false;
         return CopyFileA(source.c_str(), destination.c_str(), TRUE) != FALSE;
     };
+
+    // Preserve settings created by builds that used %LOCALAPPDATA%\Dll6.
+    char localAppData[32768]{};
+    const DWORD localLength = GetEnvironmentVariableA(
+        "LOCALAPPDATA", localAppData,
+        static_cast<DWORD>(std::size(localAppData)));
+    if (localLength && localLength < std::size(localAppData)) {
+        std::string oldConfig(localAppData, localLength);
+        while (!oldConfig.empty() &&
+               (oldConfig.back() == '\\' || oldConfig.back() == '/'))
+            oldConfig.pop_back();
+        oldConfig += "\\Dll6\\Dll6.ini";
+        if (tryCopy(oldConfig)) return true;
+    }
 
     // LoadLibrary builds historically kept Dll6.ini beside the DLL.
     char modulePath[32768]{};
@@ -238,7 +296,7 @@ bool TryMigrateLegacyConfig(const std::string& destination) {
 }
 
 void ApplyPendingConfigRestore(const std::string& destination) {
-    const std::string pending = Dll6Paths::DataFileA("Dll6.restore.ini");
+    const std::string pending = Dll6Paths::DataFileA("menu.restore.ini");
     const DWORD attributes = GetFileAttributesA(pending.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES ||
         (attributes & FILE_ATTRIBUTE_DIRECTORY))
@@ -247,7 +305,7 @@ void ApplyPendingConfigRestore(const std::string& destination) {
     // Keep the displaced file once for recovery, then atomically consume the
     // prepared restore on the next injection. This also avoids fighting an
     // older injected build that may still be autosaving while the game runs.
-    const std::string backup = Dll6Paths::DataFileA("Dll6.before_restore.ini");
+    const std::string backup = Dll6Paths::DataFileA("menu.before_restore.ini");
     CopyFileA(destination.c_str(), backup.c_str(), TRUE);
     MoveFileExA(pending.c_str(), destination.c_str(),
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
@@ -276,9 +334,11 @@ bool ExtractBundledDefaultConfig(const std::string& path) {
 
 void LoadConfig() {
     const std::string path = ConfigPath();
-    ApplyPendingConfigRestore(path);
+    const bool loadingProfile = !configPathOverride.empty();
+    if (!loadingProfile) ApplyPendingConfigRestore(path);
     std::ifstream input(path);
     if (!input) {
+        if (loadingProfile) return;
         input.close();
         input.clear();
         if (TryMigrateLegacyConfig(path) || ExtractBundledDefaultConfig(path))
@@ -376,6 +436,10 @@ void LoadConfig() {
         else if (key == "cornerBoxes") cornerBoxes = value;
         else if (key == "boxThickness") boxThickness = static_cast<float>(number);
         else if (key == "cornerBoxLength") cornerBoxLength = static_cast<float>(number);
+        else if (key == "menuAccentR") menuAccentColor[0] = std::clamp(static_cast<float>(number), 0.0f, 1.0f);
+        else if (key == "menuAccentG") menuAccentColor[1] = std::clamp(static_cast<float>(number), 0.0f, 1.0f);
+        else if (key == "menuAccentB") menuAccentColor[2] = std::clamp(static_cast<float>(number), 0.0f, 1.0f);
+        else if (key == "menuAccentA") menuAccentColor[3] = std::clamp(static_cast<float>(number), 0.0f, 1.0f);
         else if (key == "enemyBoxR") enemyBoxColor[0] = static_cast<float>(number);
         else if (key == "enemyBoxG") enemyBoxColor[1] = static_cast<float>(number);
         else if (key == "enemyBoxB") enemyBoxColor[2] = static_cast<float>(number);
@@ -533,8 +597,14 @@ void LoadConfig() {
         if (key == "drawOrbEsp") drawOrbEsp = value;
         else if (key == "drawSpectatorList") drawSpectatorList = value;
         if (key == "freeCam") freeCam = value;
+        else if (key == "disableDrifterDarkness") disableDrifterDarkness = value;
+        else if (key == "autoActiveReload") autoActiveReload = value;
+        else if (key == "bunnyHop") bunnyHop = value;
         else if (key == "freeCamKey") freeCamKey = static_cast<int>(number);
         else if (key == "freeCamSpeed") freeCamSpeed = static_cast<float>(number);
+        else if (key == "movementProbeEnabled") movementProbeEnabled = value;
+        else if (key == "movementReplayEnabled") movementReplayEnabled = value;
+        else if (key == "movementReplayKey") movementReplayKey = static_cast<int>(number);
         if (key == "farmAssist") farmAssist = value;
         if (key == "autoLastHitOrbs") autoLastHitOrbs = value;
         else if (key == "autoLastHitOrbsAutoFire") autoLastHitOrbsAutoFire = value;
@@ -609,6 +679,71 @@ void LoadConfig() {
     // invalid state with both flags enabled.
     if (aimMixedMode)
         aimSilentMode = false;
+}
+
+std::vector<std::wstring> GetConfigProfiles() {
+    std::vector<std::wstring> profiles;
+    const auto appendDirectory = [&profiles](const std::wstring& directory) {
+        WIN32_FIND_DATAW data{};
+        HANDLE search = FindFirstFileW((directory + L"\\*.ini").c_str(), &data);
+        if (search == INVALID_HANDLE_VALUE) return;
+        do {
+            if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::wstring name = data.cFileName;
+            if (name.size() >= 4 &&
+                _wcsicmp(name.c_str() + name.size() - 4, L".ini") == 0)
+                name.resize(name.size() - 4);
+            if (name.empty() || _wcsicmp(name.c_str(), L"menu.restore") == 0 ||
+                _wcsicmp(name.c_str(), L"menu.before_restore") == 0 ||
+                _wcsicmp(name.c_str(), L"menu") == 0)
+                continue;
+            const bool duplicate = std::any_of(
+                profiles.begin(), profiles.end(), [&name](const std::wstring& existing) {
+                    return _wcsicmp(existing.c_str(), name.c_str()) == 0;
+                });
+            if (!duplicate) profiles.push_back(std::move(name));
+        } while (FindNextFileW(search, &data));
+        FindClose(search);
+    };
+    appendDirectory(Dll6Paths::DataDirectoryW());
+    // Profiles made by the immediately preceding build lived in this
+    // subdirectory. Keep them visible and loadable during migration.
+    appendDirectory(Dll6Paths::DataFileW(L"configs"));
+    std::sort(profiles.begin(), profiles.end(), [](const auto& left, const auto& right) {
+        return _wcsicmp(left.c_str(), right.c_str()) < 0;
+    });
+    return profiles;
+}
+
+bool SaveConfigProfile(const std::wstring& name) {
+    const std::string path = ProfilePath(name);
+    if (path.empty()) return false;
+    configPathOverride = path;
+    SaveConfig();
+    configPathOverride.clear();
+    const DWORD attributes = GetFileAttributesA(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+bool LoadConfigProfile(const std::wstring& name) {
+    std::string path = ProfilePath(name);
+    if (path.empty()) return false;
+    DWORD attributes = GetFileAttributesA(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        const std::wstring normalized = NormalizeProfileName(name);
+        const std::string ansiName = WideToAnsi(normalized);
+        if (!ansiName.empty()) {
+            path = Dll6Paths::DataFileA("configs") + "\\" + ansiName + ".ini";
+            attributes = GetFileAttributesA(path.c_str());
+        }
+    }
+    if (attributes == INVALID_FILE_ATTRIBUTES ||
+        (attributes & FILE_ATTRIBUTE_DIRECTORY)) return false;
+    configPathOverride = path;
+    LoadConfig();
+    configPathOverride.clear();
+    return true;
 }
 
 void SaveConfig() {
@@ -690,6 +825,10 @@ void SaveConfig() {
            << "cornerBoxes " << cornerBoxes << '\n'
            << "boxThickness " << boxThickness << '\n'
            << "cornerBoxLength " << cornerBoxLength << '\n'
+           << "menuAccentR " << menuAccentColor[0] << '\n'
+           << "menuAccentG " << menuAccentColor[1] << '\n'
+           << "menuAccentB " << menuAccentColor[2] << '\n'
+           << "menuAccentA " << menuAccentColor[3] << '\n'
            << "enemyBoxR " << enemyBoxColor[0] << '\n'
            << "enemyBoxG " << enemyBoxColor[1] << '\n'
            << "enemyBoxB " << enemyBoxColor[2] << '\n'
@@ -842,8 +981,14 @@ void SaveConfig() {
            << "drawOrbEsp " << drawOrbEsp << '\n'
            << "drawSpectatorList " << drawSpectatorList << '\n'
            << "freeCam " << freeCam << '\n'
+           << "disableDrifterDarkness " << disableDrifterDarkness << '\n'
+           << "autoActiveReload " << autoActiveReload << '\n'
+           << "bunnyHop " << bunnyHop << '\n'
            << "freeCamKey " << freeCamKey << '\n'
            << "freeCamSpeed " << freeCamSpeed << '\n'
+           << "movementProbeEnabled " << movementProbeEnabled << '\n'
+           << "movementReplayEnabled " << movementReplayEnabled << '\n'
+           << "movementReplayKey " << movementReplayKey << '\n'
            << "farmAssist " << farmAssist << '\n'
            << "autoLastHitOrbs " << autoLastHitOrbs << '\n'
            << "autoLastHitOrbsAutoFire " << autoLastHitOrbsAutoFire << '\n'

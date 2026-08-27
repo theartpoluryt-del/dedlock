@@ -21,7 +21,7 @@ inline std::string DataDirectoryA() {
         while (!result.empty() &&
                (result.back() == '\\' || result.back() == '/'))
             result.pop_back();
-        result += "\\Dll6";
+        result += "\\Axiom";
         CreateDirectoryA(result.c_str(), nullptr);
         return result;
     }();
@@ -42,7 +42,7 @@ inline std::wstring DataDirectoryW() {
         while (!result.empty() &&
                (result.back() == L'\\' || result.back() == L'/'))
             result.pop_back();
-        result += L"\\Dll6";
+        result += L"\\Axiom";
         CreateDirectoryW(result.c_str(), nullptr);
         return result;
     }();

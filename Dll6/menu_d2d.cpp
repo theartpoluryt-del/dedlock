@@ -13,7 +13,9 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <cwctype>
 #include <cwchar>
+#include <initializer_list>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -63,6 +65,7 @@ struct Renderer {
     int pendingFallbackFrames = 0;
     int previewValidationHeroId = 0;
     int previewValidationFrames = 0;
+    int activePreviewHeroId = 0;
     ComPtr<ID2D1Bitmap> tabIcons[4];
     ComPtr<ID2D1Bitmap> previewAbilityIcons[4];
     ComPtr<ID2D1Bitmap> previewHeroPortraits[38];
@@ -120,6 +123,16 @@ struct Renderer {
     float rightContentBottom = 0.0f;
     int activeScrollColumn = 0;
     float scrollGrabOffset = 0.0f;
+    bool profileNameEditing = false;
+    bool profileSaveRequested = false;
+    std::wstring profileName;
+    std::wstring selectedProfile = L"Select config";
+    std::wstring profileStatus;
+    ULONGLONG profileStatusUntil = 0;
+    std::vector<std::wstring> profileItems;
+    int profilePopupFirst = 0;
+    bool searchOpen = false;
+    std::wstring searchQuery;
     void* activeSlider = nullptr;
     std::unordered_map<const void*, float> toggleAnimation;
     std::unordered_map<const void*, float> sliderAnimation;
@@ -146,7 +159,6 @@ struct Popup {
 Popup pendingPopup{};
 int popupSelectionId = 0;
 int popupSelectionValue = -1;
-float menuAccentColor[4] = {0.15f, 0.62f, 1.00f, 1.00f};
 static const wchar_t* const kFarmModes[] = {L"Normal", L"pSilent", L"Mixed"};
 static const wchar_t* const kFarmActivationModes[] = {L"Hold", L"Toggle"};
 static const int kPreviewHeroIds[] = {
@@ -350,7 +362,8 @@ std::wstring KeyName(int key) {
 
 bool Clicked(const Layout& l, const D2D1_RECT_F& r) {
     // The color picker is modal: controls underneath must not receive input.
-    if (g.colorPopup || g.openCombo) return false;
+    if (g.colorPopup || g.openCombo || g.profileNameEditing || g.searchOpen)
+        return false;
     return l.clicked && Contains(r, l.mouse);
 }
 
@@ -789,44 +802,93 @@ void DrawEspChip(const Layout& l, float x, float y, float width,
 
 void DrawNavigationIcon(int variant, float x, float y, bool selected) {
     const D2D1_COLOR_F c = selected ? White() : Muted();
-    if (variant == 0) { DrawEye(x, y, c); return; }                 // Enemy
+    constexpr float stroke = 1.75f;
     SetBrush(c);
-    if (variant == 1) {                                             // Ally
-        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x - 5, y - 3), 5, 5), g.brush.Get(), 1.4f);
-        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x + 5, y - 3), 5, 5), g.brush.Get(), 1.4f);
-        Line(D2D1::Point2F(x - 12, y + 10), D2D1::Point2F(x + 12, y + 10), c, 1.6f); return;
-    }
-    if (variant == 2) {                                             // Creep
-        g.target->DrawRectangle(Rect(x - 8, y - 8, x + 8, y + 8), g.brush.Get(), 1.5f);
-        Line(D2D1::Point2F(x - 12, y), D2D1::Point2F(x - 8, y), c, 1.4f);
-        Line(D2D1::Point2F(x + 8, y), D2D1::Point2F(x + 12, y), c, 1.4f); return;
-    }
-    if (variant == 3) {                                             // Player aim
-        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 8, 8), g.brush.Get(), 1.5f);
-        Line(D2D1::Point2F(x - 13, y), D2D1::Point2F(x + 13, y), c, 1.4f);
-        Line(D2D1::Point2F(x, y - 13), D2D1::Point2F(x, y + 13), c, 1.4f); return;
-    }
-    if (variant == 4) {                                             // Creep aim
-        Line(D2D1::Point2F(x - 9, y + 8), D2D1::Point2F(x, y - 9), c, 1.6f);
-        Line(D2D1::Point2F(x, y - 9), D2D1::Point2F(x + 9, y + 8), c, 1.6f);
-        Line(D2D1::Point2F(x - 6, y + 2), D2D1::Point2F(x + 6, y + 2), c, 1.4f); return;
-    }
-    if (variant == 5) {                                             // World
-        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 10, 10),
-                              g.brush.Get(), 1.5f);
-        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 4, 10),
-                              g.brush.Get(), 1.2f);
-        Line(D2D1::Point2F(x - 9, y), D2D1::Point2F(x + 9, y), c, 1.2f);
+    const auto path = [&](std::initializer_list<D2D1_POINT_2F> points,
+                          bool closed = false) {
+        if (points.size() < 2) return;
+        ComPtr<ID2D1PathGeometry> geometry;
+        ComPtr<ID2D1GeometrySink> sink;
+        if (FAILED(g.factory->CreatePathGeometry(&geometry)) ||
+            FAILED(geometry->Open(&sink))) return;
+        auto iterator = points.begin();
+        sink->BeginFigure(*iterator++, D2D1_FIGURE_BEGIN_HOLLOW);
+        for (; iterator != points.end(); ++iterator) sink->AddLine(*iterator);
+        sink->EndFigure(closed ? D2D1_FIGURE_END_CLOSED
+                               : D2D1_FIGURE_END_OPEN);
+        sink->Close();
+        g.target->DrawGeometry(geometry.Get(), g.brush.Get(), stroke);
+    };
+
+    if (variant == 0) { // Enemy: focused player silhouette.
+        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y - 5), 4, 4),
+                              g.brush.Get(), stroke);
+        path({D2D1::Point2F(x - 8, y + 9), D2D1::Point2F(x - 7, y + 5),
+              D2D1::Point2F(x - 3, y + 2), D2D1::Point2F(x + 3, y + 2),
+              D2D1::Point2F(x + 7, y + 5), D2D1::Point2F(x + 8, y + 9)});
+        Line(D2D1::Point2F(x - 13, y - 9), D2D1::Point2F(x - 8, y - 9), c, stroke);
+        Line(D2D1::Point2F(x - 13, y - 9), D2D1::Point2F(x - 13, y - 4), c, stroke);
+        Line(D2D1::Point2F(x + 13, y + 9), D2D1::Point2F(x + 8, y + 9), c, stroke);
+        Line(D2D1::Point2F(x + 13, y + 9), D2D1::Point2F(x + 13, y + 4), c, stroke);
         return;
     }
-    if (variant == 7) {                                             // Scripts
-        Line(D2D1::Point2F(x - 10, y - 7), D2D1::Point2F(x - 3, y), c, 1.6f);
-        Line(D2D1::Point2F(x - 3, y), D2D1::Point2F(x - 10, y + 7), c, 1.6f);
-        Line(D2D1::Point2F(x + 10, y - 7), D2D1::Point2F(x + 3, y), c, 1.6f);
-        Line(D2D1::Point2F(x + 3, y), D2D1::Point2F(x + 10, y + 7), c, 1.6f);
+    if (variant == 1) { // Ally: shield and check.
+        path({D2D1::Point2F(x, y - 12), D2D1::Point2F(x + 10, y - 8),
+              D2D1::Point2F(x + 9, y + 2), D2D1::Point2F(x, y + 12),
+              D2D1::Point2F(x - 9, y + 2), D2D1::Point2F(x - 10, y - 8)}, true);
+        path({D2D1::Point2F(x - 5, y), D2D1::Point2F(x - 1, y + 4),
+              D2D1::Point2F(x + 6, y - 4)});
         return;
     }
-    DrawTabIcon(2, x, y, selected);                                 // Misc
+    if (variant == 2) { // Creep: compact bot glyph.
+        path({D2D1::Point2F(x - 8, y - 8), D2D1::Point2F(x, y - 12),
+              D2D1::Point2F(x + 8, y - 8), D2D1::Point2F(x + 8, y + 7),
+              D2D1::Point2F(x, y + 11), D2D1::Point2F(x - 8, y + 7)}, true);
+        g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x - 3, y - 1), 1.5f, 1.5f), g.brush.Get());
+        g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x + 3, y - 1), 1.5f, 1.5f), g.brush.Get());
+        Line(D2D1::Point2F(x - 4, y + 5), D2D1::Point2F(x + 4, y + 5), c, stroke);
+        return;
+    }
+    if (variant == 3) { // Player aim: precision reticle.
+        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 6, 6),
+                              g.brush.Get(), stroke);
+        g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 1.8f, 1.8f), g.brush.Get());
+        Line(D2D1::Point2F(x - 13, y), D2D1::Point2F(x - 8, y), c, stroke);
+        Line(D2D1::Point2F(x + 8, y), D2D1::Point2F(x + 13, y), c, stroke);
+        Line(D2D1::Point2F(x, y - 13), D2D1::Point2F(x, y - 8), c, stroke);
+        Line(D2D1::Point2F(x, y + 8), D2D1::Point2F(x, y + 13), c, stroke);
+        return;
+    }
+    if (variant == 4) { // Creep aim: target diamond.
+        path({D2D1::Point2F(x, y - 11), D2D1::Point2F(x + 11, y),
+              D2D1::Point2F(x, y + 11), D2D1::Point2F(x - 11, y)}, true);
+        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 3.5f, 3.5f),
+                              g.brush.Get(), stroke);
+        return;
+    }
+    if (variant == 5) { // World: clean globe.
+        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 11, 11),
+                              g.brush.Get(), stroke);
+        g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 4.5f, 11),
+                              g.brush.Get(), 1.35f);
+        Line(D2D1::Point2F(x - 10, y), D2D1::Point2F(x + 10, y), c, 1.35f);
+        return;
+    }
+    if (variant == 7) { // Scripts: code brackets with action spark.
+        path({D2D1::Point2F(x - 8, y - 8), D2D1::Point2F(x - 13, y),
+              D2D1::Point2F(x - 8, y + 8)});
+        path({D2D1::Point2F(x + 8, y - 8), D2D1::Point2F(x + 13, y),
+              D2D1::Point2F(x + 8, y + 8)});
+        Line(D2D1::Point2F(x + 2, y - 10), D2D1::Point2F(x - 3, y + 10), c, stroke);
+        return;
+    }
+    // Misc: balanced adjustment sliders.
+    Line(D2D1::Point2F(x - 11, y - 8), D2D1::Point2F(x + 11, y - 8), c, stroke);
+    Line(D2D1::Point2F(x - 11, y), D2D1::Point2F(x + 11, y), c, stroke);
+    Line(D2D1::Point2F(x - 11, y + 8), D2D1::Point2F(x + 11, y + 8), c, stroke);
+    g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x - 4, y - 8), 2.5f, 2.5f), g.brush.Get());
+    g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x + 5, y), 2.5f, 2.5f), g.brush.Get());
+    g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x - 1, y + 8), 2.5f, 2.5f), g.brush.Get());
 }
 
 void DrawSectionHeading(float x, float y, float width, const wchar_t* title) {
@@ -1965,6 +2027,7 @@ void ResetTarget() {
     g.lastDisplayedPreviewHeroId = 0;
     g.pendingFallbackHeroId = 0;
     g.pendingFallbackFrames = 0;
+    g.activePreviewHeroId = 0;
     for (auto& icon : g.tabIcons) icon.Reset();
     for (auto& icon : g.previewAbilityIcons) icon.Reset();
     for (auto& portrait : g.previewHeroPortraits) portrait.Reset();
@@ -2095,6 +2158,319 @@ bool UploadSoftwareMenuTexture() {
 
 void DrawMenuSettingsPanel(const Layout& l);
 
+namespace {
+
+constexpr int kProfileComboId = 901;
+
+void RefreshProfileItems() {
+    g.profileItems = GetConfigProfiles();
+    g.profilePopupFirst = std::clamp(
+        g.profilePopupFirst, 0,
+        (std::max)(0, static_cast<int>(g.profileItems.size()) - 9));
+}
+
+void SetProfileStatus(const wchar_t* message) {
+    g.profileStatus = message ? message : L"";
+    g.profileStatusUntil = GetTickCount64() + 3000;
+}
+
+void CommitProfileSave() {
+    g.profileSaveRequested = false;
+    if (SaveConfigProfile(g.profileName)) {
+        while (!g.profileName.empty() && iswspace(g.profileName.front()))
+            g.profileName.erase(g.profileName.begin());
+        while (!g.profileName.empty() && iswspace(g.profileName.back()))
+            g.profileName.pop_back();
+        if (g.profileName.size() > 4 &&
+            _wcsicmp(g.profileName.c_str() + g.profileName.size() - 4,
+                     L".ini") == 0)
+            g.profileName.resize(g.profileName.size() - 4);
+        while (!g.profileName.empty() &&
+               (iswspace(g.profileName.back()) || g.profileName.back() == L'.'))
+            g.profileName.pop_back();
+        g.selectedProfile = g.profileName;
+        g.profileNameEditing = false;
+        RefreshProfileItems();
+        SetProfileStatus(L"Config saved");
+    } else {
+        SetProfileStatus(L"Invalid config name");
+    }
+}
+
+void DrawProfilePopup(const Layout& l) {
+    if (g.openCombo != kProfileComboId) return;
+    constexpr int visibleRows = 9;
+    constexpr float rowHeight = 38.0f;
+    const int total = static_cast<int>(g.profileItems.size());
+    if (total <= 0) return;
+    const int visible = (std::min)(visibleRows, total);
+    const D2D1_RECT_F popup = Rect(458, 59, 675,
+                                   59 + visible * rowHeight + 7.0f);
+    g.comboPopupRect = popup;
+    GlowRounded(popup, 7, Color(0, 0, 0, 0.55f), 4, 2.0f);
+    FillRounded(popup, 7, Color(0.045f, 0.047f, 0.058f, 0.995f));
+    StrokeRounded(popup, 7, Border());
+
+    if (Contains(popup, l.mouse) && total > visibleRows) {
+        const float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0.0f) {
+            g.profilePopupFirst = std::clamp(
+                g.profilePopupFirst - (wheel > 0.0f ? 1 : -1),
+                0, total - visibleRows);
+        }
+    }
+
+    for (int row = 0; row < visible; ++row) {
+        const int itemIndex = g.profilePopupFirst + row;
+        const std::wstring& label = g.profileItems[static_cast<size_t>(itemIndex)];
+        const D2D1_RECT_F item = Rect(
+            popup.left + 4, popup.top + 4 + row * rowHeight,
+            popup.right - 4, popup.top + 4 + (row + 1) * rowHeight - 4);
+        const bool selected = _wcsicmp(label.c_str(),
+                                       g.selectedProfile.c_str()) == 0;
+        if (selected)
+            FillRounded(item, 5, Red(0.16f));
+        else if (Contains(item, l.mouse))
+            FillRounded(item, 5, Color(1, 1, 1, 0.04f));
+        Text(label.c_str(), Rect(item.left + 10, item.top,
+                                item.right - 8, item.bottom),
+             g.regular.Get(), selected ? Red() : White());
+        if (l.clicked && Contains(item, l.mouse)) {
+            const bool loaded = LoadConfigProfile(label);
+            if (loaded) {
+                g.selectedProfile = label;
+                SetProfileStatus(L"Config loaded");
+            } else {
+                SetProfileStatus(L"Could not load config");
+            }
+            g.openCombo = 0;
+        }
+    }
+}
+
+void DrawProfileSaveModal(const Layout& l) {
+    if (!g.profileNameEditing) return;
+    const D2D1_RECT_F dim = Rect(0, 0, kMainWindowWidth, kDesignHeight);
+    FillRect(dim, Color(0, 0, 0, 0.58f));
+    const D2D1_RECT_F modal = Rect(323, 260, 673, 448);
+    GlowRounded(modal, 10, Color(0, 0, 0, 0.78f), 7, 2.2f);
+    FillRounded(modal, 10, ThemeSurface(0.012f, 0.042f, 1.0f));
+    StrokeRounded(modal, 10, Border(), 1.0f);
+    Text(L"Save configuration", Rect(345, 278, 650, 310),
+         g.semibold.Get(), White());
+    Text(L"Config name", Rect(345, 316, 650, 340),
+         g.regular.Get(), Muted());
+    const D2D1_RECT_F input = Rect(345, 344, 651, 384);
+    FillRounded(input, 6, Color(0.045f, 0.048f, 0.060f, 1.0f));
+    StrokeRounded(input, 6, Red(0.66f), 1.0f);
+    std::wstring shown = g.profileName;
+    if ((GetTickCount64() / 500) % 2 == 0) shown += L"|";
+    Text(shown.c_str(), Rect(input.left + 12, input.top,
+                            input.right - 10, input.bottom),
+         g.regular.Get(), White());
+
+    const D2D1_RECT_F cancel = Rect(345, 397, 483, 431);
+    const D2D1_RECT_F save = Rect(493, 397, 651, 431);
+    FillRounded(cancel, 6, Color(1, 1, 1, 0.045f));
+    StrokeRounded(cancel, 6, Border());
+    Text(L"Cancel", cancel, g.centered.Get(), Muted());
+    GradientRounded(save, 6, Red(0.96f), Red(0.68f), true);
+    Text(L"Save", save, g.centered.Get(), White());
+
+    if (l.clicked && Contains(cancel, l.mouse)) {
+        g.profileNameEditing = false;
+        g.profileSaveRequested = false;
+    } else if ((l.clicked && Contains(save, l.mouse)) ||
+               g.profileSaveRequested) {
+        CommitProfileSave();
+    }
+}
+
+struct SearchEntry {
+    const wchar_t* label;
+    const wchar_t* page;
+    int tab;
+    int subtab;
+    int visualTeam;
+    int scriptHero;
+};
+
+static constexpr SearchEntry kSearchEntries[]{
+    {L"Aim assist", L"Player aim", 1, 0, 0, 0},
+    {L"Visibility check", L"Player aim", 1, 0, 0, 0},
+    {L"Aim mode", L"Player aim", 1, 0, 0, 0},
+    {L"Activation", L"Player aim", 1, 0, 0, 0},
+    {L"Target bones", L"Player aim", 1, 0, 0, 0},
+    {L"Hitchance", L"Player aim", 1, 0, 0, 0},
+    {L"Anti-Frog", L"Player aim", 1, 0, 0, 0},
+    {L"HS threshold", L"Player aim", 1, 0, 0, 0},
+    {L"Lock Target", L"Player aim", 1, 0, 0, 0},
+    {L"Target selection", L"Player aim", 1, 0, 0, 0},
+    {L"Aim FOV", L"Player aim", 1, 0, 0, 0},
+    {L"Pitch smoothing", L"Player aim", 1, 0, 0, 0},
+    {L"Yaw smoothing", L"Player aim", 1, 0, 0, 0},
+    {L"Only Yaw", L"Player aim", 1, 0, 0, 0},
+    {L"Prediction", L"Player aim", 1, 0, 0, 0},
+    {L"Draw FOV circle", L"Player aim", 1, 0, 0, 0},
+    {L"Creep aim", L"Creep aim", 1, 1, 0, 0},
+    {L"Creep ESP", L"Creep aim", 1, 1, 0, 0},
+    {L"Farm mode", L"Creep aim", 1, 1, 0, 0},
+    {L"Creep FOV", L"Creep aim", 1, 1, 0, 0},
+    {L"Smoothing", L"Creep aim", 1, 1, 0, 0},
+    {L"Orb ESP", L"Creep aim", 1, 1, 0, 0},
+    {L"Orb aim", L"Creep aim", 1, 1, 0, 0},
+    {L"Boxes", L"Enemy visuals", 0, 0, 0, 0},
+    {L"Skeleton", L"Enemy visuals", 0, 0, 0, 0},
+    {L"Health", L"Enemy visuals", 0, 0, 0, 0},
+    {L"Glow", L"Enemy visuals", 0, 0, 0, 0},
+    {L"Invisible Chams", L"Enemy visuals", 0, 0, 0, 0},
+    {L"Boxes", L"Ally visuals", 0, 0, 1, 0},
+    {L"Skeleton", L"Ally visuals", 0, 0, 1, 0},
+    {L"Glow", L"Ally visuals", 0, 0, 1, 0},
+    {L"Creep visuals", L"Creep visuals", 0, 0, 2, 0},
+    {L"World modulation", L"World", 0, 0, 3, 0},
+    {L"Disable skybox", L"World", 0, 0, 3, 0},
+    {L"Camp Timers", L"World", 0, 0, 3, 0},
+    {L"Vindicta script", L"Scripts", 3, 0, 0, 0},
+    {L"Haze Sleep Dagger", L"Scripts", 3, 0, 0, 1},
+    {L"Shiv Serrated Knives", L"Scripts", 3, 0, 0, 2},
+    {L"Bebop ability 3", L"Scripts", 3, 0, 0, 3},
+    {L"Drifter ability 2", L"Scripts", 3, 0, 0, 4},
+    {L"Auto parry", L"Misc", 2, 0, 0, 0},
+    {L"Spectator list", L"Misc", 2, 0, 0, 0},
+    {L"Free camera", L"Misc", 2, 0, 0, 0},
+    {L"FOV Changer", L"Misc", 2, 0, 0, 0},
+    {L"Disable Drifter Darkness", L"Misc", 2, 0, 0, 0},
+    {L"Auto Active Reload", L"Misc", 2, 0, 0, 0},
+    {L"BunnyHop", L"Misc", 2, 0, 0, 0},
+};
+
+std::wstring LowerText(const wchar_t* text) {
+    std::wstring result = text ? text : L"";
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](wchar_t character) { return std::towlower(character); });
+    return result;
+}
+
+std::vector<const SearchEntry*> SearchMatches() {
+    std::vector<const SearchEntry*> matches;
+    if (g.searchQuery.empty()) return matches;
+    const std::wstring query = LowerText(g.searchQuery.c_str());
+    for (const SearchEntry& entry : kSearchEntries) {
+        if (LowerText(entry.label).find(query) != std::wstring::npos ||
+            LowerText(entry.page).find(query) != std::wstring::npos) {
+            matches.push_back(&entry);
+            if (matches.size() == 8) break;
+        }
+    }
+    return matches;
+}
+
+void OpenSearchEntry(const SearchEntry& entry) {
+    g.tab = entry.tab;
+    g.aimSubtab = entry.subtab;
+    g.visualTeam = entry.visualTeam;
+    g.scriptHero = entry.scriptHero;
+    g.leftColumnScroll = 0.0f;
+    g.rightColumnScroll = 0.0f;
+    g.pageAlpha = 0.0f;
+    g.pageShift = 12.0f;
+    g.searchOpen = false;
+    g.searchQuery.clear();
+}
+
+void DrawSearchPanel(const Layout& l) {
+    if (!g.searchOpen) return;
+    FillRect(Rect(0, 0, kMainWindowWidth, kDesignHeight),
+             Color(0, 0, 0, 0.54f));
+    const D2D1_RECT_F panel = Rect(472, 78, 966, 544);
+    GlowRounded(panel, 10, Color(0, 0, 0, 0.78f), 7, 2.2f);
+    FillRounded(panel, 10, ThemeSurface(0.012f, 0.042f, 1.0f));
+    StrokeRounded(panel, 10, Border(), 1.0f);
+    Text(L"Search settings", Rect(496, 94, 900, 126),
+         g.semibold.Get(), White());
+    const D2D1_RECT_F close = Rect(918, 91, 950, 123);
+    if (Contains(close, l.mouse)) FillRounded(close, 5, Color(1, 1, 1, 0.055f));
+    Line(D2D1::Point2F(928, 101), D2D1::Point2F(940, 113), Muted(), 1.6f);
+    Line(D2D1::Point2F(940, 101), D2D1::Point2F(928, 113), Muted(), 1.6f);
+
+    const D2D1_RECT_F input = Rect(496, 136, 942, 178);
+    FillRounded(input, 6, Color(0.045f, 0.048f, 0.060f, 1.0f));
+    StrokeRounded(input, 6, Red(0.66f), 1.0f);
+    SetBrush(Muted());
+    g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(515, 156), 6, 6),
+                              g.brush.Get(), 1.5f);
+    Line(D2D1::Point2F(519, 160), D2D1::Point2F(525, 166), Muted(), 1.5f);
+    std::wstring shown = g.searchQuery;
+    if ((GetTickCount64() / 500) % 2 == 0) shown += L"|";
+    if (g.searchQuery.empty() && (GetTickCount64() / 500) % 2 != 0)
+        shown = L"Type a function name...";
+    Text(shown.c_str(), Rect(536, input.top, input.right - 12, input.bottom),
+         g.regular.Get(), g.searchQuery.empty() ? Muted() : White());
+
+    const auto matches = SearchMatches();
+    if (g.searchQuery.empty()) {
+        Text(L"Start typing to find any menu function",
+             Rect(496, 205, 942, 244), g.centered.Get(), Muted());
+    } else if (matches.empty()) {
+        Text(L"No matching functions",
+             Rect(496, 205, 942, 244), g.centered.Get(), Muted());
+    } else {
+        constexpr float rowHeight = 39.0f;
+        for (size_t index = 0; index < matches.size(); ++index) {
+            const SearchEntry& entry = *matches[index];
+            const D2D1_RECT_F row = Rect(496, 194 + index * rowHeight,
+                                         942, 229 + index * rowHeight);
+            if (Contains(row, l.mouse)) FillRounded(row, 5, Red(0.12f));
+            Text(entry.label, Rect(row.left + 12, row.top, row.right - 150, row.bottom),
+                 g.regular.Get(), White());
+            Text(entry.page, Rect(row.right - 145, row.top, row.right - 12, row.bottom),
+                 g.regular.Get(), Muted());
+            if (l.clicked && Contains(row, l.mouse)) OpenSearchEntry(entry);
+        }
+    }
+    if (l.clicked && Contains(close, l.mouse)) {
+        g.searchOpen = false;
+        g.searchQuery.clear();
+    }
+}
+
+} // namespace
+
+bool HandleD2DMenuTextInput(UINT message, WPARAM wParam) {
+    if (!g.profileNameEditing && !g.searchOpen) return false;
+    if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) {
+        if (wParam == VK_SHIFT || wParam == VK_LSHIFT || wParam == VK_RSHIFT ||
+            wParam == VK_MENU || wParam == VK_LMENU || wParam == VK_RMENU)
+            return false;
+        if (wParam == VK_ESCAPE) {
+            g.profileNameEditing = false;
+            g.profileSaveRequested = false;
+            g.searchOpen = false;
+            g.searchQuery.clear();
+        } else if (wParam == VK_RETURN) {
+            if (g.profileNameEditing) g.profileSaveRequested = true;
+            else {
+                const auto matches = SearchMatches();
+                if (!matches.empty()) OpenSearchEntry(*matches.front());
+            }
+        }
+        return true;
+    }
+    if (message != WM_CHAR) return false;
+    const wchar_t character = static_cast<wchar_t>(wParam);
+    std::wstring& input = g.profileNameEditing ? g.profileName : g.searchQuery;
+    if (character == L'\b') {
+        if (!input.empty()) input.pop_back();
+    } else if (character == L'\r' || character == L'\n') {
+        if (g.profileNameEditing) g.profileSaveRequested = true;
+    } else if (character >= 32 && input.size() < 48 &&
+               (!g.profileNameEditing || !wcschr(L"<>:\"/\\|?*", character))) {
+        input.push_back(character);
+    }
+    return true;
+}
+
 bool PrepareD2DMenu(IDXGISwapChain* swapChain) {
     if (!swapChain || !EnsureFactories()) return false;
     const ImGuiIO& io = ImGui::GetIO();
@@ -2172,7 +2548,8 @@ void RenderD2DMenu(std::size_t playerCount) {
         io.MousePos.x <= g.windowX + windowWidth - 54.0f * safeScale &&
         io.MousePos.y >= g.windowY &&
         io.MousePos.y <= g.windowY + 62.0f * safeScale;
-    if (io.MouseClicked[0] && mouseInHeader) {
+    const bool blockingDialog = g.profileNameEditing || g.searchOpen;
+    if (!blockingDialog && io.MouseClicked[0] && mouseInHeader) {
         g.draggingWindow = true;
         g.dragGrabX = io.MousePos.x - g.windowX;
         g.dragGrabY = io.MousePos.y - g.windowY;
@@ -2197,6 +2574,12 @@ void RenderD2DMenu(std::size_t playerCount) {
                             (io.MousePos.y - l.y) / safeScale);
     l.clicked = menuOpen && io.MouseClicked[0];
     l.down = menuOpen && io.MouseDown[0];
+    Layout modalLayout = l;
+    if (blockingDialog) {
+        l.clicked = false;
+        l.down = false;
+        g.openCombo = 0;
+    }
     popupSelectionId = 0;
     popupSelectionValue = -1;
     if (g.colorPopup && l.clicked && !Contains(ActiveColorPopupRect(), l.mouse)) {
@@ -2255,7 +2638,21 @@ void RenderD2DMenu(std::size_t playerCount) {
         pDevice && pContext) {
         Preview3DFrame previewFrame{};
         SetPanoramaPreviewRole(g.visualTeam);
-        const int previewHeroId = GetPanoramaPreviewHero();
+        // Use the role-owned selection directly. The global requested hero can
+        // still refer to the previous tab during a Panorama UI reload.
+        const int previewHeroId =
+            GetPanoramaPreviewHeroForRole(g.visualTeam);
+        SetPanoramaPreviewHero(previewHeroId);
+        if (g.activePreviewHeroId != previewHeroId) {
+            g.activePreviewHeroId = previewHeroId;
+            g.preview3dBitmap.Reset();
+            g.preview3dTexture.Reset();
+            g.preview3dActive = false;
+            g.preview3dShared = false;
+            g.previewValidationHeroId = previewHeroId;
+            g.previewValidationFrames = 0;
+            g.previewFreezeAfterDrag = false;
+        }
         ID3D11Texture2D* panoramaTexture = GetPanoramaPreviewTexture();
         // A non-black capture can still be the game backbuffer behind the
         // Panorama panel while its portrait world is being recreated.  It is
@@ -2461,10 +2858,39 @@ void RenderD2DMenu(std::size_t playerCount) {
     const D2D1_RECT_F profile = Rect(458, 16, 675, 54);
     FillRounded(profile, 3, Color(1, 1, 1, 0.025f));
     StrokeRounded(profile, 3, Border(), 0.9f);
-    Text(L"Global", Rect(475, 16, 620, 54), g.regular.Get(), White());
+    Text(g.selectedProfile.c_str(), Rect(475, 16, 640, 54),
+         g.regular.Get(), White());
     Line(D2D1::Point2F(648, 31), D2D1::Point2F(654, 37), Muted(), 1.3f);
     Line(D2D1::Point2F(654, 37), D2D1::Point2F(660, 31), Muted(), 1.3f);
-    if (Clicked(l, save)) SaveConfig();
+    if (Clicked(l, save)) {
+        g.profileName = _wcsicmp(g.selectedProfile.c_str(), L"Select config") == 0
+            ? L"" : g.selectedProfile;
+        g.profileNameEditing = true;
+        g.profileSaveRequested = false;
+        g.openCombo = 0;
+        g.settingsOpen = false;
+        g.searchOpen = false;
+        g.searchQuery.clear();
+    }
+    if (Clicked(l, profile)) {
+        RefreshProfileItems();
+        if (g.profileItems.empty()) {
+            SetProfileStatus(L"No saved configs");
+            g.openCombo = 0;
+        } else {
+        g.profilePopupFirst = 0;
+        g.openCombo = kProfileComboId;
+        g.settingsOpen = false;
+        const int visible = (std::min)(
+            9, static_cast<int>(g.profileItems.size()));
+        g.comboPopupRect = Rect(458, 59, 675,
+                                59 + visible * 38.0f + 7.0f);
+        }
+    }
+    if (!g.profileStatus.empty() && GetTickCount64() < g.profileStatusUntil) {
+        Text(g.profileStatus.c_str(), Rect(690, 16, 855, 54),
+             g.regular.Get(), Muted());
+    }
     const D2D1_RECT_F gear = Rect(874, 12, 916, 54);
     if (Clicked(l, gear)) g.settingsOpen = !g.settingsOpen;
     const D2D1_COLOR_F gearColor = g.settingsOpen ? Red() : Muted();
@@ -2475,13 +2901,28 @@ void RenderD2DMenu(std::size_t playerCount) {
         Line(D2D1::Point2F(895 + std::cos(a) * 11, 31 + std::sin(a) * 11),
              D2D1::Point2F(895 + std::cos(a) * 15, 31 + std::sin(a) * 15), gearColor, 2.0f);
     }
-    // Search icon beside the settings button, matching the compact toolbar.
-    SetBrush(Muted());
-    g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(947, 29), 6, 6), g.brush.Get(), 1.5f);
-    Line(D2D1::Point2F(952, 34), D2D1::Point2F(959, 41), Muted(), 1.5f);
-    Line(D2D1::Point2F(964, 24), D2D1::Point2F(976, 36), Muted(), 1.4f);
-    Line(D2D1::Point2F(976, 24), D2D1::Point2F(964, 36), Muted(), 1.4f);
-    if (Clicked(l, Rect(958, 8, 990, 53))) {
+    const D2D1_RECT_F searchButton = Rect(922, 12, 956, 50);
+    const D2D1_RECT_F closeButton = Rect(962, 12, 990, 50);
+    if (Contains(searchButton, l.mouse))
+        FillRounded(searchButton, 5, Color(1, 1, 1, 0.050f));
+    if (Contains(closeButton, l.mouse))
+        FillRounded(closeButton, 5, Color(1, 1, 1, 0.050f));
+    const D2D1_COLOR_F searchColor = g.searchOpen ? Red() : Muted();
+    SetBrush(searchColor);
+    g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(937, 29), 7.5f, 7.5f),
+                              g.brush.Get(), 1.7f);
+    Line(D2D1::Point2F(942.5f, 34.5f), D2D1::Point2F(949, 41),
+         searchColor, 1.7f);
+    Line(D2D1::Point2F(970, 24), D2D1::Point2F(982, 36), Muted(), 1.6f);
+    Line(D2D1::Point2F(982, 24), D2D1::Point2F(970, 36), Muted(), 1.6f);
+    if (Clicked(l, searchButton)) {
+        g.searchOpen = true;
+        g.searchQuery.clear();
+        g.settingsOpen = false;
+        g.openCombo = 0;
+        g.colorPopup = nullptr;
+    }
+    if (Clicked(l, closeButton)) {
         SaveConfig();
         SetMenuOpen(false);
     }
@@ -2509,18 +2950,18 @@ void RenderD2DMenu(std::size_t playerCount) {
         DrawNavigationIcon(icon, 43, y + 21, selected);
         Text(label, Rect(74, y + 5, 242, y + 36), g.medium.Get(), selected ? White() : Muted());
     };
-    section(L"VISUALS", 100);
-    nav(L"Enemy", 124, 0, g.tab == 0 && g.visualTeam == 0, [&] { g.tab = 0; g.visualTeam = 0; });
-    nav(L"Ally", 168, 1, g.tab == 0 && g.visualTeam == 1, [&] { g.tab = 0; g.visualTeam = 1; });
-    nav(L"Creep", 212, 2, g.tab == 0 && g.visualTeam == 2, [&] { g.tab = 0; g.visualTeam = 2; });
-    nav(L"World", 256, 5, g.tab == 0 && g.visualTeam == 3, [&] { g.tab = 0; g.visualTeam = 3; });
-    section(L"AIM ASSIST", 322);
-    nav(L"Player aim", 346, 3, g.tab == 1 && g.aimSubtab == 0, [&] { g.tab = 1; g.aimSubtab = 0; });
-    nav(L"Creep aim", 390, 4, g.tab == 1 && g.aimSubtab != 0, [&] { g.tab = 1; g.aimSubtab = 1; });
-    section(L"MISCELLANEOUS", 456);
-    nav(L"Misc", 480, 6, g.tab == 2, [&] { g.tab = 2; });
-    section(L"HEROES", 546);
-    nav(L"Scripts", 570, 7, g.tab == 3, [&] { g.tab = 3; });
+    section(L"AIMBOT", 100);
+    nav(L"Player aim", 124, 3, g.tab == 1 && g.aimSubtab == 0, [&] { g.tab = 1; g.aimSubtab = 0; });
+    nav(L"Creep aim", 168, 4, g.tab == 1 && g.aimSubtab != 0, [&] { g.tab = 1; g.aimSubtab = 1; });
+    section(L"VISUALS", 234);
+    nav(L"Enemy", 258, 0, g.tab == 0 && g.visualTeam == 0, [&] { g.tab = 0; g.visualTeam = 0; });
+    nav(L"Ally", 302, 1, g.tab == 0 && g.visualTeam == 1, [&] { g.tab = 0; g.visualTeam = 1; });
+    nav(L"Creep", 346, 2, g.tab == 0 && g.visualTeam == 2, [&] { g.tab = 0; g.visualTeam = 2; });
+    nav(L"World", 390, 5, g.tab == 0 && g.visualTeam == 3, [&] { g.tab = 0; g.visualTeam = 3; });
+    section(L"HEROES", 456);
+    nav(L"Scripts", 480, 7, g.tab == 3, [&] { g.tab = 3; });
+    section(L"MISCELLANEOUS", 546);
+    nav(L"Misc", 570, 6, g.tab == 2, [&] { g.tab = 2; });
 
     const float contentX = 349.0f + g.pageShift;
     const wchar_t* pageTitle = g.tab == 0 ? (g.visualTeam == 0 ? L"Enemy" :
@@ -2906,14 +3347,14 @@ void RenderD2DMenu(std::size_t playerCount) {
             farmToggleMode = farmBind == 1;
             DrawKeyBind(l, leftX, firstY + 210, columnWidth,
                         farmKeyCapture, farmAssistKey, &farmKeyCapture);
+             DrawSlider(l, leftX, firstY + 280, columnWidth, L"Creep FOV",
+                        &farmFov, 40.0f, 600.0f, L"%.0f px");
              if (!farmSilentMode || farmMixedMode) {
-                 DrawSlider(l, leftX, firstY + 280, columnWidth, L"Farm FOV",
-                            &farmFov, 40.0f, 600.0f, L"%.0f px");
                  DrawSlider(l, leftX, firstY + 350, columnWidth, L"Smoothing",
                             &farmAimSmooth, 1.0f, 20.0f, L"%.1f");
              }
              const float farmCircleY = (!farmSilentMode || farmMixedMode)
-                ? firstY + 420.0f : firstY + 280.0f;
+                ? firstY + 420.0f : firstY + 350.0f;
              DrawToggle(l, leftX, farmCircleY, columnWidth, L"Farm FOV circle",
                         L"Show the creep aim radius", &drawFarmFovCircle);
              if (drawFarmFovCircle)
@@ -2935,14 +3376,14 @@ void RenderD2DMenu(std::size_t playerCount) {
                 farmToggleMode = farmBind == 1;
                 DrawKeyBind(l, leftX, firstY + 210, columnWidth,
                             farmKeyCapture, farmAssistKey, &farmKeyCapture);
+                 DrawSlider(l, leftX, firstY + 280, columnWidth, L"Creep FOV",
+                            &farmFov, 40.0f, 600.0f, L"%.0f px");
                  if (!farmSilentMode || farmMixedMode) {
-                     DrawSlider(l, leftX, firstY + 280, columnWidth, L"Farm FOV",
-                                &farmFov, 40.0f, 600.0f, L"%.0f px");
                      DrawSlider(l, leftX, firstY + 350, columnWidth, L"Smoothing",
                                 &farmAimSmooth, 1.0f, 20.0f, L"%.1f");
                  }
                  const float farmCircleY = (!farmSilentMode || farmMixedMode)
-                     ? firstY + 420.0f : firstY + 280.0f;
+                     ? firstY + 420.0f : firstY + 350.0f;
                  DrawToggle(l, leftX, farmCircleY, columnWidth, L"Farm FOV circle",
                             L"Show the creep aim radius", &drawFarmFovCircle);
                  if (drawFarmFovCircle)
@@ -3057,7 +3498,7 @@ void RenderD2DMenu(std::size_t playerCount) {
         DrawCombo(l, 302, leftX, firstY + 230, columnWidth, L"Activation",
                   &farmBind, kFarmActivationModes, 2);
         farmToggleMode = farmBind == 1;
-        DrawSlider(l, leftX, firstY + 304, columnWidth, L"Farm FOV",
+        DrawSlider(l, leftX, firstY + 304, columnWidth, L"Creep FOV",
                    &farmFov, 40.0f, 600.0f, L"%.0f px");
         DrawSlider(l, leftX, firstY + 378, columnWidth, L"Smoothing",
                    &farmAimSmooth, 1.0f, 20.0f, L"%.1f");
@@ -3099,6 +3540,18 @@ void RenderD2DMenu(std::size_t playerCount) {
             DrawSlider(l, leftX, firstY + 214, columnWidth, L"Freecam speed",
                        &freeCamSpeed, 50.0f, 5000.0f, L"%.0f u/s");
         }
+        DrawSectionHeading(leftX, firstY + 300, columnWidth, L"Movement Lab");
+        DrawToggle(l, leftX, firstY + 340, columnWidth, L"Record Bot2 pass",
+                   L"Save one completed Bot2 route automatically",
+                   &movementProbeEnabled);
+        DrawToggle(l, leftX, firstY + 394, columnWidth, L"Replay last pass",
+                   L"Calibrate and repeat the latest saved route",
+                   &movementReplayEnabled);
+        if (movementReplayEnabled) {
+            DrawKeyBind(l, leftX, firstY + 448, columnWidth,
+                        movementReplayKeyCapture, movementReplayKey,
+                        &movementReplayKeyCapture);
+        }
 
         DrawToggle(l, rightX, firstY, rightColumnWidth, L"FOV Changer",
                    L"Override the normal camera field of view", &fovChangerEnabled);
@@ -3109,17 +3562,27 @@ void RenderD2DMenu(std::size_t playerCount) {
         DrawSlider(l, rightX, firstY + 172, rightColumnWidth, L"Scoped FOV",
                    &scopedCameraFov, 20.0f, 140.0f, L"%.0f deg");
 
-        DrawSectionHeading(rightX, firstY + 246, rightColumnWidth, L"Session");
+        DrawSectionHeading(rightX, firstY + 246, rightColumnWidth, L"Effects");
+        DrawToggle(l, rightX, firstY + 286, rightColumnWidth,
+                   L"Disable Drifter Darkness",
+                   L"Remove Darkness vision and minimap restrictions",
+                   &disableDrifterDarkness);
+        DrawToggle(l, rightX, firstY + 340, rightColumnWidth,
+                   L"Auto Active Reload",
+                   L"Automatically hit the Active Reload window",
+                   &autoActiveReload);
+        DrawToggle(l, rightX, firstY + 394, rightColumnWidth,
+                   L"BunnyHop",
+                   L"Keep jumping while Space is held",
+                   &bunnyHop);
+
         wchar_t status[80]{};
         std::swprintf(status, 80, L"%.0f FPS    %zu players", io.Framerate, playerCount);
-        Text(status, Rect(rightX + 10, firstY + 286,
-             rightX + rightColumnWidth, firstY + 321),
+        Text(status, Rect(rightX + 10, firstY + 444,
+             rightX + rightColumnWidth, firstY + 475),
              g.regular.Get(), Muted());
-        Text(L"Unload the module and restore all hooks safely.",
-             Rect(rightX + 10, firstY + 334, rightX + rightColumnWidth, firstY + 374),
-             g.regular.Get(), Muted());
-        const D2D1_RECT_F unload = Rect(rightX, firstY + 392,
-                                       rightX + rightColumnWidth, firstY + 436);
+        const D2D1_RECT_F unload = Rect(rightX, firstY + 486,
+                                       rightX + rightColumnWidth, firstY + 530);
         GradientRounded(unload, 7, Color(1.0f, 0.10f, 0.19f), Color(0.60f, 0.01f, 0.06f), true);
         InnerGlow(unload, 7);
         Text(L"Unload DLL", unload, g.centered.Get(), White());
@@ -3128,7 +3591,10 @@ void RenderD2DMenu(std::size_t playerCount) {
 
     g.target->PopAxisAlignedClip();
     DrawPopup(l);
+    DrawProfilePopup(l);
     DrawMenuSettingsPanel(settingsLayout);
+    DrawSearchPanel(modalLayout);
+    DrawProfileSaveModal(modalLayout);
     if (popupSelectionId == 101) {
         aimSilentMode = popupSelectionValue == 1;
         aimMixedMode = popupSelectionValue == 2;

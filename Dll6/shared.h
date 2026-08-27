@@ -37,6 +37,7 @@ inline uintptr_t EntityChunks=0x10, HighestEntityIndex=0x20A0,
     EntityHandleOffset=0x10;
 }
 struct Vector3 { float x,y,z; }; struct Vector2 { float x,y; }; struct Matrix4x4 { float m[4][4]; }; struct ColorRGBA { uint8_t r,g,b,a; };
+struct CUserCmd;
 std::wstring GetVirtualKeyDisplayNameW(int key);
 std::string GetVirtualKeyDisplayName(int key);
 struct BoneSegment { Vector3 start; Vector3 end; };
@@ -73,6 +74,19 @@ constexpr UINT ApplyGlowMessage = WM_APP + 0x4D;
 constexpr UINT PanoramaPreviewUiMessage = WM_APP + 0x4E;
 constexpr UINT PanoramaPreviewGlowMessage = WM_APP + 0x4F;
 extern bool freeCam;
+extern bool disableDrifterDarkness;
+extern bool autoActiveReload;
+extern bool bunnyHop;
+extern bool movementProbeEnabled;
+extern bool movementReplayEnabled, movementReplayActive,
+            movementReplayCalibrating,
+            movementReplayKeyCapture;
+extern int movementReplayKey;
+#ifdef DLL6_MOVEMENT_ONLY
+extern bool localMovementRecording, localMovementRecordingReady,
+            localMovementPlaybackActive, localMovementPlaybackCalibrating;
+extern int localMovementRecordKey;
+#endif
 extern bool freeCamActive;
 extern int freeCamKey;
 extern bool freeCamKeyCapture;
@@ -97,6 +111,23 @@ extern uintptr_t clientBase; extern bool menuOpen,drawEsp,drawBoxes,drawHealth,d
 extern std::mutex movementDebugTargetMutex; extern Vector3 movementDebugTarget; extern bool movementDebugTargetReady;
 extern std::mutex movementDebugWishMutex; extern Vector3 movementDebugWishDirection; extern bool movementDebugWishReady;
 bool GetCurrentCameraForward(Vector3& forward);
+void UpdateMovementProbe(const std::vector<PlayerData>& players);
+void UpdateMovementBotInputText(const std::vector<PlayerData>& players);
+void CaptureMovementPacketEntitySnapshot(uint64_t packetSequence,
+                                         int32_t serverTick,
+                                         int32_t deltaFrom,
+                                         int32_t updatedEntries,
+                                         uint32_t entityDataBytes,
+                                         uint64_t entityDataHash);
+bool ProcessMovementReplayUserCmd(CUserCmd* command, uintptr_t input = 0);
+#ifdef DLL6_MOVEMENT_ONLY
+void PrepareLocalMovementPlaybackInput();
+void CaptureLocalMovementRawKeyEvent(int virtualKey, bool pressed);
+#endif
+bool MovementReplayVirtualKeyDown(int key);
+uint64_t MovementReplayHeldButtons();
+uint64_t MovementReplayPressedButtons();
+void DrawMovementReplayOverlay();
 extern float aimFov,aimSmooth,farmAimSmooth; extern bool aimVisibilityCheck,aimToggleMode,aimToggleActive,aimToggleLastDown,farmSilentMode,farmMixedMode,humanAimTargetFound; extern ID3D11Texture2D* depthStaging; extern UINT depthWidth,depthHeight; extern DXGI_FORMAT depthFormat; extern bool depthSnapshotReady; extern int depthDiagnosticState; extern Matrix4x4 currentViewMatrix; extern bool currentViewMatrixReady;
 extern bool aimMixedMode, aimOnlyYaw, aimLockTarget, aimPrediction;
 extern int aimLockKey;
@@ -122,6 +153,7 @@ extern bool enemyPlayerNamesEnabled, allyPlayerNamesEnabled;
 extern bool enemyDistanceEnabled, allyDistanceEnabled;
 extern bool enemySnaplinesEnabled, allySnaplinesEnabled;
 extern bool enemyBonesEnabled, allyBonesEnabled;
+extern float menuAccentColor[4];
 extern float enemyBoxColor[4], teammateBoxColor[4];
 extern float enemyNameColor[4], teammateNameColor[4];
 extern float enemySkeletonColor[4], teammateSkeletonColor[4];
@@ -170,6 +202,9 @@ bool WriteResolvedOffsetSnapshot();
 extern bool runtimeOffsetsReady;
 extern std::string runtimeBuildKey;
 bool InitializeNativeGlow();
+bool InstallDrifterDarknessHooks();
+void RemoveDrifterDarknessHooks();
+void MaintainDrifterDarknessSuppression();
 bool RegisterNativeGlow(uintptr_t entity);
 bool RegisterNativeTrooperGlow(uintptr_t entity);
 bool RegisterNativePreviewGlow(uintptr_t entity);
@@ -179,18 +214,25 @@ extern bool orbEntityEventsAvailable;
 bool NotifyOrbEntityAdded(uint32_t); void NotifyOrbEntityRemoved(uint32_t);
 void QueueOrbEntityAdded(uint32_t); void QueueOrbEntityRemoved(uint32_t);
 void LoadConfig(); void SaveConfig();
+std::vector<std::wstring> GetConfigProfiles();
+bool SaveConfigProfile(const std::wstring& name);
+bool LoadConfigProfile(const std::wstring& name);
 // Call this from the game's StartSound hook. entityIndex is the sound source
 // entity index and soundName is the emitted sound name.
 void NotifyParrySound(int entityIndex, const char* soundName);
 void ApplyCurrentCameraAim(const Vector3& worldTarget);
 void ApplyHeroScriptCameraAim(const Vector3& worldTarget,
                               float pitchSmooth, float yawSmooth);
+void ApplyMovementReplayCameraAngles(const Vector3& angles);
+#ifdef DLL6_MOVEMENT_ONLY
+bool GetMovementReplayCameraAngles(Vector3& angles);
+#endif
 void QueueHeroSilentAngles(const Vector3& angles, bool attack,
                            bool overridePrimaryAim = false);
 void ClearHeroSilentAngles();
 void FlushCurrentCameraAim();
 void UpdateVisibleAimCamera();
-extern ID3D11Device* pDevice; extern ID3D11DeviceContext* pContext; extern ID3D11RenderTargetView* pRenderTargetView; extern HWND gameWindow; extern WNDPROC oWndProc; extern HMODULE moduleHandle; extern void** presentVTable; extern volatile LONG unloadRequested,unloadThreadStarted; extern std::mutex glowMutex,heroPawnsMutex; extern std::unordered_set<uintptr_t> registeredGlows,queuedGlows; extern EspStatus espStatus; extern std::unordered_map<uintptr_t,bool> combatVTables; extern std::vector<uintptr_t> heroVTables,heroPawns; extern HANDLE heroDiscoveryThread,glowApplyThread,farmTargetThread,stopHeroDiscoveryEvent; extern PresentFn oPresent;
+extern ID3D11Device* pDevice; extern ID3D11DeviceContext* pContext; extern ID3D11RenderTargetView* pRenderTargetView; extern HWND gameWindow; extern WNDPROC oWndProc; extern HMODULE moduleHandle; extern HANDLE moduleInstanceGuard,moduleReadyEvent; extern void** presentVTable; extern volatile LONG unloadRequested,unloadThreadStarted; extern std::mutex glowMutex,heroPawnsMutex; extern std::unordered_set<uintptr_t> registeredGlows,queuedGlows; extern EspStatus espStatus; extern std::unordered_map<uintptr_t,bool> combatVTables; extern std::vector<uintptr_t> heroVTables,heroPawns; extern HANDLE heroDiscoveryThread,glowApplyThread,farmTargetThread,stopHeroDiscoveryEvent; extern PresentFn oPresent;
 template<typename T> T Read(uintptr_t address) { T value{}; if (!address) return value; __try { value=*reinterpret_cast<T*>(address); } __except(EXCEPTION_EXECUTE_HANDLER) { value=T{}; } return value; }
 template<typename T> void Write(uintptr_t address,const T& value) { if (!address) return; __try { *reinterpret_cast<T*>(address)=value; } __except(EXCEPTION_EXECUTE_HANDLER) {} }
  bool WorldToScreen(const Vector3&,Vector2&,const Matrix4x4&); void ArmGameDepthCapture(); void TrackGameDepthStencil(ID3D11DepthStencilView*); bool CaptureDepthSnapshot(); bool ReadDepthAt(float,float,float&); bool IsDepthBufferPopulated(); bool GetEntityBonePosition(uintptr_t,const char*,Vector3&); bool GetEntityBoneSkeleton(uintptr_t,std::vector<BoneSegment>&); bool GetEntityPreviewSkeleton(uintptr_t,std::array<Vector3,18>&,std::array<bool,18>&); bool GetAimPointScreen(const PlayerData&,float,Vector2&); bool GetAimAnglesFromScreen(float,float,Vector3&); bool IsAimPointVisible(const PlayerData&,float,float,float); bool IsWorldAimPointVisible(const Vector3&,uintptr_t=0); void ProcessAimVisibilityTraces(); void AimAtClosestEnemy(const std::vector<PlayerData>&); void FarmAimAssist(const std::vector<PlayerData>&); void AutoLastHitOrbs(); void AutoParry(const std::vector<PlayerData>&); void ReleaseAimResources();
@@ -210,6 +252,7 @@ BOOL CALLBACK FindGameWindowCallback(HWND,LPARAM); bool HookGameWindow(); uintpt
 void ApplyEnemyRadar(bool enabled);
 void UpdateWorldVisuals();
 void RestoreWorldVisuals();
+void SetDrifterPostProcessingSuppressed(bool suppressed);
 void RestoreWorldRenderState();
 void DebugEntityHandle(uint32_t);
 float GetClientGameTime();

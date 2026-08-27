@@ -108,6 +108,10 @@ bool userCmdHookInstalled = false;
 std::atomic<unsigned long long> silentAppliedCalls{0};
 std::atomic<unsigned long long> createMoveCalls{0};
 std::atomic<unsigned long long> userCmdResolvedCalls{0};
+std::atomic<bool> bunnyBlockAirJump{false};
+std::atomic<bool> bunnyDashJumpOneShot{false};
+std::atomic<bool> bunnyFinishDashJumpInput{false};
+std::atomic<ULONGLONG> bunnyDashGuardUntil{0};
 UserCmdFunctionAddresses runtimeUserCmdFunctions{};
 bool pendingHeroSilentOverridesPrimary = false;
 
@@ -117,6 +121,9 @@ using GetUserCmdArrayFn = uintptr_t(__fastcall*)(uintptr_t, int);
 using GetUserCmdBySequenceFn = uintptr_t(__fastcall*)(uintptr_t, uint32_t);
 CreateMoveFn originalCreateMove = nullptr;
 void* createMoveTarget = nullptr;
+#ifndef DLL6_MOVEMENT_ONLY
+void RefreshDrifterDarknessForToggle();
+#endif
 
 // CreateMove calls input->vtable[6](input, userCmd) after building the
 // command and before the command is consumed by local movement. This is the
@@ -128,6 +135,9 @@ void* applyInputCommandTarget = nullptr;
 bool applyInputCommandHookInstalled = false;
 
 void ApplyVisibleAimInput(uintptr_t input);
+#ifndef DLL6_MOVEMENT_ONLY
+void ApplyBunnyHop(uintptr_t userCmd);
+#endif
 
 using PawnProcessUserCmdFn = void(__fastcall*)(uintptr_t, uintptr_t);
 PawnProcessUserCmdFn originalPawnProcessUserCmd = nullptr;
@@ -328,11 +338,15 @@ using GetKeyStateFn = SHORT(WINAPI*)(int);
 using GetKeyboardStateFn = BOOL(WINAPI*)(PBYTE);
 using GetRawInputDataFn = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
 using GetRawInputBufferFn = UINT(WINAPI*)(PRAWINPUT, PUINT, UINT);
+using SetCursorPosFn = BOOL(WINAPI*)(int, int);
+using ClipCursorFn = BOOL(WINAPI*)(const RECT*);
 GetAsyncKeyStateFn originalGetAsyncKeyState = nullptr;
 GetKeyStateFn originalGetKeyState = nullptr;
 GetKeyboardStateFn originalGetKeyboardState = nullptr;
 GetRawInputDataFn originalGetRawInputData = nullptr;
 GetRawInputBufferFn originalGetRawInputBuffer = nullptr;
+SetCursorPosFn originalSetCursorPos = nullptr;
+ClipCursorFn originalClipCursor = nullptr;
 
 bool WriteCodeBytes(void* address, const void* bytes, size_t size) {
     if (!address || !bytes || !size) return false;
@@ -802,25 +816,96 @@ void DeactivateBuiltInFreeCamera() {
     builtInFreeCameraActive = false;
 }
 
+bool IsKeyboardLayoutModifier(int key) {
+    return key == VK_SHIFT || key == VK_LSHIFT || key == VK_RSHIFT ||
+           key == VK_MENU || key == VK_LMENU || key == VK_RMENU;
+}
+
+BOOL WINAPI hkSetCursorPos(int x, int y) {
+    // Source 2 re-enters relative-mouse mode after an Alt-Tab and then warps
+    // the OS cursor to the client centre every frame. The menu uses the real
+    // absolute cursor, so acknowledge those warps without applying them.
+    if (menuOpen) return TRUE;
+    return originalSetCursorPos ? originalSetCursorPos(x, y) : FALSE;
+}
+
+BOOL WINAPI hkClipCursor(const RECT* rect) {
+    // The game also restores its centre-sized cursor clip on activation.
+    if (menuOpen && rect) return TRUE;
+    return originalClipCursor ? originalClipCursor(rect) : FALSE;
+}
+
 SHORT WINAPI hkGetAsyncKeyState(int key) {
-    if (!IsGameFocused() || menuOpen ||
+    if (!IsGameFocused() || (menuOpen && !IsKeyboardLayoutModifier(key)) ||
         (freeCamActive && IsFreeCameraMovementKey(key))) return 0;
-    return originalGetAsyncKeyState ? originalGetAsyncKeyState(key) : 0;
+    if (MovementReplayVirtualKeyDown(key))
+        return static_cast<SHORT>(0x8001);
+    const SHORT result =
+        originalGetAsyncKeyState ? originalGetAsyncKeyState(key) : 0;
+#ifdef DLL6_MOVEMENT_ONLY
+    CaptureLocalMovementRawKeyEvent(key, (result & 0x8000) != 0);
+#endif
+    return result;
 }
 
 SHORT WINAPI hkGetKeyState(int key) {
-    if (!IsGameFocused() || menuOpen ||
+    if (!IsGameFocused() || (menuOpen && !IsKeyboardLayoutModifier(key)) ||
         (freeCamActive && IsFreeCameraMovementKey(key))) return 0;
-    return originalGetKeyState ? originalGetKeyState(key) : 0;
+    if (MovementReplayVirtualKeyDown(key))
+        return static_cast<SHORT>(0x8001);
+    const SHORT result = originalGetKeyState ? originalGetKeyState(key) : 0;
+#ifdef DLL6_MOVEMENT_ONLY
+    CaptureLocalMovementRawKeyEvent(key, (result & 0x8000) != 0);
+#endif
+    return result;
 }
 
 BOOL WINAPI hkGetKeyboardState(PBYTE state) {
-    if (!IsGameFocused() || menuOpen) {
+    if (!IsGameFocused()) {
         if (state) ZeroMemory(state, 256);
         return TRUE;
     }
     const BOOL result =
         originalGetKeyboardState ? originalGetKeyboardState(state) : FALSE;
+    if (menuOpen) {
+        if (state) {
+            const BYTE shift = state[VK_SHIFT];
+            const BYTE leftShift = state[VK_LSHIFT];
+            const BYTE rightShift = state[VK_RSHIFT];
+            const BYTE alt = state[VK_MENU];
+            const BYTE leftAlt = state[VK_LMENU];
+            const BYTE rightAlt = state[VK_RMENU];
+            ZeroMemory(state, 256);
+            state[VK_SHIFT] = shift;
+            state[VK_LSHIFT] = leftShift;
+            state[VK_RSHIFT] = rightShift;
+            state[VK_MENU] = alt;
+            state[VK_LMENU] = leftAlt;
+            state[VK_RMENU] = rightAlt;
+        }
+        return TRUE;
+    }
+#ifdef DLL6_MOVEMENT_ONLY
+    if (result && state && localMovementRecording) {
+        constexpr int recordedKeys[]{
+            'W', 'S', 'A', 'D', VK_SPACE, VK_LCONTROL, VK_LSHIFT};
+        for (const int key : recordedKeys)
+            CaptureLocalMovementRawKeyEvent(
+                key, (state[key] & 0x80) != 0);
+    }
+#endif
+    if (result && state && (movementReplayActive || movementReplayCalibrating)) {
+        constexpr int replayKeys[]{
+            'W', 'S', 'A', 'D', VK_SPACE,
+            VK_CONTROL, VK_LCONTROL, VK_RCONTROL,
+            VK_SHIFT, VK_LSHIFT, VK_RSHIFT};
+        for (const int key : replayKeys) {
+            if (MovementReplayVirtualKeyDown(key))
+                state[key] = static_cast<BYTE>(state[key] | 0x80);
+            else
+                state[key] = static_cast<BYTE>(state[key] & 0x7F);
+        }
+    }
     if (result && freeCamActive && state) {
         constexpr int blockedKeys[] = {
             'W', 'S', 'A', 'D', VK_SPACE, VK_CONTROL, VK_LCONTROL,
@@ -832,14 +917,34 @@ BOOL WINAPI hkGetKeyboardState(PBYTE state) {
 }
 
 UINT WINAPI hkGetRawInputData(HRAWINPUT handle, UINT command, LPVOID data, PUINT size, UINT headerSize) {
-    if (menuOpen) {
-        if (size) *size = 0;
-        SetLastError(ERROR_ACCESS_DENIED);
-        return static_cast<UINT>(-1);
-    }
     const UINT result = originalGetRawInputData
         ? originalGetRawInputData(handle, command, data, size, headerSize)
         : static_cast<UINT>(-1);
+    if (menuOpen && command == RID_INPUT && data &&
+        result != static_cast<UINT>(-1) && result >= sizeof(RAWINPUTHEADER)) {
+        auto* input = static_cast<RAWINPUT*>(data);
+        if (input->header.dwType == RIM_TYPEMOUSE) {
+            input->data.mouse.lLastX = 0;
+            input->data.mouse.lLastY = 0;
+            input->data.mouse.usButtonFlags = 0;
+            input->data.mouse.ulRawButtons = 0;
+        } else if (input->header.dwType == RIM_TYPEKEYBOARD &&
+                   !IsKeyboardLayoutModifier(input->data.keyboard.VKey)) {
+            input->data.keyboard.Flags |= RI_KEY_BREAK;
+            input->data.keyboard.Message = WM_KEYUP;
+        }
+    }
+#ifdef DLL6_MOVEMENT_ONLY
+    if (command == RID_INPUT && data && result != static_cast<UINT>(-1) &&
+        result >= sizeof(RAWINPUTHEADER)) {
+        auto* input = static_cast<RAWINPUT*>(data);
+        if (input->header.dwType == RIM_TYPEKEYBOARD) {
+            CaptureLocalMovementRawKeyEvent(
+                input->data.keyboard.VKey,
+                (input->data.keyboard.Flags & RI_KEY_BREAK) == 0);
+        }
+    }
+#endif
     if (freeCamActive && command == RID_INPUT && data &&
         result != static_cast<UINT>(-1) &&
         result >= sizeof(RAWINPUTHEADER)) {
@@ -851,18 +956,42 @@ UINT WINAPI hkGetRawInputData(HRAWINPUT handle, UINT command, LPVOID data, PUINT
             input->data.keyboard.Message = WM_KEYUP;
         }
     }
+#ifdef DLL6_MOVEMENT_ONLY
+    if ((localMovementPlaybackActive || localMovementPlaybackCalibrating) &&
+        command == RID_INPUT && data && result != static_cast<UINT>(-1) &&
+        result >= sizeof(RAWINPUTHEADER)) {
+        auto* input = static_cast<RAWINPUT*>(data);
+        if (input->header.dwType == RIM_TYPEMOUSE) {
+            input->data.mouse.lLastX = 0;
+            input->data.mouse.lLastY = 0;
+        }
+    }
+#endif
     return result;
 }
 
 UINT WINAPI hkGetRawInputBuffer(PRAWINPUT data, PUINT size, UINT headerSize) {
-    if (menuOpen) {
-        if (size) *size = 0;
-        SetLastError(ERROR_ACCESS_DENIED);
-        return static_cast<UINT>(-1);
-    }
     const UINT result = originalGetRawInputBuffer
         ? originalGetRawInputBuffer(data, size, headerSize)
         : static_cast<UINT>(-1);
+    if (menuOpen && data && result != static_cast<UINT>(-1)) {
+        RAWINPUT* input = data;
+        for (UINT index = 0; index < result; ++index) {
+            if (input->header.dwType == RIM_TYPEMOUSE) {
+                input->data.mouse.lLastX = 0;
+                input->data.mouse.lLastY = 0;
+                input->data.mouse.usButtonFlags = 0;
+                input->data.mouse.ulRawButtons = 0;
+            } else if (input->header.dwType == RIM_TYPEKEYBOARD &&
+                       !IsKeyboardLayoutModifier(input->data.keyboard.VKey)) {
+                input->data.keyboard.Flags |= RI_KEY_BREAK;
+                input->data.keyboard.Message = WM_KEYUP;
+            }
+            const UINT alignedSize = (input->header.dwSize + 7u) & ~7u;
+            input = reinterpret_cast<RAWINPUT*>(
+                reinterpret_cast<uint8_t*>(input) + alignedSize);
+        }
+    }
     if (freeCamActive && data && result != static_cast<UINT>(-1)) {
         RAWINPUT* input = data;
         for (UINT i = 0; i < result; ++i) {
@@ -878,6 +1007,26 @@ UINT WINAPI hkGetRawInputBuffer(PRAWINPUT data, PUINT size, UINT headerSize) {
                 reinterpret_cast<uint8_t*>(input) + alignedSize);
         }
     }
+#ifdef DLL6_MOVEMENT_ONLY
+    if (data && result != static_cast<UINT>(-1)) {
+        RAWINPUT* input = data;
+        for (UINT i = 0; i < result; ++i) {
+            if (input->header.dwType == RIM_TYPEKEYBOARD) {
+                CaptureLocalMovementRawKeyEvent(
+                    input->data.keyboard.VKey,
+                    (input->data.keyboard.Flags & RI_KEY_BREAK) == 0);
+            } else if ((localMovementPlaybackActive ||
+                        localMovementPlaybackCalibrating) &&
+                       input->header.dwType == RIM_TYPEMOUSE) {
+                input->data.mouse.lLastX = 0;
+                input->data.mouse.lLastY = 0;
+            }
+            const UINT alignedSize = (input->header.dwSize + 7u) & ~7u;
+            input = reinterpret_cast<RAWINPUT*>(
+                reinterpret_cast<uint8_t*>(input) + alignedSize);
+        }
+    }
+#endif
     return result;
 }
 
@@ -1041,6 +1190,13 @@ bool UserCmdHasAnyMask(const CUserCmd* command, std::uint64_t mask) {
 
 bool GetPendingSilentInputAngle(Vector3& angles) {
     const bool physicalAttack = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    if ((farmSilentMode || farmMixedMode) && physicalAttack) {
+        std::lock_guard<std::mutex> lock(creepSilentMutex);
+        if (pendingCreepReady) {
+            angles = pendingCreepAngles;
+            return true;
+        }
+    }
     if (aimSilentActive && physicalAttack) {
         std::lock_guard<std::mutex> lock(humanSilentMutex);
         if (pendingHumanReady) {
@@ -1052,13 +1208,6 @@ bool GetPendingSilentInputAngle(Vector3& angles) {
         std::lock_guard<std::mutex> lock(orbSilentMutex);
         if (pendingOrbReady && pendingOrbAttack) {
             angles = pendingOrbAngles;
-            return true;
-        }
-    }
-    if ((farmSilentMode || farmMixedMode) && physicalAttack) {
-        std::lock_guard<std::mutex> lock(creepSilentMutex);
-        if (pendingCreepReady) {
-            angles = pendingCreepAngles;
             return true;
         }
     }
@@ -1090,9 +1239,20 @@ void ApplyPendingUserCmdAngles(uintptr_t userCmd) {
             0x0000001000000000ull;  // Ability 4 (Vindicta)
         const bool heroAbilityCommand =
             UserCmdHasAnyMask(command, HeroAbilityAimMask);
+        // Creep Aim owns primary-fire commands whenever it has a live target.
+        // Resolve this before the shared hero/script queue so a stale script
+        // angle can never redirect a creep shot.
+        if ((farmNormalActive || farmSilentMode || farmMixedMode) &&
+            commandHasAttack) {
+            std::lock_guard<std::mutex> lock(creepSilentMutex);
+            if (pendingCreepReady) {
+                angles = pendingCreepAngles;
+                ready = true;
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(silentAnglesMutex);
-            if (pendingSilentAnglesReady &&
+            if (!ready && pendingSilentAnglesReady &&
                 (heroAbilityCommand ||
                  pendingHeroSilentOverridesPrimary)) {
                 angles = pendingSilentAngles;
@@ -1102,26 +1262,31 @@ void ApplyPendingUserCmdAngles(uintptr_t userCmd) {
             }
         }
 
-        // A held player shot has priority over autonomous orb/farm helpers.
-        // Keep the selected angle alive for every CreateMove command while the
-        // render-side target remains valid; consuming it once left later
-        // subtick shots with the old camera angle.
+        // A script-generated ability press owns its generated shot, but a
+        // merely cached preview angle must not hijack primary fire.
+        if (!ready) {
+            std::lock_guard<std::mutex> lock(silentAnglesMutex);
+            if (pendingSilentAnglesReady && pendingSilentAttack) {
+                angles = pendingSilentAngles;
+                attack = true;
+                pendingSilentAttack = false;
+                ready = true;
+            }
+        }
+        // While Creep Aim has a live target it owns primary fire in every
+        // mode. Player, orb and cached hero angles must not overwrite it.
+        if (!ready && (farmNormalActive || farmSilentMode || farmMixedMode) &&
+            commandHasAttack) {
+            std::lock_guard<std::mutex> lock(creepSilentMutex);
+            if (pendingCreepReady) {
+                angles = pendingCreepAngles;
+                ready = true;
+            }
+        }
         if (!ready && aimSilentActive && commandHasAttack) {
             std::lock_guard<std::mutex> lock(humanSilentMutex);
             if (pendingHumanReady) {
                 angles = pendingHumanAngles;
-                ready = true;
-            }
-        }
-        // Hero scripts use this same pending-command path as ordinary silent
-        // aim. Unlike the human branch, the attack is generated by the script
-        // and therefore does not depend on a physical mouse button state.
-        if (!ready) {
-            std::lock_guard<std::mutex> lock(silentAnglesMutex);
-            if (pendingSilentAnglesReady) {
-                angles = pendingSilentAngles;
-                attack = pendingSilentAttack;
-                pendingSilentAttack = false;
                 ready = true;
             }
         }
@@ -1133,13 +1298,6 @@ void ApplyPendingUserCmdAngles(uintptr_t userCmd) {
                 // Attack is a pulse, but the angle must remain valid for all
                 // commands until AutoLastHitOrbs drops or changes the target.
                 pendingOrbAttack = false;
-                ready = true;
-            }
-        }
-        if (!ready && (farmSilentMode || farmMixedMode) && commandHasAttack) {
-            std::lock_guard<std::mutex> lock(creepSilentMutex);
-            if (pendingCreepReady) {
-                angles = pendingCreepAngles;
                 ready = true;
             }
         }
@@ -1364,13 +1522,37 @@ void __fastcall hkApplyInputCommand(uintptr_t input, uintptr_t userCmd) {
     // This is the last input stage before local movement consumes the command.
     // Applying here makes Normal/Mixed rotate the actual in-game camera while
     // keeping the OS cursor untouched.
-    const bool heroScriptModified = ProcessHeroScriptsUserCmd(
+    bool heroScriptModified = false;
+#ifdef DLL6_MOVEMENT_ONLY
+    // Citadel's callback finalizes analog axes, button transitions and input
+    // history. Run it first for recording and playback, then patch the fully
+    // built replay command before CreateMove hands it to the local pawn.
+    const bool replayWasActive =
+        localMovementPlaybackActive || localMovementPlaybackCalibrating;
+    if (originalApplyInputCommand)
+        originalApplyInputCommand(input, userCmd);
+    const bool movementReplayModified = ProcessMovementReplayUserCmd(
+        reinterpret_cast<CUserCmd*>(userCmd), input);
+    if (replayWasActive && movementReplayModified) {
+        auto* command = reinterpret_cast<CUserCmd*>(userCmd);
+        if (command && command->cmd.has_ang_camera_angles()) {
+            const auto& value = command->cmd.ang_camera_angles();
+            PatchInputHistory(userCmd, {value.x(), value.y(), value.z()});
+        }
+    }
+    return;
+#else
+    #ifndef DLL6_MOVEMENT_ONLY
+    heroScriptModified = ProcessHeroScriptsUserCmd(
         reinterpret_cast<CUserCmd*>(userCmd), true, input);
     // Hero abilities publish into the same pending-angle channel as ordinary
     // pSilent. Process them first so angle and Ability button are written to
     // this exact command and its input history together.
     ApplyPendingUserCmdAngles(userCmd);
-    if (heroScriptModified) {
+#endif
+    const bool movementReplayModified = ProcessMovementReplayUserCmd(
+        reinterpret_cast<CUserCmd*>(userCmd), input);
+    if (heroScriptModified || movementReplayModified) {
         auto* command = reinterpret_cast<CUserCmd*>(userCmd);
         if (command && command->cmd.has_ang_camera_angles()) {
             const auto& value = command->cmd.ang_camera_angles();
@@ -1379,6 +1561,11 @@ void __fastcall hkApplyInputCommand(uintptr_t input, uintptr_t userCmd) {
     }
     if (originalApplyInputCommand)
         originalApplyInputCommand(input, userCmd);
+    // The stock callback finalizes button states. Filter only after it returns,
+    // otherwise it can restore Space into the command before the local pawn
+    // consumes it.
+    ApplyBunnyHop(userCmd);
+#endif
 }
 
 bool EnsureApplyInputCommandHook(uintptr_t input) {
@@ -1603,6 +1790,9 @@ void ApplyVisibleAimRecoilCommand(uintptr_t userCmd) {
         (!aimNormalActive && !aimMixedMode) ||
         (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0)
         return;
+    // Creep Aim publishes the complete command angle itself. Do not replace
+    // its pitch with the currently cached player target.
+    if (farmNormalActive) return;
 
     Vector3 target{};
     {
@@ -1639,6 +1829,8 @@ Vector3 queuedCameraAimTarget{};
 bool queuedCameraAimReady = false;
 ULONGLONG queuedCameraAimAt = 0;
 bool queuedCameraAimUsesCustomSmoothing = false;
+bool queuedCameraAimUsesDirectAngles = false;
+Vector3 queuedCameraAimDirectAngles{};
 float queuedCameraAimPitchSmooth = 1.0f;
 float queuedCameraAimYawSmooth = 1.0f;
 
@@ -1655,6 +1847,7 @@ void ApplyCurrentCameraAimInternal(const Vector3& worldTarget) {
         queuedCameraAimReady = true;
         queuedCameraAimAt = now;
         queuedCameraAimUsesCustomSmoothing = false;
+        queuedCameraAimUsesDirectAngles = false;
     }
 
     // Normal and the visible half of Mixed must not become inert when the
@@ -1683,10 +1876,34 @@ void ApplyHeroScriptCameraAimInternal(const Vector3& worldTarget,
         queuedCameraAimReady = true;
         queuedCameraAimAt = now;
         queuedCameraAimUsesCustomSmoothing = true;
+        queuedCameraAimUsesDirectAngles = false;
         queuedCameraAimPitchSmooth = (std::clamp)(pitchSmooth, 1.0f, 20.0f);
         queuedCameraAimYawSmooth = (std::clamp)(yawSmooth, 1.0f, 20.0f);
     }
 
+    const ULONGLONG hookAt = lastGameplayCameraHookAt.load(
+        std::memory_order_acquire);
+    if (hookAt == 0 || now - hookAt > 100)
+        FlushCurrentCameraAimInternal();
+}
+
+void ApplyMovementReplayCameraAnglesInternal(const Vector3& angles) {
+    if (freeCamActive || menuOpen || !IsGameFocused() ||
+        !std::isfinite(angles.x) || !std::isfinite(angles.y))
+        return;
+    const ULONGLONG now = GetTickCount64();
+    {
+        std::lock_guard<std::mutex> lock(currentCameraAimMutex);
+        queuedCameraAimReady = true;
+        queuedCameraAimAt = now;
+        queuedCameraAimUsesCustomSmoothing = true;
+        queuedCameraAimUsesDirectAngles = true;
+        queuedCameraAimDirectAngles = {
+            (std::clamp)(angles.x, -89.0f, 89.0f),
+            NormalizeCameraAngle(angles.y), 0.0f};
+        queuedCameraAimPitchSmooth = 1.0f;
+        queuedCameraAimYawSmooth = 1.0f;
+    }
     const ULONGLONG hookAt = lastGameplayCameraHookAt.load(
         std::memory_order_acquire);
     if (hookAt == 0 || now - hookAt > 100)
@@ -1707,6 +1924,8 @@ void FlushCurrentCameraAimInternal(uintptr_t camera) {
 
     Vector3 worldTarget{};
     bool customSmoothing = false;
+    bool directAngles = false;
+    Vector3 requestedAngles{};
     float pitchSmooth = aimPitchSmooth;
     float yawSmooth = aimYawSmooth;
     {
@@ -1721,6 +1940,8 @@ void FlushCurrentCameraAimInternal(uintptr_t camera) {
         }
         worldTarget = queuedCameraAimTarget;
         customSmoothing = queuedCameraAimUsesCustomSmoothing;
+        directAngles = queuedCameraAimUsesDirectAngles;
+        requestedAngles = queuedCameraAimDirectAngles;
         if (customSmoothing) {
             pitchSmooth = queuedCameraAimPitchSmooth;
             yawSmooth = queuedCameraAimYawSmooth;
@@ -1734,22 +1955,25 @@ void FlushCurrentCameraAimInternal(uintptr_t camera) {
     float yaw = Read<float>(camera + 0x48);
     if (!std::isfinite(pitch) || !std::isfinite(yaw)) return;
 
-    Vector3 cameraPosition = Read<Vector3>(camera + 0x38);
-    if (!std::isfinite(cameraPosition.x) ||
-        !std::isfinite(cameraPosition.y) ||
-        !std::isfinite(cameraPosition.z)) {
-        if (!currentCameraPositionReady) return;
-        cameraPosition = currentCameraPosition;
-    }
-
-    const float dx = worldTarget.x - cameraPosition.x;
-    const float dy = worldTarget.y - cameraPosition.y;
-    const float dz = worldTarget.z - cameraPosition.z;
-    const float horizontal = std::sqrt(dx * dx + dy * dy);
-    if (!std::isfinite(horizontal) || horizontal < 0.001f) return;
     constexpr float RadToDeg = 57.29577951308232f;
-    const float targetPitch = -std::atan2(dz, horizontal) * RadToDeg;
-    const float targetYaw = std::atan2(dy, dx) * RadToDeg;
+    float targetPitch = requestedAngles.x;
+    float targetYaw = requestedAngles.y;
+    if (!directAngles) {
+        Vector3 cameraPosition = Read<Vector3>(camera + 0x38);
+        if (!std::isfinite(cameraPosition.x) ||
+            !std::isfinite(cameraPosition.y) ||
+            !std::isfinite(cameraPosition.z)) {
+            if (!currentCameraPositionReady) return;
+            cameraPosition = currentCameraPosition;
+        }
+        const float dx = worldTarget.x - cameraPosition.x;
+        const float dy = worldTarget.y - cameraPosition.y;
+        const float dz = worldTarget.z - cameraPosition.z;
+        const float horizontal = std::sqrt(dx * dx + dy * dy);
+        if (!std::isfinite(horizontal) || horizontal < 0.001f) return;
+        targetPitch = -std::atan2(dz, horizontal) * RadToDeg;
+        targetYaw = std::atan2(dy, dx) * RadToDeg;
+    }
     float pitchDelta = NormalizeCameraAngle(targetPitch - pitch);
     float yawDelta = NormalizeCameraAngle(targetYaw - yaw);
 
@@ -1830,26 +2054,455 @@ void FlushCurrentCameraAimInternal(uintptr_t camera) {
     Write<float>(camera + 0x48, yaw);
 }
 
+#ifndef DLL6_MOVEMENT_ONLY
+uintptr_t FindLocalPrimaryWeaponAbility() {
+    if (!currentLocalPawn) return 0;
+    const uintptr_t component = currentLocalPawn + Offsets::AbilityComponent;
+    const int count = (std::clamp)(
+        Read<int>(component + Offsets::AbilityVector), 0, 64);
+    const uintptr_t handles = Read<uintptr_t>(
+        component + Offsets::AbilityVector + sizeof(uintptr_t));
+    for (int index = 0; handles && index < count; ++index) {
+        const uintptr_t ability = ResolveEntity(
+            Read<uint32_t>(handles + index * sizeof(uint32_t)));
+        if (ability &&
+            Read<int16_t>(ability + Offsets::AbilitySlot) == 0x15)
+            return ability;
+    }
+    return 0;
+}
+
+void ApplyAutoActiveReload(uintptr_t userCmd) {
+    static uintptr_t inReloadOffset = 0;
+    static uintptr_t canActiveReloadOffset = 0;
+    static uintptr_t lastReloadStartOffset = 0;
+    static uintptr_t nextPrimaryAttackOffset = 0;
+    static uintptr_t attackDelayPauseOffset = 0;
+    static uintptr_t simulationTimeOffset = 0;
+    static uintptr_t lastWeapon = 0;
+    static bool previousReload = false;
+    static bool firedThisReload = false;
+    static float triggerTime = 0.0f;
+    static ULONGLONG reloadObservedAt = 0;
+    static ULONGLONG nextOffsetRetry = 0;
+    static ULONGLONG nextDiagnosticAt = 0;
+
+    if (!autoActiveReload || !currentLocalPawn) {
+        previousReload = false;
+        firedThisReload = false;
+        triggerTime = 0.0f;
+        reloadObservedAt = 0;
+        lastWeapon = 0;
+        return;
+    }
+    if (!userCmd) return;
+
+    const ULONGLONG now = GetTickCount64();
+    if ((!inReloadOffset || !canActiveReloadOffset ||
+         !lastReloadStartOffset || !nextPrimaryAttackOffset ||
+         !attackDelayPauseOffset || !simulationTimeOffset) &&
+        now >= nextOffsetRetry) {
+        nextOffsetRetry = now + 1000;
+        if (!inReloadOffset)
+            inReloadOffset = ResolveRuntimeSchemaOffset(
+                "CCitadel_Ability_PrimaryWeapon", "m_bInReload");
+        if (!canActiveReloadOffset)
+            canActiveReloadOffset = ResolveRuntimeSchemaOffset(
+                "CCitadel_Ability_PrimaryWeapon", "m_bCanActiveReload");
+        if (!lastReloadStartOffset)
+            lastReloadStartOffset = ResolveRuntimeSchemaOffset(
+                "CCitadel_Ability_PrimaryWeapon",
+                "m_flLastReloadStartTime");
+        if (!nextPrimaryAttackOffset)
+            nextPrimaryAttackOffset = ResolveRuntimeSchemaOffset(
+                "CCitadel_Ability_PrimaryWeapon", "m_flNextPrimaryAttack");
+        if (!attackDelayPauseOffset)
+            attackDelayPauseOffset = ResolveRuntimeSchemaOffset(
+                "CCitadel_Ability_PrimaryWeapon",
+                "m_flAttackDelayPauseTotalTime");
+        if (!simulationTimeOffset)
+            simulationTimeOffset = ResolveRuntimeSchemaOffset(
+                "C_BaseEntity", "m_flSimulationTime");
+    }
+    if (!inReloadOffset || !canActiveReloadOffset ||
+        !lastReloadStartOffset || !nextPrimaryAttackOffset ||
+        !attackDelayPauseOffset) {
+        if (now >= nextDiagnosticAt) {
+            nextDiagnosticAt = now + 500;
+            std::ofstream log(
+                Dll6Paths::DataFileA("active_reload_runtime.log"),
+                std::ios::app);
+            if (log)
+                log << "offsets in_reload=0x" << std::hex << inReloadOffset
+                    << " can=0x" << canActiveReloadOffset
+                    << " start=0x" << lastReloadStartOffset
+                    << " next=0x" << nextPrimaryAttackOffset
+                    << " pause=0x" << attackDelayPauseOffset
+                    << std::dec << '\n';
+        }
+        return;
+    }
+
+    const uintptr_t weapon = FindLocalPrimaryWeaponAbility();
+    if (!weapon) {
+        previousReload = false;
+        firedThisReload = false;
+        triggerTime = 0.0f;
+        reloadObservedAt = 0;
+        lastWeapon = 0;
+        return;
+    }
+    if (weapon != lastWeapon) {
+        lastWeapon = weapon;
+        previousReload = false;
+        firedThisReload = false;
+        triggerTime = 0.0f;
+        reloadObservedAt = 0;
+    }
+
+    const bool inReload = Read<uint8_t>(weapon + inReloadOffset) != 0;
+    const bool supportsActiveReload =
+        Read<uint8_t>(weapon + canActiveReloadOffset) != 0;
+    const float globalGameNow = GetClientGameTime();
+    const float simulationNow = simulationTimeOffset
+        ? Read<float>(currentLocalPawn + simulationTimeOffset) : 0.0f;
+    const float lastReloadStart =
+        Read<float>(weapon + lastReloadStartOffset);
+    const float nextPrimaryAttack =
+        Read<float>(weapon + nextPrimaryAttackOffset);
+    const float attackDelayPauseTotal =
+        Read<float>(weapon + attackDelayPauseOffset);
+
+    // This is the exact scheduling used by Andromeda 2.5.5. The pause-total
+    // term is updated by the game during dashes and other interruptions, so
+    // triggerTime moves with the actual reload instead of wall-clock time.
+    const float computedTrigger = lastReloadStart +
+        (nextPrimaryAttack - lastReloadStart + attackDelayPauseTotal) * 0.5f -
+        0.1f;
+    const float clockUpperBound = nextPrimaryAttack +
+        (std::max)(0.0f, attackDelayPauseTotal) + 2.0f;
+    const auto clockMatchesReload = [&](float value) {
+        return std::isfinite(value) && value > 0.0f &&
+            value >= lastReloadStart - 1.0f && value <= clockUpperBound;
+    };
+    float reloadNow = 0.0f;
+    const char* clockSource = "none";
+    if (clockMatchesReload(globalGameNow)) {
+        reloadNow = globalGameNow;
+        clockSource = "globals";
+    } else if (clockMatchesReload(simulationNow)) {
+        // Local-player simulation time shares the GameTime_t epoch used by
+        // the weapon fields and remains available when the GlobalVars pattern
+        // resolves to a stale client clock after a map/session transition.
+        reloadNow = simulationNow;
+        clockSource = "simulation";
+    } else if (inReload && reloadObservedAt) {
+        // Last-resort compatibility path for a client build where neither
+        // clock is exposed. Pause-total still moves computedTrigger when a
+        // dash or another action delays the reload.
+        reloadNow = lastReloadStart +
+            static_cast<float>(now - reloadObservedAt) / 1000.0f;
+        clockSource = "local";
+    }
+    const bool validSchedule = supportsActiveReload &&
+        std::isfinite(lastReloadStart) &&
+        std::isfinite(nextPrimaryAttack) &&
+        std::isfinite(attackDelayPauseTotal) &&
+        std::isfinite(computedTrigger) && lastReloadStart > 0.0f &&
+        nextPrimaryAttack > lastReloadStart;
+
+    if (!inReload) {
+        triggerTime = 0.0f;
+        firedThisReload = false;
+        reloadObservedAt = 0;
+    } else {
+        if (!previousReload || !reloadObservedAt)
+            reloadObservedAt = now;
+        // Initialize the local fallback after recording the start tick.
+        if (reloadNow <= 0.0f) {
+            reloadNow = lastReloadStart;
+            clockSource = "local";
+        }
+    }
+    if (inReload && validSchedule &&
+        ((!previousReload && !firedThisReload) || triggerTime > 0.0f)) {
+        if (std::isfinite(computedTrigger) && computedTrigger > 0.0f)
+            triggerTime = computedTrigger;
+    }
+    previousReload = inReload;
+
+    const bool tapReload = inReload && !firedThisReload &&
+        triggerTime > 0.0f && reloadNow > 0.0f &&
+        triggerTime <= reloadNow;
+    if (tapReload) {
+        firedThisReload = true;
+        triggerTime = 0.0f;
+    }
+    if (now >= nextDiagnosticAt || tapReload) {
+        nextDiagnosticAt = now + 250;
+        std::ofstream log(
+            Dll6Paths::DataFileA("active_reload_runtime.log"),
+            std::ios::app);
+        if (log)
+            log << "weapon=0x" << std::hex << weapon
+                << " in_off=0x" << inReloadOffset
+                << " can_off=0x" << canActiveReloadOffset << std::dec
+                << " in_reload=" << inReload
+                << " supported=" << supportsActiveReload
+                << " global_now=" << globalGameNow
+                << " simulation_now=" << simulationNow
+                << " reload_now=" << reloadNow
+                << " clock=" << clockSource
+                << " start=" << lastReloadStart
+                << " next=" << nextPrimaryAttack
+                << " pause_total=" << attackDelayPauseTotal
+                << " computed=" << computedTrigger
+                << " scheduled=" << triggerTime
+                << " tap=" << tapReload << '\n';
+    }
+    if (!tapReload) return;
+
+    auto* command = reinterpret_cast<CUserCmd*>(userCmd);
+    const uint64_t reloadMask =
+        static_cast<uint64_t>(InputBitMask::Reload);
+    command->buttonStates.buttonState1 |= reloadMask;
+    command->buttonStates.buttonState2 |= reloadMask;
+    command->buttonStates.buttonState3 |= reloadMask;
+    if (auto* base = command->cmd.mutable_base()) {
+        if (auto* buttons = base->mutable_buttons_pb()) {
+            buttons->set_buttonstate1(buttons->buttonstate1() | reloadMask);
+            buttons->set_buttonstate2(buttons->buttonstate2() | reloadMask);
+            buttons->set_buttonstate3(buttons->buttonstate3() | reloadMask);
+        }
+    }
+
+}
+
+void ApplyBunnyHop(uintptr_t userCmd) {
+    static uintptr_t groundEntityOffset = 0;
+    static uintptr_t flagsOffset = 0;
+    static ULONGLONG nextOffsetRetry = 0;
+    static ULONGLONG nextDiagnosticAt = 0;
+    static bool previousOnGround = false;
+    static bool previousSpaceDown = false;
+    static bool landingArmed = false;
+    static bool manualAirborneInput = false;
+    static ULONGLONG airborneSince = 0;
+    static ULONGLONG airbornePhaseSince = 0;
+    static ULONGLONG spaceReleasedAt = 0;
+    static ULONGLONG lastDashPressedAt = 0;
+    static bool previousDashDown = false;
+    static uintptr_t trackedPawn = 0;
+
+    if (!bunnyHop || !currentLocalPawn || !userCmd) {
+        bunnyBlockAirJump.store(false, std::memory_order_release);
+        bunnyDashJumpOneShot.store(false, std::memory_order_release);
+        bunnyFinishDashJumpInput.store(false, std::memory_order_release);
+        bunnyDashGuardUntil.store(0, std::memory_order_release);
+        previousOnGround = false;
+        previousSpaceDown = false;
+        landingArmed = false;
+        manualAirborneInput = false;
+        airborneSince = 0;
+        airbornePhaseSince = 0;
+        spaceReleasedAt = 0;
+        lastDashPressedAt = 0;
+        previousDashDown = false;
+        bunnyDashGuardUntil.store(0, std::memory_order_release);
+        trackedPawn = 0;
+        return;
+    }
+
+    if (trackedPawn != currentLocalPawn) {
+        trackedPawn = currentLocalPawn;
+        previousOnGround = false;
+        previousSpaceDown = false;
+        landingArmed = false;
+        manualAirborneInput = false;
+        airborneSince = 0;
+        airbornePhaseSince = 0;
+        spaceReleasedAt = 0;
+        lastDashPressedAt = 0;
+        previousDashDown = false;
+    }
+
+    const ULONGLONG now = GetTickCount64();
+    if (bunnyFinishDashJumpInput.exchange(false,
+            std::memory_order_acq_rel)) {
+        manualAirborneInput = false;
+    }
+    if ((!groundEntityOffset || !flagsOffset) && now >= nextOffsetRetry) {
+        nextOffsetRetry = now + 1000;
+        if (!groundEntityOffset)
+            groundEntityOffset = ResolveRuntimeSchemaOffset(
+                "C_BaseEntity", "m_hGroundEntity");
+        if (!flagsOffset)
+            flagsOffset = ResolveRuntimeSchemaOffset(
+                "C_BaseEntity", "m_fFlags");
+    }
+    if (!groundEntityOffset && !flagsOffset) return;
+
+    auto* command = reinterpret_cast<CUserCmd*>(userCmd);
+    // Space is published as two Citadel actions at this stage: mantle/jump
+    // assistance and zipline interaction.  BunnyHop may gate only the former;
+    // clearing the combined mask makes it impossible to grab a zipline.
+    constexpr uint64_t mantleJumpMask = 0x0001000000000000ull;
+    constexpr uint64_t standardJumpMask = 0x0000000000000002ull;
+    constexpr uint64_t filteredJumpMask =
+        mantleJumpMask | standardJumpMask;
+    const bool spaceDown = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+    const uint32_t groundHandle = groundEntityOffset
+        ? Read<uint32_t>(currentLocalPawn + groundEntityOffset)
+        : 0xFFFFFFFFu;
+    const uint32_t flags = flagsOffset
+        ? Read<uint32_t>(currentLocalPawn + flagsOffset) : 0u;
+    const bool handleOnGround = groundEntityOffset &&
+        groundHandle != 0xFFFFFFFFu &&
+        (groundHandle & 0x7FFFu) != 0x7FFFu;
+    const bool flagsOnGround = flagsOffset && (flags & 1u) != 0;
+    // When both fields are available, require them to agree.  Either field can
+    // briefly retain/flicker its ground value during a movement transition;
+    // treating that as a landing is enough to consume a hero's double jump.
+    const bool onGround = groundEntityOffset && flagsOffset
+        ? (handleOnGround && flagsOnGround)
+        : (handleOnGround || flagsOnGround);
+
+    if (onGround) airbornePhaseSince = 0;
+    else if (!airbornePhaseSince) airbornePhaseSince = now;
+
+    const bool physicalPress = spaceDown && !previousSpaceDown;
+    const bool dashDown =
+        (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ||
+        (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0 ||
+        (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
+    if (dashDown && !previousDashDown) lastDashPressedAt = now;
+    previousDashDown = dashDown;
+    const bool dashJumpPress = physicalPress && lastDashPressedAt &&
+        now - lastDashPressedAt <= 650;
+    if (dashJumpPress)
+        bunnyDashJumpOneShot.store(true, std::memory_order_release);
+    if (dashJumpPress)
+        bunnyDashGuardUntil.store(now + 1500, std::memory_order_release);
+    const bool physicalRelease = !spaceDown && previousSpaceDown;
+    if (physicalRelease || (!spaceDown && !spaceReleasedAt))
+        spaceReleasedAt = now;
+    if (!spaceDown) {
+        landingArmed = false;
+        manualAirborneInput = false;
+        airborneSince = 0;
+        bunnyDashGuardUntil.store(0, std::memory_order_release);
+    } else if (physicalPress && !onGround) {
+        // Treat this as an intentional double jump only after a distinct key-up
+        // interval and a stable airborne phase. Tiny sampled release gaps while
+        // holding/tapping for BunnyHop must not spend the second jump.
+        const bool deliberateAirPress = airbornePhaseSince &&
+            now - airbornePhaseSince >= 120 && spaceReleasedAt &&
+            now - spaceReleasedAt >= 80;
+        manualAirborneInput = deliberateAirPress;
+    } else if (!onGround) {
+        if (!airborneSince) airborneSince = now;
+        // A real jump remains airborne for much longer than this.  Arming only
+        // after a stable airborne interval rejects the one-frame ground bounce
+        // seen immediately after take-off.
+        if (now - airborneSince >= 100) landingArmed = true;
+    }
+
+    if (onGround) manualAirborneInput = false;
+    const bool initialPress = physicalPress && onGround;
+    const bool landingTap = spaceDown && onGround && !previousOnGround &&
+                            landingArmed;
+    if (landingTap) {
+        landingArmed = false;
+        airborneSince = 0;
+    }
+    previousOnGround = onGround;
+    previousSpaceDown = spaceDown;
+    bunnyBlockAirJump.store(!onGround && !manualAirborneInput,
+                            std::memory_order_release);
+
+    if (now >= nextDiagnosticAt) {
+        nextDiagnosticAt = now + 250;
+        std::ofstream log(Dll6Paths::DataFileA("bunnyhop_runtime.log"),
+                          std::ios::app);
+        if (log)
+            log << "pawn=0x" << std::hex << currentLocalPawn
+                << " ground_off=0x" << groundEntityOffset
+                << " flags_off=0x" << flagsOffset
+                << " ground=0x" << groundHandle
+                << " flags=0x" << flags << std::dec
+                << " space=" << spaceDown
+                << " on_ground=" << onGround
+                << " tap=" << landingTap
+                << " native1=0x" << std::hex
+                << command->buttonStates.buttonState1 << std::dec << '\n';
+    }
+    if (!spaceDown) return;
+    if (manualAirborneInput) return;
+
+    const uint64_t keepMask = ~filteredJumpMask;
+    const bool issueJump = initialPress || landingTap;
+    command->buttonStates.buttonState1 =
+        (command->buttonStates.buttonState1 & keepMask) |
+        (issueJump ? mantleJumpMask : 0u);
+    command->buttonStates.buttonState2 =
+        (command->buttonStates.buttonState2 & keepMask) |
+        (issueJump ? mantleJumpMask : 0u);
+    // Physical Space never sets buttonState3 (the scroll/impulse channel).
+    // Mirroring the jump there can submit a second jump action in the same
+    // command, so always remove it from that channel.
+    command->buttonStates.buttonState3 =
+        command->buttonStates.buttonState3 & keepMask;
+    if (auto* base = command->cmd.mutable_base()) {
+        if (auto* buttons = base->mutable_buttons_pb()) {
+            buttons->set_buttonstate1(
+                (buttons->buttonstate1() & keepMask) |
+                (issueJump ? mantleJumpMask : 0u));
+            buttons->set_buttonstate2(
+                (buttons->buttonstate2() & keepMask) |
+                (issueJump ? mantleJumpMask : 0u));
+            buttons->set_buttonstate3(
+                buttons->buttonstate3() & keepMask);
+        }
+    }
+}
+#endif
+
 void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3) {
     EnsureGameplayCameraUpdateHook();
+#ifndef DLL6_MOVEMENT_ONLY
     if (fovChangerEnabled || overrideScopeFov)
         EnsureGetRenderFovHook();
+#endif
     if (!currentLocalPawn) {
         const uintptr_t resolvedPawn = FindLocalPawnFromController();
         if (resolvedPawn) currentLocalPawn = resolvedPawn;
     }
     if (kSilentMovementYawIsolation)
         EnsurePawnProcessUserCmdHook(currentLocalPawn);
-    if (kSilentMoveDataYawIsolation)
+    if (kSilentMoveDataYawIsolation || movementReplayEnabled || bunnyHop)
         EnsureProcessMovementHook(currentLocalPawn);
     // CreateMove and the following local input stage can both append weapon
     // recoil. Bracket the stock call so the state is clear before a shot is
     // built and immediately clear any state it produced afterwards.
+#ifndef DLL6_MOVEMENT_ONLY
     ApplyVisibleAimInput(input);
+#endif
+#ifdef DLL6_MOVEMENT_ONLY
+    // Publish the recorded held keys before the engine constructs this tick's
+    // command, allowing it to create the normal native subtick transitions.
+    PrepareLocalMovementPlaybackInput();
+#endif
     if (originalCreateMove) originalCreateMove(input, splitScreenIndex, a3);
+#ifndef DLL6_MOVEMENT_ONLY
+    // Apply a live Drifter toggle on the gameplay thread. The modifier Think
+    // touches gameplay-owned state and must not be invoked from Present.
+    RefreshDrifterDarknessForToggle();
+#endif
     // Engine physics tracing is only safe on the gameplay thread. Present
     // queues visibility requests; resolve them here and publish cached results.
+#ifndef DLL6_MOVEMENT_ONLY
     ProcessAimVisibilityTraces();
+#endif
     EnsureApplyInputCommandHook(input);
     // currentLocalPawn is refreshed by the render/entity path and may become
     // available only after the first CreateMove call. Retry here so the next
@@ -1860,12 +2513,14 @@ void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3
     }
     if (kSilentMovementYawIsolation)
         EnsurePawnProcessUserCmdHook(currentLocalPawn);
-    if (kSilentMoveDataYawIsolation)
+    if (kSilentMoveDataYawIsolation || movementReplayEnabled || bunnyHop)
         EnsureProcessMovementHook(currentLocalPawn);
     const auto callCount = ++createMoveCalls;
     const uintptr_t userCmd = GetCurrentUserCmd();
     if (userCmd) ++userCmdResolvedCalls;
+#ifndef DLL6_MOVEMENT_ONLY
     ApplyVisibleAimRecoilCommand(userCmd);
+#endif
 
     // The pawn callback captures the exact raw movement and visible camera
     // yaw. ApplyPendingUserCmdAngles rotates that same command only when a
@@ -1902,9 +2557,13 @@ void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3
     // optional runtime hook. Process here as well so hero scripts still work
     // when that auxiliary hook cannot be installed in a particular session.
     // ProcessHeroScriptsUserCmd de-duplicates the same command pointer.
-    const bool heroScriptModified = ProcessHeroScriptsUserCmd(
+    bool heroScriptModified = false;
+#ifndef DLL6_MOVEMENT_ONLY
+    heroScriptModified = ProcessHeroScriptsUserCmd(
         reinterpret_cast<CUserCmd*>(userCmd), true, input);
+    ApplyAutoActiveReload(userCmd);
     ApplyPendingUserCmdAngles(userCmd);
+#endif
     if (heroScriptModified) {
         auto* command = reinterpret_cast<CUserCmd*>(userCmd);
         if (command && command->cmd.has_ang_camera_angles()) {
@@ -1953,6 +2612,7 @@ void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3
                         << " cmdYaw=" << commandYaw << '\n';
         }
     }
+#ifndef DLL6_MOVEMENT_ONLY
     static bool freeCamKeyLastDown = false;
     const bool freeCamKeyDown = IsGameFocused() && !menuOpen && freeCamKey > 0 &&
         ((GetAsyncKeyState(freeCamKey) & 0x8000) != 0);
@@ -1960,6 +2620,7 @@ void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3
         freeCamActive = !freeCamActive;
     freeCamKeyLastDown = freeCamKeyDown;
     UpdateFreeCameraCommand(userCmd);
+#endif
 }
 
 uintptr_t __fastcall hkProcessMovement(uintptr_t movementServices,
@@ -1973,7 +2634,8 @@ uintptr_t __fastcall hkProcessMovement(uintptr_t movementServices,
     float sourceLeft = 0.0f;
     float correctedForward = 0.0f;
     float correctedLeft = 0.0f;
-    if (moveData && aimSilentActive && physicalAttack) {
+    if (kSilentMoveDataYawIsolation && moveData && aimSilentActive &&
+        physicalAttack) {
         Vector3 cameraForward{};
         Vector3 pendingSilentAngles{};
         if (GetCurrentCameraForward(cameraForward) &&
@@ -2012,8 +2674,118 @@ uintptr_t __fastcall hkProcessMovement(uintptr_t movementServices,
         }
     }
 
+    // The command protobuf alone is too late for several Citadel mechanics:
+    // ProcessMovement reads the movement service's live CInButtonState. Feed
+    // the replay bits into that final consumer, then restore the object after
+    // the call so no synthetic key can remain stuck between commands.
+    // CInButtonState lives at +0x50 and begins with an 8-byte vtable.
+    // Never overwrite it: the actual button masks start at +0x58.
+    constexpr uintptr_t MovementButtonsOffset = 0x58;
+    constexpr uint64_t ReplayManagedButtons =
+        static_cast<uint64_t>(InputBitMask::Forward) |
+        static_cast<uint64_t>(InputBitMask::Back) |
+        static_cast<uint64_t>(InputBitMask::MoveLeft) |
+        static_cast<uint64_t>(InputBitMask::MoveRight) |
+        static_cast<uint64_t>(InputBitMask::Jump) |
+        static_cast<uint64_t>(InputBitMask::Duck) |
+        static_cast<uint64_t>(InputBitMask::Speed);
+    const uint64_t replayHeld = MovementReplayHeldButtons();
+    const uint64_t replayPressed = MovementReplayPressedButtons();
+    std::array<uint64_t, 2> savedMovementButtons{};
+    const bool patchReplayButtons = movementServices &&
+        (movementReplayActive || movementReplayCalibrating);
+    if (patchReplayButtons) {
+        for (size_t i = 0; i < savedMovementButtons.size(); ++i)
+            savedMovementButtons[i] = Read<uint64_t>(
+                movementServices + MovementButtonsOffset + i * sizeof(uint64_t));
+        Write<uint64_t>(movementServices + MovementButtonsOffset,
+            (savedMovementButtons[0] & ~ReplayManagedButtons) | replayHeld);
+        Write<uint64_t>(movementServices + MovementButtonsOffset + 8,
+            (savedMovementButtons[1] & ~ReplayManagedButtons) | replayPressed);
+    }
+
+#ifndef DLL6_MOVEMENT_ONLY
+    // Citadel consumes jump from the movement service, not only from the
+    // serialized usercmd.  In particular m_nButtonDoublePressed can remain
+    // queued after the command masks were already cleaned and spend the hero's
+    // air jump.  Hide jump/mantle from the live consumer for this call while
+    // leaving IN_ZIPLINE (bit 56) completely untouched.
+    constexpr uint64_t MovementJumpMask =
+        0x0000000000000002ull | 0x0001000000000000ull;
+    constexpr uintptr_t QueuedButtonDownOffset = 0x70;
+    constexpr uintptr_t QueuedButtonChangeOffset = 0x78;
+    constexpr uintptr_t ButtonDoublePressedOffset = 0x80;
+    std::array<uint64_t, 3> savedBunnyButtons{};
+    const bool dashJumpOneShot = movementServices && bunnyHop &&
+        bunnyDashJumpOneShot.exchange(false, std::memory_order_acq_rel);
+    const ULONGLONG dashGuardUntil =
+        bunnyDashGuardUntil.load(std::memory_order_acquire);
+    const bool dashGuardActive = dashGuardUntil &&
+        GetTickCount64() < dashGuardUntil;
+    const bool patchBunnyButtons = movementServices && bunnyHop &&
+        (bunnyBlockAirJump.load(std::memory_order_acquire) ||
+         dashGuardActive);
+    if (patchBunnyButtons) {
+        for (size_t i = 0; i < savedBunnyButtons.size(); ++i) {
+            const uintptr_t offset = MovementButtonsOffset + i * sizeof(uint64_t);
+            savedBunnyButtons[i] = Read<uint64_t>(movementServices + offset);
+            Write<uint64_t>(movementServices + offset,
+                            savedBunnyButtons[i] & ~MovementJumpMask);
+        }
+        Write<uint64_t>(movementServices + QueuedButtonDownOffset,
+            Read<uint64_t>(movementServices + QueuedButtonDownOffset) &
+            ~MovementJumpMask);
+        Write<uint64_t>(movementServices + QueuedButtonChangeOffset,
+            Read<uint64_t>(movementServices + QueuedButtonChangeOffset) &
+            ~MovementJumpMask);
+        Write<uint64_t>(movementServices + ButtonDoublePressedOffset,
+            Read<uint64_t>(movementServices + ButtonDoublePressedOffset) &
+            ~MovementJumpMask);
+    }
+#endif
+
     const uintptr_t result = originalProcessMovement
         ? originalProcessMovement(movementServices, moveData) : 0;
+#ifndef DLL6_MOVEMENT_ONLY
+    if (patchBunnyButtons) {
+        // Restore only the ordinary held/changed/scroll snapshots. Queued and
+        // double-pressed jump bits are intentionally kept cleared so they
+        // cannot fire on a later prediction pass.
+        for (size_t i = 0; i < savedBunnyButtons.size(); ++i)
+            Write<uint64_t>(movementServices + MovementButtonsOffset +
+                            i * sizeof(uint64_t), savedBunnyButtons[i]);
+        Write<uint64_t>(movementServices + QueuedButtonDownOffset,
+            Read<uint64_t>(movementServices + QueuedButtonDownOffset) &
+            ~MovementJumpMask);
+        Write<uint64_t>(movementServices + QueuedButtonChangeOffset,
+            Read<uint64_t>(movementServices + QueuedButtonChangeOffset) &
+            ~MovementJumpMask);
+        Write<uint64_t>(movementServices + ButtonDoublePressedOffset,
+            Read<uint64_t>(movementServices + ButtonDoublePressedOffset) &
+            ~MovementJumpMask);
+    }
+    if (dashJumpOneShot) {
+        // Let this ProcessMovement call consume Space as a dash-jump, then
+        // discard only the queued follow-up that would become an air jump on
+        // the next prediction pass.
+        Write<uint64_t>(movementServices + QueuedButtonDownOffset,
+            Read<uint64_t>(movementServices + QueuedButtonDownOffset) &
+            ~MovementJumpMask);
+        Write<uint64_t>(movementServices + QueuedButtonChangeOffset,
+            Read<uint64_t>(movementServices + QueuedButtonChangeOffset) &
+            ~MovementJumpMask);
+        Write<uint64_t>(movementServices + ButtonDoublePressedOffset,
+            Read<uint64_t>(movementServices + ButtonDoublePressedOffset) &
+            ~MovementJumpMask);
+        bunnyBlockAirJump.store(true, std::memory_order_release);
+        bunnyFinishDashJumpInput.store(true, std::memory_order_release);
+    }
+#endif
+    if (patchReplayButtons) {
+        for (size_t i = 0; i < savedMovementButtons.size(); ++i)
+            Write<uint64_t>(movementServices + MovementButtonsOffset +
+                            i * sizeof(uint64_t), savedMovementButtons[i]);
+    }
     if (corrected) {
         Write<float>(moveData + 0x2C, sourceForward);
         Write<float>(moveData + 0x30, sourceLeft);
@@ -2308,6 +3080,347 @@ uintptr_t __fastcall hkUserCmdToNetwork(uintptr_t a1, uintptr_t a2, uintptr_t a3
         ? originalUserCmdToNetwork(a1, a2, a3) : 0;
 }
 
+#ifndef DLL6_MOVEMENT_ONLY
+using DarknessTargetThinkFn = __int64(__fastcall*)(__int64);
+using HasModifierStateFn = bool(__fastcall*)(__int64, uint16_t);
+using DarknessZoneManagerFn = uintptr_t(__fastcall*)();
+using DarknessZoneRemoveFn = void(__fastcall*)(uintptr_t, int, bool, bool);
+using DarknessTargetUpdateFn = __int64(__fastcall*)(__int64);
+using DarknessPropertyGetFn = float(__fastcall*)(uintptr_t, uintptr_t);
+
+DarknessTargetThinkFn originalDarknessTargetThink = nullptr;
+HasModifierStateFn originalHasModifierState = nullptr;
+void* darknessTargetThinkTarget = nullptr;
+void* hasModifierStateTarget = nullptr;
+std::atomic<uint64_t> darknessTargetThinkCalls{0};
+std::atomic<uint64_t> darknessModifierQueries{0};
+std::atomic<uint64_t> darknessModifierQueriesBlocked{0};
+std::atomic<ULONGLONG> darknessVictimSeenAt{0};
+uintptr_t darknessBucketSizeOffset = 0;
+
+struct DarknessModifierSnapshot {
+    uintptr_t modifier{};
+    float radius[2]{};
+    uint8_t lock[2]{};
+    bool captured{};
+    bool inflated{};
+};
+
+DarknessModifierSnapshot darknessModifierSnapshot{};
+bool darknessLastAppliedToggle = disableDrifterDarkness;
+DarknessZoneManagerFn darknessZoneManager = nullptr;
+DarknessZoneRemoveFn darknessZoneRemove = nullptr;
+DarknessTargetUpdateFn darknessTargetUpdate = nullptr;
+DarknessPropertyGetFn darknessPropertyGet = nullptr;
+bool darknessZoneFunctionsResolved = false;
+
+uintptr_t ResolveRelativeCallTarget(uintptr_t callInstruction);
+
+bool IsWritableAddress(uintptr_t address) {
+    if (!address) return false;
+    MEMORY_BASIC_INFORMATION information{};
+    if (!VirtualQuery(reinterpret_cast<void*>(address), &information,
+                      sizeof(information)) ||
+        information.State != MEM_COMMIT ||
+        (information.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+        return false;
+    const DWORD protection = information.Protect & 0xFF;
+    return protection == PAGE_READWRITE ||
+           protection == PAGE_WRITECOPY ||
+           protection == PAGE_EXECUTE_READWRITE ||
+           protection == PAGE_EXECUTE_WRITECOPY;
+}
+
+bool ValidateDarknessController(uintptr_t candidate,
+                                uintptr_t& sizeOffset) {
+    if (!IsWritableAddress(candidate)) return false;
+    constexpr int states[]{1, 3, 4};
+    constexpr uintptr_t offsets[]{0, 0x10};
+    for (const uintptr_t offset : offsets) {
+        bool plausible = true;
+        for (const int state : states) {
+            const int size = Read<int>(
+                candidate + 0x20 + state * 0x20 + offset);
+            if (size < 0 || size > 4096) {
+                plausible = false;
+                break;
+            }
+        }
+        if (plausible) {
+            sizeOffset = offset;
+            return true;
+        }
+    }
+    return false;
+}
+
+uintptr_t GetDrifterPostProcessController() {
+    static uintptr_t controller = 0;
+    static bool resolved = false;
+    if (resolved) return controller;
+    resolved = true;
+
+    constexpr const char* patterns[]{
+        "48 8D 05 ? ? ? ? C3 CC CC CC CC CC CC CC CC 40 57 48 83 EC ? BA",
+        "48 8D 05 ? ? ? ? C3 CC CC CC CC CC CC CC CC 40 57 48 83 EC"};
+    for (const char* pattern : patterns) {
+        uintptr_t searchFrom = clientBase;
+        for (int matchIndex = 0; matchIndex < 256; ++matchIndex) {
+            const uintptr_t getter = FindClientPattern(pattern, searchFrom);
+            if (!getter) break;
+            searchFrom = getter + 1;
+            const int32_t relative = Read<int32_t>(getter + 3);
+            const uintptr_t leaTarget = getter + 7 +
+                static_cast<intptr_t>(relative);
+            uintptr_t sizeOffset = 0;
+            if (ValidateDarknessController(leaTarget, sizeOffset)) {
+                controller = leaTarget;
+                darknessBucketSizeOffset = sizeOffset;
+                return controller;
+            }
+            const uintptr_t indirect = Read<uintptr_t>(leaTarget);
+            if (ValidateDarknessController(indirect, sizeOffset)) {
+                controller = indirect;
+                darknessBucketSizeOffset = sizeOffset;
+                return controller;
+            }
+        }
+    }
+    return controller;
+}
+
+void InflateDrifterTargetRadius(uintptr_t modifier) {
+    if (!modifier) return;
+    constexpr uintptr_t properties[]{280, 536};
+    for (const uintptr_t propertyOffset : properties) {
+        const uintptr_t property = modifier + propertyOffset;
+        // These fields are read by the current Darkness Target Think at
+        // modifier+0x118 and modifier+0x218. Their cache can legitimately be
+        // zero on the first victim tick, so range validation would skip the
+        // override and leave both the world mask and model culling active.
+        Write<float>(property + 0x38, 80000.0f);
+        Write<uint8_t>(property + 0x3D, 1);
+    }
+}
+
+void CaptureDrifterTargetRadius(uintptr_t modifier) {
+    if (!modifier || (darknessModifierSnapshot.captured &&
+                      darknessModifierSnapshot.modifier == modifier))
+        return;
+    darknessModifierSnapshot = {};
+    darknessModifierSnapshot.modifier = modifier;
+    if (!darknessPropertyGet && darknessTargetThinkTarget) {
+        darknessPropertyGet = reinterpret_cast<DarknessPropertyGetFn>(
+            ResolveRelativeCallTarget(
+                reinterpret_cast<uintptr_t>(darknessTargetThinkTarget) +
+                0x468));
+    }
+    constexpr uintptr_t properties[]{280, 536};
+    for (size_t index = 0; index < std::size(properties); ++index) {
+        const uintptr_t property = modifier + properties[index];
+        float radius = Read<float>(property + 0x38);
+        __try {
+            if (darknessPropertyGet)
+                radius = darknessPropertyGet(property, 0);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            darknessPropertyGet = nullptr;
+        }
+        darknessModifierSnapshot.radius[index] = radius;
+        darknessModifierSnapshot.lock[index] =
+            Read<uint8_t>(property + 0x3D);
+    }
+    darknessModifierSnapshot.captured = true;
+}
+
+void RestoreDrifterTargetRadius() {
+    if (!darknessModifierSnapshot.captured) return;
+    constexpr uintptr_t properties[]{280, 536};
+    for (size_t index = 0; index < std::size(properties); ++index) {
+        const uintptr_t property =
+            darknessModifierSnapshot.modifier + properties[index];
+        Write<float>(property + 0x38,
+                     darknessModifierSnapshot.radius[index]);
+        Write<uint8_t>(property + 0x3D,
+                       darknessModifierSnapshot.lock[index]);
+    }
+    darknessModifierSnapshot.inflated = false;
+}
+
+uintptr_t ResolveRelativeCallTarget(uintptr_t callInstruction) {
+    if (!callInstruction || Read<uint8_t>(callInstruction) != 0xE8)
+        return 0;
+    return callInstruction + 5 +
+        static_cast<intptr_t>(Read<int32_t>(callInstruction + 1));
+}
+
+void ResolveDarknessZoneFunctions() {
+    if (darknessZoneFunctionsResolved) return;
+    darknessZoneFunctionsResolved = true;
+    // CModifier_Drifter_Darkness_Target::OnRemoved removes the visibility
+    // registration stored at +0x418. Resolve both callees from that native
+    // cleanup sequence instead of pinning their update-sensitive RVAs.
+    const uintptr_t cleanup = FindUniqueClientPattern(
+        "83 BF 18 04 00 00 FF 48 8B 5C 24 ? 74 ? E8 ? ? ? ? "
+        "8B 97 18 04 00 00 "
+        "41 B1 01 45 33 C0 48 8B C8 E8 ? ? ? ? C7 87 18 04 00 00 "
+        "FF FF FF FF");
+    if (!cleanup) return;
+    darknessZoneManager = reinterpret_cast<DarknessZoneManagerFn>(
+        ResolveRelativeCallTarget(cleanup + 14));
+    darknessZoneRemove = reinterpret_cast<DarknessZoneRemoveFn>(
+        ResolveRelativeCallTarget(cleanup + 34));
+    darknessTargetUpdate = reinterpret_cast<DarknessTargetUpdateFn>(
+        FindUniqueClientPattern(
+            "48 89 5C 24 ? 57 48 83 EC 70 0F 29 74 24 ? "
+            "0F 29 7C 24 ? 44 0F 29 44 24 ? 48 8B F9"));
+    if (!darknessTargetUpdate && darknessTargetThinkTarget) {
+        const uintptr_t adjacentUpdate =
+            reinterpret_cast<uintptr_t>(darknessTargetThinkTarget) + 0x510;
+        if (Read<uint32_t>(adjacentUpdate) == 0x245C8948)
+            darknessTargetUpdate =
+                reinterpret_cast<DarknessTargetUpdateFn>(adjacentUpdate);
+    }
+}
+
+void RemoveTrackedDarknessZone() {
+    if (!darknessModifierSnapshot.captured) return;
+    ResolveDarknessZoneFunctions();
+    if (!darknessZoneManager || !darknessZoneRemove) return;
+    const uintptr_t modifier = darknessModifierSnapshot.modifier;
+    const int handle = Read<int>(modifier + 0x418);
+    if (handle == -1) return;
+    __try {
+        const uintptr_t manager = darknessZoneManager();
+        if (manager) darknessZoneRemove(manager, handle, false, true);
+        Write<int>(modifier + 0x418, -1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        darknessZoneManager = nullptr;
+        darknessZoneRemove = nullptr;
+    }
+}
+
+void PurgeDrifterDarknessBuckets() {
+    const uintptr_t controller = GetDrifterPostProcessController();
+    if (!controller) return;
+    // Black, Blinded and DrifterDarknessCaster. Builds differ in whether the
+    // bucket exposes m_Size directly or after a 0x10-byte CUtlMemory header;
+    // controller discovery validates and records the live layout.
+    constexpr int states[]{1, 3, 4};
+    for (const int state : states) {
+        const uintptr_t sizeAddress = controller + 0x20 +
+            state * 0x20 + darknessBucketSizeOffset;
+        const int size = Read<int>(sizeAddress);
+        if (size >= 0 && size <= 4096)
+            Write<int>(sizeAddress, 0);
+    }
+}
+
+__int64 __fastcall HookDarknessTargetThink(__int64 modifier) {
+    darknessTargetThinkCalls.fetch_add(1, std::memory_order_relaxed);
+    if (!originalDarknessTargetThink) return 0;
+    CaptureDrifterTargetRadius(static_cast<uintptr_t>(modifier));
+    darknessLastAppliedToggle = disableDrifterDarkness;
+    if (!disableDrifterDarkness) {
+        if (darknessModifierSnapshot.inflated)
+            RestoreDrifterTargetRadius();
+        return originalDarknessTargetThink(modifier);
+    }
+
+    // The original Think must run after inflating the target radius: it is the
+    // part that republishes heroes outside the real darkness volume. Remove
+    // only the post-process buckets afterwards so visibility is preserved
+    // without bringing the black screen back.
+    InflateDrifterTargetRadius(static_cast<uintptr_t>(modifier));
+    darknessModifierSnapshot.inflated = true;
+    const __int64 result = originalDarknessTargetThink(modifier);
+    PurgeDrifterDarknessBuckets();
+    return result;
+}
+
+bool __fastcall HookHasModifierState(__int64 entity, uint16_t state) {
+    darknessModifierQueries.fetch_add(1, std::memory_order_relaxed);
+    const bool actualState = originalHasModifierState
+        ? originalHasModifierState(entity, state) : false;
+    if (state == 240 && actualState)
+        darknessVictimSeenAt.store(GetTickCount64(),
+                                   std::memory_order_relaxed);
+    // These are query gates only. Do not force m_bVisibleOnMap: doing so also
+    // publishes unrelated dormant entities and floods the minimap with junk.
+    if (disableDrifterDarkness &&
+        (state == 208 || state == 239 || state == 240)) {
+        darknessModifierQueriesBlocked.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    return actualState;
+}
+
+void LogDrifterToggleRefresh(bool enabled, uintptr_t modifier,
+                             int oldHandle) {
+    std::ofstream toggleLog(
+        Dll6Paths::DataFileA("drifter_darkness_toggle.log"),
+        std::ios::app);
+    if (!toggleLog) return;
+    toggleLog << "enabled=" << enabled
+              << " modifier=0x" << std::hex << modifier
+              << " manager=0x"
+              << reinterpret_cast<uintptr_t>(darknessZoneManager)
+              << " remove=0x"
+              << reinterpret_cast<uintptr_t>(darknessZoneRemove)
+              << " update=0x"
+              << reinterpret_cast<uintptr_t>(darknessTargetUpdate)
+              << std::dec << " old_handle=" << oldHandle
+              << " new_handle=" << Read<int>(modifier + 0x418)
+              << " radius118=" << Read<float>(modifier + 280 + 0x38)
+              << " radius218=" << Read<float>(modifier + 536 + 0x38)
+              << " lock118="
+              << static_cast<int>(Read<uint8_t>(modifier + 280 + 0x3D))
+              << " lock218="
+              << static_cast<int>(Read<uint8_t>(modifier + 536 + 0x3D))
+              << '\n';
+}
+
+void RefreshDrifterDarknessForToggle() {
+    const bool enabled = disableDrifterDarkness;
+    if (enabled == darknessLastAppliedToggle) return;
+    darknessLastAppliedToggle = enabled;
+
+    const ULONGLONG seenAt =
+        darknessVictimSeenAt.load(std::memory_order_relaxed);
+    const ULONGLONG now = GetTickCount64();
+    if (!darknessModifierSnapshot.captured || !seenAt || now < seenAt ||
+        now - seenAt > 1000)
+        return;
+
+    const uintptr_t modifier = darknessModifierSnapshot.modifier;
+    if (!IsWritableAddress(modifier + 280)) return;
+    // The radius is copied into a manager-owned visibility registration.
+    // Merely restoring the network fields cannot shrink an already-created
+    // zone, so remove its live handle before rebuilding it below.
+    const int oldHandle = Read<int>(modifier + 0x418);
+    RemoveTrackedDarknessZone();
+    if (enabled) {
+        InflateDrifterTargetRadius(modifier);
+        darknessModifierSnapshot.inflated = true;
+    } else {
+        RestoreDrifterTargetRadius();
+    }
+
+    // Re-run the victim Think once so the renderer immediately rebuilds its
+    // boundary/model visibility using the selected radius.
+    __try {
+        if (originalDarknessTargetThink)
+            originalDarknessTargetThink(static_cast<__int64>(modifier));
+        ResolveDarknessZoneFunctions();
+        if (darknessTargetUpdate)
+            darknessTargetUpdate(static_cast<__int64>(modifier));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        darknessModifierSnapshot = {};
+    }
+    if (enabled) PurgeDrifterDarknessBuckets();
+    LogDrifterToggleRefresh(enabled, modifier, oldHandle);
+}
+#endif
+
 }
 
 void ApplyCurrentCameraAim(const Vector3& worldTarget) {
@@ -2318,6 +3431,26 @@ void ApplyHeroScriptCameraAim(const Vector3& worldTarget,
                               float pitchSmooth, float yawSmooth) {
     ApplyHeroScriptCameraAimInternal(worldTarget, pitchSmooth, yawSmooth);
 }
+
+void ApplyMovementReplayCameraAngles(const Vector3& angles) {
+    ApplyMovementReplayCameraAnglesInternal(angles);
+}
+
+#ifdef DLL6_MOVEMENT_ONLY
+bool GetMovementReplayCameraAngles(Vector3& angles) {
+    angles = {};
+    const uintptr_t manager = ResolveCitadelCameraManager();
+    if (!manager) return false;
+    const uintptr_t camera = Read<uintptr_t>(manager + 0x28);
+    if (!camera) return false;
+    const float pitch = Read<float>(camera + 0x44);
+    const float yaw = Read<float>(camera + 0x48);
+    if (!std::isfinite(pitch) || !std::isfinite(yaw)) return false;
+    angles = {(std::clamp)(pitch, -89.0f, 89.0f),
+              NormalizeCameraAngle(yaw), 0.0f};
+    return true;
+}
+#endif
 
 void QueueHeroSilentAngles(const Vector3& angles, bool attack,
                            bool overridePrimaryAim) {
@@ -2339,6 +3472,144 @@ void ClearHeroSilentAngles() {
 
 void FlushCurrentCameraAim() {
     FlushCurrentCameraAimInternal();
+}
+
+bool InstallDrifterDarknessHooks() {
+#ifdef DLL6_MOVEMENT_ONLY
+    return false;
+#else
+    if (darknessTargetThinkTarget && hasModifierStateTarget &&
+        originalDarknessTargetThink && originalHasModifierState)
+        return true;
+
+    darknessTargetThinkTarget = reinterpret_cast<void*>(FindClientPattern(
+        "40 55 53 56 48 8D 6C 24 ? 48 81 EC 80 01 00 00 44 0F 29 84 24"));
+    hasModifierStateTarget = reinterpret_cast<void*>(FindClientPattern(
+        "4C 8B 89 ? ? ? ? 4D 85 C9 74 ? 44 0F B7 C2"));
+    const uintptr_t controller = GetDrifterPostProcessController();
+    if (!darknessTargetThinkTarget || !hasModifierStateTarget) {
+        std::ofstream log(
+            Dll6Paths::DataFileA("drifter_darkness_hooks.log"),
+            std::ios::trunc);
+        if (log) {
+            log << "patterns missing think=0x" << std::hex
+                << reinterpret_cast<uintptr_t>(darknessTargetThinkTarget)
+                << " modifier=0x"
+                << reinterpret_cast<uintptr_t>(hasModifierStateTarget)
+                << " controller=0x" << controller << '\n';
+        }
+        darknessTargetThinkTarget = nullptr;
+        hasModifierStateTarget = nullptr;
+        return false;
+    }
+
+    const MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED)
+        return false;
+    const MH_STATUS thinkCreate = MH_CreateHook(
+        darknessTargetThinkTarget,
+        reinterpret_cast<void*>(&HookDarknessTargetThink),
+        reinterpret_cast<void**>(&originalDarknessTargetThink));
+    const MH_STATUS modifierCreate = MH_CreateHook(
+        hasModifierStateTarget,
+        reinterpret_cast<void*>(&HookHasModifierState),
+        reinterpret_cast<void**>(&originalHasModifierState));
+    if ((thinkCreate != MH_OK && thinkCreate != MH_ERROR_ALREADY_CREATED) ||
+        (modifierCreate != MH_OK && modifierCreate != MH_ERROR_ALREADY_CREATED)) {
+        if (darknessTargetThinkTarget)
+            MH_RemoveHook(darknessTargetThinkTarget);
+        if (hasModifierStateTarget)
+            MH_RemoveHook(hasModifierStateTarget);
+        darknessTargetThinkTarget = nullptr;
+        hasModifierStateTarget = nullptr;
+        originalDarknessTargetThink = nullptr;
+        originalHasModifierState = nullptr;
+        return false;
+    }
+
+    const MH_STATUS thinkEnable = MH_EnableHook(darknessTargetThinkTarget);
+    const MH_STATUS modifierEnable = MH_EnableHook(hasModifierStateTarget);
+    const bool enabled =
+        (thinkEnable == MH_OK || thinkEnable == MH_ERROR_ENABLED) &&
+        (modifierEnable == MH_OK || modifierEnable == MH_ERROR_ENABLED);
+    if (!enabled) {
+        RemoveDrifterDarknessHooks();
+        return false;
+    }
+
+    std::ofstream log(
+        Dll6Paths::DataFileA("drifter_darkness_hooks.log"),
+        std::ios::trunc);
+    if (log) {
+        log << "installed think=0x" << std::hex
+            << reinterpret_cast<uintptr_t>(darknessTargetThinkTarget)
+            << " modifier=0x"
+            << reinterpret_cast<uintptr_t>(hasModifierStateTarget)
+            << " controller=0x" << controller << '\n';
+    }
+    return true;
+#endif
+}
+
+void RemoveDrifterDarknessHooks() {
+#ifndef DLL6_MOVEMENT_ONLY
+    SetDrifterPostProcessingSuppressed(false);
+    if (darknessTargetThinkTarget) {
+        MH_DisableHook(darknessTargetThinkTarget);
+        MH_RemoveHook(darknessTargetThinkTarget);
+    }
+    if (hasModifierStateTarget) {
+        MH_DisableHook(hasModifierStateTarget);
+        MH_RemoveHook(hasModifierStateTarget);
+    }
+    darknessTargetThinkTarget = nullptr;
+    hasModifierStateTarget = nullptr;
+    originalDarknessTargetThink = nullptr;
+    originalHasModifierState = nullptr;
+#endif
+}
+
+void MaintainDrifterDarknessSuppression() {
+#ifndef DLL6_MOVEMENT_ONLY
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG victimSeenAt =
+        darknessVictimSeenAt.load(std::memory_order_relaxed);
+    SetDrifterPostProcessingSuppressed(
+        disableDrifterDarkness && victimSeenAt != 0 &&
+        now >= victimSeenAt && now - victimSeenAt < 500);
+    if (!disableDrifterDarkness) return;
+
+    // TargetThink is not the final writer on every client frame. The global
+    // post-process controller may be repopulated later by modifier dispatch,
+    // so clear the same three buckets once more immediately before Present.
+    PurgeDrifterDarknessBuckets();
+
+    static ULONGLONG lastLogAt = 0;
+    if (now - lastLogAt < 2000) return;
+    lastLogAt = now;
+    const uintptr_t controller = GetDrifterPostProcessController();
+    std::ofstream log(
+        Dll6Paths::DataFileA("drifter_darkness_runtime.log"),
+        std::ios::app);
+    if (log) {
+        log << "think="
+            << darknessTargetThinkCalls.load(std::memory_order_relaxed)
+            << " queries="
+            << darknessModifierQueries.load(std::memory_order_relaxed)
+            << " blocked="
+            << darknessModifierQueriesBlocked.load(std::memory_order_relaxed)
+            << " controller=0x" << std::hex << controller << std::dec
+            << " size_offset=0x" << std::hex
+            << darknessBucketSizeOffset << std::dec
+            << " bucket_sizes="
+            << Read<int>(controller + 0x20 + 1 * 0x20 +
+                         darknessBucketSizeOffset) << ','
+            << Read<int>(controller + 0x20 + 3 * 0x20 +
+                         darknessBucketSizeOffset) << ','
+            << Read<int>(controller + 0x20 + 4 * 0x20 +
+                         darknessBucketSizeOffset) << '\n';
+    }
+#endif
 }
 
 bool InstallOrbEntityHooks() {
@@ -2572,10 +3843,18 @@ bool InstallInputLockHooks() {
     const MH_STATUS rawBufferStatus = MH_CreateHookApi(
         L"user32", "GetRawInputBuffer", reinterpret_cast<LPVOID>(&hkGetRawInputBuffer),
         reinterpret_cast<LPVOID*>(&originalGetRawInputBuffer));
+    const MH_STATUS cursorPositionStatus = MH_CreateHookApi(
+        L"user32", "SetCursorPos", reinterpret_cast<LPVOID>(&hkSetCursorPos),
+        reinterpret_cast<LPVOID*>(&originalSetCursorPos));
+    const MH_STATUS cursorClipStatus = MH_CreateHookApi(
+        L"user32", "ClipCursor", reinterpret_cast<LPVOID>(&hkClipCursor),
+        reinterpret_cast<LPVOID*>(&originalClipCursor));
     if ((keyStatus != MH_OK && keyStatus != MH_ERROR_ALREADY_CREATED) ||
         (keyStateStatus != MH_OK && keyStateStatus != MH_ERROR_ALREADY_CREATED) ||
         (keyboardStatus != MH_OK && keyboardStatus != MH_ERROR_ALREADY_CREATED) ||
         (rawBufferStatus != MH_OK && rawBufferStatus != MH_ERROR_ALREADY_CREATED) ||
+        (cursorPositionStatus != MH_OK && cursorPositionStatus != MH_ERROR_ALREADY_CREATED) ||
+        (cursorClipStatus != MH_OK && cursorClipStatus != MH_ERROR_ALREADY_CREATED) ||
         (rawStatus != MH_OK && rawStatus != MH_ERROR_ALREADY_CREATED)) return false;
 
     const MH_STATUS enableStatus = MH_EnableHook(MH_ALL_HOOKS);
@@ -2588,16 +3867,22 @@ void RemoveInputLockHooks() {
     MH_DisableHook(reinterpret_cast<LPVOID>(GetKeyboardState));
     MH_DisableHook(reinterpret_cast<LPVOID>(GetRawInputData));
     MH_DisableHook(reinterpret_cast<LPVOID>(GetRawInputBuffer));
+    MH_DisableHook(reinterpret_cast<LPVOID>(SetCursorPos));
+    MH_DisableHook(reinterpret_cast<LPVOID>(ClipCursor));
     MH_RemoveHook(reinterpret_cast<LPVOID>(GetAsyncKeyState));
     MH_RemoveHook(reinterpret_cast<LPVOID>(GetKeyState));
     MH_RemoveHook(reinterpret_cast<LPVOID>(GetKeyboardState));
     MH_RemoveHook(reinterpret_cast<LPVOID>(GetRawInputData));
     MH_RemoveHook(reinterpret_cast<LPVOID>(GetRawInputBuffer));
+    MH_RemoveHook(reinterpret_cast<LPVOID>(SetCursorPos));
+    MH_RemoveHook(reinterpret_cast<LPVOID>(ClipCursor));
     originalGetAsyncKeyState = nullptr;
     originalGetKeyState = nullptr;
     originalGetKeyboardState = nullptr;
     originalGetRawInputData = nullptr;
     originalGetRawInputBuffer = nullptr;
+    originalSetCursorPos = nullptr;
+    originalClipCursor = nullptr;
 }
 
 void SetupHooks() {
@@ -2686,7 +3971,36 @@ void SetupHooks() {
 }
 
 DWORD WINAPI InitializeThread(LPVOID) {
+    // A second mapped copy would install another set of detours over the
+    // first one. Keep one active instance per game process, but release this
+    // guard during the orderly hot-unload so reinjection remains possible.
+    const std::wstring instanceGuardName =
+        L"Local\\Dll6_Deadlock_SingleInstance_" +
+        std::to_wstring(GetCurrentProcessId());
+    moduleInstanceGuard = CreateMutexW(
+        nullptr, FALSE, instanceGuardName.c_str());
+    if (!moduleInstanceGuard || GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (moduleInstanceGuard) {
+            CloseHandle(moduleInstanceGuard);
+            moduleInstanceGuard = nullptr;
+        }
+        return 0;
+    }
+    const std::wstring readyEventName =
+        L"Local\\Dll6_Deadlock_Ready_" +
+        std::to_wstring(GetCurrentProcessId());
+    moduleReadyEvent = CreateEventW(nullptr, TRUE, FALSE,
+                                    readyEventName.c_str());
+
+#ifdef DLL6_MOVEMENT_ONLY
+    // Standalone demonstration build: no menu/config-dependent features.
+    menuOpen = false;
+    movementProbeEnabled = false;
+    movementReplayEnabled = true;
+    movementReplayKey = VK_F6;
+#else
     LoadConfig();
+#endif
     for (int attempt = 0; attempt < 100; ++attempt) {
         clientBase = reinterpret_cast<uintptr_t>(GetModuleHandleA("client.dll"));
         if (clientBase) break;
@@ -2732,9 +4046,13 @@ DWORD WINAPI InitializeThread(LPVOID) {
         return 0;
     }
 
+#ifndef DLL6_MOVEMENT_ONLY
     const bool nativeGlowFound = InitializeNativeGlow();
     printf("[Glow] native registration: %s\n",
            nativeGlowFound ? "ready" : "unavailable");
+    printf("[Misc] Disable Drifter Darkness hooks: %s\n",
+           InstallDrifterDarknessHooks() ? "installed" : "unavailable");
+#endif
 
     {
         std::ofstream marker(
@@ -2759,7 +4077,9 @@ DWORD WINAPI InitializeThread(LPVOID) {
     stopHeroDiscoveryEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
     if (stopHeroDiscoveryEvent) {
         heroDiscoveryThread = CreateThread(nullptr, 0, HeroDiscoveryWorker, nullptr, 0, nullptr);
+#ifndef DLL6_MOVEMENT_ONLY
         farmTargetThread = CreateThread(nullptr, 0, FarmTargetWorker, nullptr, 0, nullptr);
+#endif
         if (heroDiscoveryThread)
             SetThreadPriority(heroDiscoveryThread, THREAD_PRIORITY_BELOW_NORMAL);
         if (farmTargetThread)
@@ -2768,7 +4088,9 @@ DWORD WINAPI InitializeThread(LPVOID) {
         // CGlowProperty worker is intentionally disabled because it competes
         // with the outline renderer and creates a jittering second layer.
     }
+#ifndef DLL6_MOVEMENT_ONLY
     InstallModelGlowHook();
+#endif
     // Keep the serializer untouched. Silent is applied in CreateMove, where
     // the current command and movement values are available together.
     printf("[!] CUserCmd_to_network silent hook disabled\n");
@@ -2797,7 +4119,10 @@ DWORD WINAPI InitializeThread(LPVOID) {
     printf("[+] CreateMove hook: %s\n", InstallCreateMoveHook(userCmdFunctions) ? "installed" : "not installed");
     printf("[+] Input lock hooks: %s\n", InstallInputLockHooks() ? "installed" : "not installed");
     printf("[+] Free camera origin patch: signature ready\n");
+#ifndef DLL6_MOVEMENT_ONLY
     printf("[+] Sound event hook: %s\n", InstallSoundEventHook() ? "installed" : "not installed");
+#endif
     SetupHooks();
+    if (moduleReadyEvent) SetEvent(moduleReadyEvent);
     return 0;
 }

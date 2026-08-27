@@ -1,0 +1,6 @@
+#include "launcher_resource.h"
+
+IDI_AXIOM_ICON ICON "assets\\axiom.ico"
+IDR_PAYLOAD_DLL RCDATA "x64\\Release\\Dll6.dll"
+IDR_AXIOM_LOGO RCDATA "assets\\deadlock_logo_exact.png"
+IDR_AXIOM_BACKGROUND RCDATA "assets\\axiom-background.png"
