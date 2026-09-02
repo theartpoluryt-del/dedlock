@@ -13,6 +13,7 @@
 #include <unordered_set>
 #include <mutex>
 #include <atomic>
+#include <memory>
 #include <cmath>
 #include <cfloat>
 
@@ -43,6 +44,12 @@ std::string GetVirtualKeyDisplayName(int key);
 struct BoneSegment { Vector3 start; Vector3 end; };
 struct AbilityEspData { int level{}; float cooldown{}; float cooldownDuration{}; bool valid{}; };
 struct PlayerData { uintptr_t entity{}; Vector3 pos; Vector3 worldPos; Vector3 visualAnchor; Vector3 headPos; Vector3 neckPos; Vector3 bodyPos; Vector3 leftArmPos; Vector3 rightArmPos; Vector3 leftLegPos; Vector3 rightLegPos; bool hasVisualAnchor=false; bool hasHeadBone=false; bool hasNeckBone=false; bool hasBodyBone=false; bool hasLeftArmBone=false; bool hasRightArmBone=false; bool hasLeftLegBone=false; bool hasRightLegBone=false; std::vector<BoneSegment> bones; float boxLeft,boxTop,boxRight,boxBottom; float modelMinZ,modelMaxZ,modelHeight; int health,maxHealth,team; float distance; std::array<AbilityEspData,4> abilities{}; std::string heroName; std::string playerName; };
+struct VisualFrameSnapshot {
+    std::vector<PlayerData> players;
+    Matrix4x4 viewMatrix{};
+    uint64_t sequence{};
+    ULONGLONG capturedAt{};
+};
 struct FarmTarget { uintptr_t entity{}; Vector3 pos{}; int health{}; int maxHealth{}; uint8_t team{}; std::string className; };
 struct OrbTarget { uintptr_t entity{}; Vector3 pos{}; std::string className; uint32_t handle{}; uint8_t team{}; };
 struct WorldEspTarget { uintptr_t entity{}; Vector3 pos{}; std::string className; std::string designerName; };
@@ -107,7 +114,16 @@ extern std::atomic<float> movementDiagAfterYaw;
 extern std::atomic<unsigned long long> wishDirectionCalls;
 extern std::atomic<unsigned long long> wishDirectionCorrectionCalls;
 
-extern uintptr_t clientBase; extern bool menuOpen,drawEsp,drawBoxes,drawHealth,drawHealthValues,drawNames,drawDistance,drawSnaplines,drawFovCircle,drawFarmFovCircle,drawBones,farmAssist,autoLastHitOrbs,drawOrbEsp,drawSpectatorList,collisionDiagnostics,remSizedHull,glowEnabled,aimAssist,autoParry,imguiInitialized,consoleAttached; extern float fovCircleAlpha,farmFov,farmFovAlpha,snaplineAlpha; extern int aimAssistKey,farmAssistKey; extern bool aimKeyCapture,farmKeyCapture; extern Vector3 currentLocalPosition; extern bool currentLocalPositionReady; extern Vector3 currentCameraPosition; extern bool currentCameraPositionReady; extern uintptr_t currentLocalPawn; extern uint32_t currentLocalPawnHandle; extern std::mutex meleeObjectsMutex; extern std::vector<uintptr_t> meleeObjects; extern std::mutex silentAnglesMutex; extern Vector3 pendingSilentAngles; extern bool pendingSilentAnglesReady,pendingSilentAttack; extern std::mutex humanSilentMutex,creepSilentMutex,orbSilentMutex; extern Vector3 pendingHumanAngles,pendingCreepAngles,pendingOrbAngles; extern bool pendingHumanReady,pendingCreepReady,pendingOrbReady,pendingOrbAttack; extern std::mutex farmTargetsMutex; extern std::vector<FarmTarget> farmTargets; extern std::mutex orbTargetsMutex; extern std::vector<OrbTarget> orbTargets; extern std::mutex worldEspTargetsMutex; extern std::vector<WorldEspTarget> worldEspTargets;
+extern uintptr_t clientBase; extern bool menuOpen,drawEsp,drawBoxes,drawHealth,drawHealthValues,drawNames,drawDistance,drawSnaplines,drawFovCircle,drawFarmFovCircle,drawBones,farmAssist,autoLastHitOrbs,drawOrbEsp,drawSpectatorList,collisionDiagnostics,remSizedHull,glowEnabled,aimAssist,autoParry,imguiInitialized,consoleAttached; extern float fovCircleAlpha,farmFov,farmFovAlpha,snaplineAlpha; extern int aimAssistKey,farmAssistKey; extern bool aimKeyCapture,farmKeyCapture; extern Vector3 currentLocalPosition; extern std::atomic_bool currentLocalPositionReady; extern Vector3 currentCameraPosition; extern std::atomic_bool currentCameraPositionReady; extern std::atomic<uintptr_t> currentLocalPawn; extern std::atomic<uint32_t> currentLocalPawnHandle; extern std::mutex meleeObjectsMutex; extern std::vector<uintptr_t> meleeObjects; extern std::mutex silentAnglesMutex; extern Vector3 pendingSilentAngles; extern bool pendingSilentAnglesReady,pendingSilentAttack; extern std::mutex humanSilentMutex,creepSilentMutex,orbSilentMutex; extern Vector3 pendingHumanAngles,pendingCreepAngles,pendingOrbAngles; extern bool pendingHumanReady,pendingCreepReady,pendingOrbReady,pendingOrbAttack; extern std::mutex farmTargetsMutex; extern std::vector<FarmTarget> farmTargets; extern std::mutex orbTargetsMutex; extern std::vector<OrbTarget> orbTargets; extern std::mutex worldEspTargetsMutex; extern std::vector<WorldEspTarget> worldEspTargets;
+extern std::atomic<float> overlayProjectionWidth, overlayProjectionHeight;
+extern bool pendingOrbHoldAttack;
+extern std::atomic_bool gameTextInputActive;
+bool AreCustomBindsSuppressed();
+void UpdateGameTextInputKey(int key, bool down);
+void ResetGameTextInputState();
+void SetGameImeInputActive();
+void NotifyGameCursorCapture(bool captured);
+extern std::mutex visualFrameStateMutex;
 extern std::mutex movementDebugTargetMutex; extern Vector3 movementDebugTarget; extern bool movementDebugTargetReady;
 extern std::mutex movementDebugWishMutex; extern Vector3 movementDebugWishDirection; extern bool movementDebugWishReady;
 bool GetCurrentCameraForward(Vector3& forward);
@@ -167,8 +183,6 @@ extern bool enemyRadarEnabled;
 extern int enemyGlowMode, allyGlowMode;
 extern bool enemyChamsEnabled, allyChamsEnabled;
 extern float enemyChamsColor[4], allyChamsColor[4];
-extern bool enemyInvisibleChamsEnabled, allyInvisibleChamsEnabled;
-extern float enemyInvisibleChamsColor[4], allyInvisibleChamsColor[4];
 extern bool creepEspEnabled, neutralCreepEspEnabled, creepBoxesEnabled, creepCornerBoxesEnabled;
 extern bool creepHealthEnabled, creepHealthValuesEnabled, creepDistanceEnabled;
 extern float creepBoxColor[4], creepHealthColor[4], creepHealthValueColor[4];
@@ -232,11 +246,20 @@ void QueueHeroSilentAngles(const Vector3& angles, bool attack,
 void ClearHeroSilentAngles();
 void FlushCurrentCameraAim();
 void UpdateVisibleAimCamera();
-extern ID3D11Device* pDevice; extern ID3D11DeviceContext* pContext; extern ID3D11RenderTargetView* pRenderTargetView; extern HWND gameWindow; extern WNDPROC oWndProc; extern HMODULE moduleHandle; extern HANDLE moduleInstanceGuard,moduleReadyEvent; extern void** presentVTable; extern volatile LONG unloadRequested,unloadThreadStarted; extern std::mutex glowMutex,heroPawnsMutex; extern std::unordered_set<uintptr_t> registeredGlows,queuedGlows; extern EspStatus espStatus; extern std::unordered_map<uintptr_t,bool> combatVTables; extern std::vector<uintptr_t> heroVTables,heroPawns; extern HANDLE heroDiscoveryThread,glowApplyThread,farmTargetThread,stopHeroDiscoveryEvent; extern PresentFn oPresent;
+using ResizeBuffersFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT,
+                                            UINT, DXGI_FORMAT, UINT);
+extern ID3D11Device* pDevice; extern ID3D11DeviceContext* pContext; extern ID3D11RenderTargetView* pRenderTargetView; extern HWND gameWindow; extern WNDPROC oWndProc; extern HMODULE moduleHandle; extern HANDLE moduleInstanceGuard,moduleReadyEvent,manualMapInfoHandle; extern bool manualMappedModule; extern void** presentVTable; extern volatile LONG unloadRequested,unloadThreadStarted; extern std::mutex glowMutex,heroPawnsMutex; extern std::unordered_set<uintptr_t> registeredGlows,queuedGlows; extern EspStatus espStatus; extern std::unordered_map<uintptr_t,bool> combatVTables; extern std::vector<uintptr_t> heroVTables,heroPawns; extern HANDLE heroDiscoveryThread,glowApplyThread,farmTargetThread,stopHeroDiscoveryEvent; extern PresentFn oPresent; extern ResizeBuffersFn oResizeBuffers;
 template<typename T> T Read(uintptr_t address) { T value{}; if (!address) return value; __try { value=*reinterpret_cast<T*>(address); } __except(EXCEPTION_EXECUTE_HANDLER) { value=T{}; } return value; }
 template<typename T> void Write(uintptr_t address,const T& value) { if (!address) return; __try { *reinterpret_cast<T*>(address)=value; } __except(EXCEPTION_EXECUTE_HANDLER) {} }
- bool WorldToScreen(const Vector3&,Vector2&,const Matrix4x4&); void ArmGameDepthCapture(); void TrackGameDepthStencil(ID3D11DepthStencilView*); bool CaptureDepthSnapshot(); bool ReadDepthAt(float,float,float&); bool IsDepthBufferPopulated(); bool GetEntityBonePosition(uintptr_t,const char*,Vector3&); bool GetEntityBoneSkeleton(uintptr_t,std::vector<BoneSegment>&); bool GetEntityPreviewSkeleton(uintptr_t,std::array<Vector3,18>&,std::array<bool,18>&); bool GetAimPointScreen(const PlayerData&,float,Vector2&); bool GetAimAnglesFromScreen(float,float,Vector3&); bool IsAimPointVisible(const PlayerData&,float,float,float); bool IsWorldAimPointVisible(const Vector3&,uintptr_t=0); void ProcessAimVisibilityTraces(); void AimAtClosestEnemy(const std::vector<PlayerData>&); void FarmAimAssist(const std::vector<PlayerData>&); void AutoLastHitOrbs(); void AutoParry(const std::vector<PlayerData>&); void ReleaseAimResources();
+ bool WorldToScreen(const Vector3&,Vector2&,const Matrix4x4&); bool ReadLiveViewMatrixSnapshot(Matrix4x4&); bool GetSceneRenderViewMatrix(Matrix4x4&); void ArmGameDepthCapture(); void TrackGameDepthStencil(ID3D11DepthStencilView*); bool CaptureDepthSnapshot(); bool ReadDepthAt(float,float,float&); bool IsDepthBufferPopulated(); bool GetEntityBonePosition(uintptr_t,const char*,Vector3&); bool PopulatePlayerAimBones(uintptr_t,PlayerData&,bool); bool GetEntityBoneSkeleton(uintptr_t,std::vector<BoneSegment>&); bool GetEntityPreviewSkeleton(uintptr_t,std::array<Vector3,18>&,std::array<bool,18>&); bool GetAimPointScreen(const PlayerData&,float,Vector2&); bool GetAimAnglesFromScreen(float,float,Vector3&); bool IsAimPointVisible(const PlayerData&,float,float,float); bool IsWorldAimPointVisible(const Vector3&,uintptr_t=0); bool TryGetWorldVisibilitySnapshot(const Vector3&,uintptr_t,bool&); void ProcessAimVisibilityTraces(); void AimAtClosestEnemy(const std::vector<PlayerData>&); void FarmAimAssist(const std::vector<PlayerData>&); void AutoLastHitOrbs(); void AutoParry(const std::vector<PlayerData>&); void ReleaseAimResources();
+void SignalEarlyFrameFence(ID3D11DeviceContext* context);
+void RequestVisualFrameSnapshot();
+void PublishVisualFrameSnapshot();
+std::shared_ptr<const VisualFrameSnapshot> AcquireVisualFrameSnapshot();
+bool InstallVisualFrameHook();
+void RemoveVisualFrameHook();
 void UpdateAimTargetLock(const std::vector<PlayerData>& players);
+void UpdateModelChamsVisibility(const std::vector<PlayerData>& players);
 Vector3 PredictPlayerAimPoint(uintptr_t target, const Vector3& point,
                               const Vector3& targetOrigin);
 void NotifyAntiFrogDamage(int attackerEntityIndex, int victimEntityIndex,
@@ -257,7 +280,7 @@ void RestoreWorldRenderState();
 void DebugEntityHandle(uint32_t);
 float GetClientGameTime();
 float GetCampGameTime();
-void SetMenuOpen(bool); bool InstallInputLockHooks(); void RemoveInputLockHooks(); std::vector<PlayerData> GetPlayers(); void RenderESP(const std::vector<PlayerData>&); void RenderMenu(size_t); void RestorePresentHook(); void ShutdownOverlay(); DWORD WINAPI UnloadThread(LPVOID); void RequestUnload(); HRESULT __stdcall hkPresent(IDXGISwapChain*,UINT,UINT); LRESULT __stdcall hkWndProc(HWND,UINT,WPARAM,LPARAM); void* DetourFunc(BYTE*,const BYTE*,const int); void SetupHooks(); DWORD WINAPI InitializeThread(LPVOID);
+void SetMenuOpen(bool); bool InstallInputLockHooks(); void RemoveInputLockHooks(); std::vector<PlayerData> GetPlayers(); void RenderESP(const std::vector<PlayerData>&); void RenderMenu(size_t); void RestorePresentHook(); void ShutdownOverlay(); DWORD WINAPI UnloadThread(LPVOID); void RequestUnload(); HRESULT __stdcall hkPresent(IDXGISwapChain*,UINT,UINT); HRESULT __stdcall hkResizeBuffers(IDXGISwapChain*,UINT,UINT,UINT,DXGI_FORMAT,UINT); LRESULT __stdcall hkWndProc(HWND,UINT,WPARAM,LPARAM); void* DetourFunc(BYTE*,const BYTE*,const int); void SetupHooks(); DWORD WINAPI InitializeThread(LPVOID);
 bool InstallOrbEntityHooks(); void RemoveOrbEntityHooks();
 struct UserCmdFunctionAddresses; bool InstallUserCmdHook(); bool InstallCreateMoveHook(const UserCmdFunctionAddresses&); void RemoveUserCmdHook();
 extern bool aimSilentMode;  // true = silent (без движения мыши)

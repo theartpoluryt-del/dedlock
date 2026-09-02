@@ -113,16 +113,71 @@ std::atomic_bool renderDepthProbeLogged = false;
 std::atomic_bool renderDepthHookInstalling = false;
 std::atomic_int nativeGlowRenderPassCount = 0;
 std::atomic_bool glowCompositeHookInstalling = false;
-thread_local bool nativeGlowCompositeActive = false;
+// A single composite hook is shared by hero highlights and the game's native
+// creep/tower/object highlights. Track what the current renderer invocation
+// actually submitted so x10 opacity is never applied globally.
+bool nativeGlowRendererActive = false;
+bool nativeGlowOpaqueHeroSeen = false;
+// PlayerHealthGlowRenderer schedules outline work on a render worker.  The
+// pass selector therefore has to cross threads; a thread_local flag leaves the
+// worker at false and makes ordinary x1 glow participate in every x10 pass.
+std::atomic_bool nativeGlowOpaqueOnlyPass = false;
+int nativeGlowCompositeRepeats = 1;
 std::atomic_uintptr_t renderInvisibleChamsContext = 0;
 std::atomic_uintptr_t invisiblePassOriginalDepth = 0;
 std::atomic_uint32_t invisiblePassOriginalStencilRef = 0;
 std::atomic_bool invisiblePassDepthCaptured = false;
 std::mutex invisiblePassMutex;
+std::recursive_mutex worldSceneMutex;
+std::recursive_mutex lightSceneMutex;
 std::atomic_uint64_t drawCallCount = 0;
 std::atomic_uint64_t glowDrawCallCount = 0;
 std::atomic_uint64_t glowPipelineCount = 0;
 std::atomic_uint64_t enemyBatchCount = 0;
+struct NativeGlowContextMark {
+    std::atomic_uintptr_t context{0};
+};
+std::array<NativeGlowContextMark, 4096> nativeGlowContexts{};
+struct ChamsVisibilitySlot {
+    std::atomic_uintptr_t pawn{0};
+    std::atomic_bool visible{true};
+};
+std::array<ChamsVisibilitySlot, 256> chamsVisibility{};
+
+void PublishChamsVisibility(uintptr_t pawn, bool visible) {
+    if (!pawn) return;
+    const size_t base = ((pawn >> 4) ^ (pawn >> 16)) &
+        (chamsVisibility.size() - 1);
+    for (size_t probe = 0; probe < 8; ++probe) {
+        auto& slot = chamsVisibility[
+            (base + probe) & (chamsVisibility.size() - 1)];
+        uintptr_t stored = slot.pawn.load(std::memory_order_acquire);
+        if (stored == pawn) {
+            slot.visible.store(visible, std::memory_order_release);
+            return;
+        }
+        if (!stored && slot.pawn.compare_exchange_strong(
+                stored, pawn, std::memory_order_acq_rel)) {
+            slot.visible.store(visible, std::memory_order_release);
+            return;
+        }
+    }
+}
+
+bool IsPawnSceneVisible(uintptr_t pawn) {
+    if (!pawn) return true;
+    const size_t base = ((pawn >> 4) ^ (pawn >> 16)) &
+        (chamsVisibility.size() - 1);
+    for (size_t probe = 0; probe < 8; ++probe) {
+        const auto& slot = chamsVisibility[
+            (base + probe) & (chamsVisibility.size() - 1)];
+        const uintptr_t stored = slot.pawn.load(std::memory_order_acquire);
+        if (stored == pawn)
+            return slot.visible.load(std::memory_order_acquire);
+        if (!stored) break;
+    }
+    return true;
+}
 
 constexpr char DrawModelPattern[] =
     "48 8B C4 53 57 41 54 48 81 EC D0 00 00";
@@ -151,6 +206,9 @@ constexpr size_t MeshMaterialDescriptor = 0x08;
 constexpr size_t MaterialDescriptorSize = 0x108;
 constexpr size_t MaterialTintOffset = 0x04;
 constexpr size_t MaterialAlphaOffset = 0x10;
+constexpr uintptr_t RenderContextDirtyFlags = 0x3F8;
+constexpr uintptr_t RenderContextDepthState = 0xE88;
+constexpr uintptr_t RenderContextStencilRef = 0xE90;
 struct alignas(8) MeshEntryCopy {
     std::array<uint8_t, MeshEntryStride> bytes;
 };
@@ -172,6 +230,64 @@ void LogGlowCounters() {
            << " glowDraw=" << glowDrawCallCount.load()
            << " glowPipeline=" << glowPipelineCount.load();
     LogGlowHook(stream.str().c_str());
+}
+
+void MarkNativeGlowContext(void* context) {
+    const uintptr_t value = reinterpret_cast<uintptr_t>(context);
+    if (!value) return;
+    const size_t base =
+        ((value >> 12) ^ (value >> 24)) & (nativeGlowContexts.size() - 1);
+    for (size_t probe = 0; probe < 8; ++probe) {
+        auto& mark = nativeGlowContexts[
+            (base + probe) & (nativeGlowContexts.size() - 1)];
+        uintptr_t stored = mark.context.load(std::memory_order_acquire);
+        if (stored == value) return;
+        if (!stored) {
+            if (mark.context.compare_exchange_strong(
+                    stored, value, std::memory_order_acq_rel))
+                return;
+        }
+    }
+    // Probe the complete table only on the very unlikely local bucket
+    // overflow. Context identity remains stable for the lifetime of this DLL;
+    // expiring it made the two passes alternate and visibly flicker.
+    for (auto& mark : nativeGlowContexts) {
+        uintptr_t empty = 0;
+        if (mark.context.compare_exchange_strong(
+                empty, value, std::memory_order_acq_rel) || empty == value)
+            return;
+    }
+}
+
+bool IsNativeGlowContext(uintptr_t context) {
+    if (!context) return false;
+    const size_t base =
+        ((context >> 12) ^ (context >> 24)) &
+        (nativeGlowContexts.size() - 1);
+    for (size_t probe = 0; probe < 8; ++probe) {
+        const auto& mark = nativeGlowContexts[
+            (base + probe) & (nativeGlowContexts.size() - 1)];
+        if (mark.context.load(std::memory_order_acquire) == context)
+            return true;
+    }
+    for (const auto& mark : nativeGlowContexts) {
+        if (mark.context.load(std::memory_order_acquire) == context)
+            return true;
+    }
+    return false;
+}
+
+void UnmarkNativeGlowContext(void* context) {
+    const uintptr_t value = reinterpret_cast<uintptr_t>(context);
+    if (!value) return;
+    for (auto& mark : nativeGlowContexts) {
+        uintptr_t stored = mark.context.load(std::memory_order_acquire);
+        if (stored == value) {
+            mark.context.compare_exchange_strong(
+                stored, 0, std::memory_order_acq_rel);
+            return;
+        }
+    }
 }
 
 bool CreateFlatChamsMaterial() {
@@ -257,7 +373,7 @@ g_tAmbientOcclusion = resource:"materials/default/default_ao_tga_559f1ac6.vtex"
         void** invisibleHandle = nullptr;
         createMaterial(
             nullptr, &invisibleHandle,
-            "materials/axiom_invisible_chams_1.vmat",
+            "materials/axiom_invisible_chams_3.vmat",
             invisibleKv3, 0, 1);
         invisibleChamsMaterial = invisibleHandle ? *invisibleHandle : nullptr;
     }
@@ -325,18 +441,18 @@ uintptr_t FindGeneratePrimitivesTarget(HMODULE sceneModule) {
     const uintptr_t constructor = FindPattern(
         sceneModule, GeneratePrimitivesVtablePattern);
     if (!constructor) return 0;
-
-    const int32_t displacement = Read<int32_t>(constructor + 3);
-    const uintptr_t vtable = constructor + 7 + displacement;
-    const uintptr_t candidate = Read<uintptr_t>(vtable + 0x20);
-    if (!candidate) return 0;
-
     MODULEINFO info{};
     if (!GetModuleInformation(
             GetCurrentProcess(), sceneModule, &info, sizeof(info)))
         return 0;
     const uintptr_t begin = reinterpret_cast<uintptr_t>(info.lpBaseOfDll);
     const uintptr_t end = begin + info.SizeOfImage;
+    if (constructor < begin || constructor > end - 7) return 0;
+    const int32_t displacement = Read<int32_t>(constructor + 3);
+    const uintptr_t vtable = constructor + 7 + displacement;
+    if (vtable < begin || vtable > end - 0x28) return 0;
+    const uintptr_t candidate = Read<uintptr_t>(vtable + 0x20);
+    if (!candidate) return 0;
     return candidate >= begin && candidate < end ? candidate : 0;
 }
 
@@ -344,9 +460,18 @@ uintptr_t FindDrawSceneObjectTarget(HMODULE sceneModule) {
     const uintptr_t constructor = FindPattern(
         sceneModule, GeneratePrimitivesVtablePattern);
     if (!constructor) return 0;
+    MODULEINFO info{};
+    if (!GetModuleInformation(
+            GetCurrentProcess(), sceneModule, &info, sizeof(info)))
+        return 0;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(info.lpBaseOfDll);
+    const uintptr_t end = begin + info.SizeOfImage;
+    if (constructor < begin || constructor > end - 7) return 0;
     const int32_t displacement = Read<int32_t>(constructor + 3);
     const uintptr_t vtable = constructor + 7 + displacement;
-    return Read<uintptr_t>(vtable + 0x08);
+    if (vtable < begin || vtable > end - 0x10) return 0;
+    const uintptr_t candidate = Read<uintptr_t>(vtable + 0x08);
+    return candidate >= begin && candidate < end ? candidate : 0;
 }
 
 uintptr_t FindRelativeCallTarget(HMODULE module, const char* pattern) {
@@ -432,7 +557,6 @@ bool IsGlowEnabledForPawn(uintptr_t pawn) {
     const uint8_t pawnTeam = Read<uint8_t>(pawn + Offsets::Team);
     if (pawnTeam != 2 && pawnTeam != 3) return false;
     const bool ally = localTeam >= 2 && localTeam <= 3 && pawnTeam == localTeam;
-    const bool teamEspEnabled = ally ? allyEspEnabled : enemyEspEnabled;
     const float maxDistance = ally ? allyEspMaxDistance : enemyEspMaxDistance;
     if (currentLocalPositionReady) {
         Vector3 position{};
@@ -444,7 +568,7 @@ bool IsGlowEnabledForPawn(uintptr_t pawn) {
             if (!std::isfinite(distance) || distance > maxDistance) return false;
         }
     }
-    return teamEspEnabled && (ally ? allyGlowEnabled : enemyGlowEnabled);
+    return ally ? allyGlowEnabled : enemyGlowEnabled;
 }
 
 bool IsChamsEnabledForPawn(uintptr_t pawn) {
@@ -454,9 +578,7 @@ bool IsChamsEnabledForPawn(uintptr_t pawn) {
     if ((localTeam != 2 && localTeam != 3) ||
         (pawnTeam != 2 && pawnTeam != 3)) return false;
     const bool ally = pawnTeam == localTeam;
-    const bool enabled = ally
-        ? (allyChamsEnabled || allyInvisibleChamsEnabled)
-        : (enemyChamsEnabled || enemyInvisibleChamsEnabled);
+    const bool enabled = ally ? allyChamsEnabled : enemyChamsEnabled;
     if (!enabled) return false;
     if (currentLocalPositionReady) {
         Vector3 position{};
@@ -515,9 +637,10 @@ bool IsEnemyHeroMesh(uintptr_t entry) {
 }
 
 bool IsEnemyOutlinePawn(uintptr_t pawn) {
-    // This is the player's outline query, so keep the render callback free of
-    // locks, entity scans, and transient health/team reads. Those operations
-    // can stall the render worker and show up as visible outline jitter.
+    // HookPlayerOutline is already the player-outline query.  Do not filter
+    // it through a hard-coded hero-id list: training dummies, newly added
+    // heroes and some replay pawns can expose a different/zero spawned id and
+    // would lose glow completely while their visible chams still worked.
     return pawn != 0 && pawn != currentLocalPawn;
 }
 
@@ -528,14 +651,9 @@ bool IsNormalFillPawn(uintptr_t pawn) {
     if ((localTeam != 2 && localTeam != 3) ||
         (pawnTeam != 2 && pawnTeam != 3)) return false;
     const bool ally = pawnTeam == localTeam;
-    const bool teamEspEnabled = ally ? allyEspEnabled : enemyEspEnabled;
-    const bool invisibleChamsEnabled = ally
-        ? allyInvisibleChamsEnabled : enemyInvisibleChamsEnabled;
     const bool normalGlowFill = (ally ? allyGlowEnabled : enemyGlowEnabled) &&
                                 (ally ? allyGlowMode : enemyGlowMode) == 1;
-    // Invisible Chams always use the complete model mask. Their coverage must
-    // never inherit the HP-clipped mode selected for ordinary native glow.
-    return teamEspEnabled && (invisibleChamsEnabled || normalGlowFill);
+    return normalGlowFill;
 }
 
 static uint32_t GlowPackedColor(const float color[4]) {
@@ -551,86 +669,12 @@ void __fastcall HookGeneratePrimitives(
     uintptr_t primitiveBuffer) {
     if (!originalGeneratePrimitives) return;
 
-    const bool chamsActive = enemyChamsEnabled || allyChamsEnabled;
-    if (!chamsActive || !flatChamsMaterial || !sceneObject ||
-        !primitiveBuffer || !currentLocalPawn) {
-        originalGeneratePrimitives(
-            thisptr, sceneObject, sceneView, primitiveBuffer);
-        return;
-    }
-
-    struct CachedOwner {
-        uint32_t handle{0xFFFFFFFFu};
-        uintptr_t pawn{};
-        bool hero{};
-    };
-    thread_local std::array<CachedOwner, 128> ownerCache{};
-
-    const uint32_t ownerHandle = Read<uint32_t>(
-        sceneObject + SceneObjectOwner);
-    auto& cached = ownerCache[ownerHandle % ownerCache.size()];
-    if (cached.handle != ownerHandle) {
-        cached.handle = ownerHandle;
-        cached.pawn = ResolveEntity(ownerHandle);
-        cached.hero = false;
-    }
-    if (cached.pawn && cached.pawn != currentLocalPawn && !cached.hero) {
-        std::lock_guard<std::mutex> lock(heroPawnsMutex);
-        cached.hero = std::find(
-            heroPawns.begin(), heroPawns.end(), cached.pawn) !=
-            heroPawns.end();
-    }
-    const uintptr_t pawn = cached.pawn;
-    if (!pawn || pawn == currentLocalPawn) {
-        originalGeneratePrimitives(
-            thisptr, sceneObject, sceneView, primitiveBuffer);
-        return;
-    }
-
-    // Reject the overwhelming majority of scene objects before taking the
-    // hero-list lock or performing any distance/health work.
-    const uint8_t pawnTeam = Read<uint8_t>(pawn + Offsets::Team);
-    if (pawnTeam != 2 && pawnTeam != 3) {
-        originalGeneratePrimitives(
-            thisptr, sceneObject, sceneView, primitiveBuffer);
-        return;
-    }
-
-    if (!cached.hero || !IsChamsEnabledForPawn(pawn)) {
-        originalGeneratePrimitives(
-            thisptr, sceneObject, sceneView, primitiveBuffer);
-        return;
-    }
-
-    const int previousCount = Read<int>(primitiveBuffer + 0xC);
+    // Keep generated primitives on their original game material.  These
+    // primitives are reused asynchronously by PlayerHealthGlowRenderer; a
+    // persistent material replacement here makes visible chams leak into the
+    // outline mask and causes the glow to disappear behind walls.  Visible
+    // chams are applied transiently in HookDrawModel instead.
     originalGeneratePrimitives(thisptr, sceneObject, sceneView, primitiveBuffer);
-
-    const int primitiveCount = Read<int>(primitiveBuffer + 0xC);
-    const uintptr_t primitives = Read<uintptr_t>(primitiveBuffer);
-    if (!primitives || previousCount < 0 || primitiveCount < previousCount ||
-        primitiveCount - previousCount > 256)
-        return;
-
-    const uint8_t localTeam =
-        Read<uint8_t>(currentLocalPawn + Offsets::Team);
-    const bool ally = localTeam >= 2 && localTeam <= 3 &&
-                      pawnTeam == localTeam;
-    const float* sourceColor = ally ? allyChamsColor : enemyChamsColor;
-    const float colorComponents[4] = {
-        sourceColor[0], sourceColor[1], sourceColor[2], 1.0f};
-    const uint32_t color = GlowPackedColor(colorComponents);
-
-    for (int i = previousCount; i < primitiveCount; ++i) {
-        const uintptr_t primitive =
-            primitives + static_cast<uintptr_t>(i) * 0x68;
-        Write<uintptr_t>(primitive + 0x20,
-                         reinterpret_cast<uintptr_t>(flatChamsMaterial));
-        Write<uint32_t>(primitive + 0x50, color);
-    }
-
-    if (primitiveCount > previousCount &&
-        !firstEnemyPassLogged.exchange(true))
-        LogGlowHook("first GeneratePrimitives chams override applied");
 }
 
 __int64 __fastcall HookPlayerOutline(
@@ -638,16 +682,22 @@ __int64 __fastcall HookPlayerOutline(
     const __int64 originalResult = originalPlayerOutline
         ? originalPlayerOutline(pawn, color, width) : 0;
 
-    if (IsEnemyOutlinePawn(static_cast<uintptr_t>(pawn))) {
+    const bool heroPawn = IsEnemyOutlinePawn(static_cast<uintptr_t>(pawn));
+    if (!heroPawn) {
+        // Additional opacity passes must contain no native creep, tower,
+        // structure or other game highlight pixels.
+        return nativeGlowOpaqueOnlyPass.load(std::memory_order_acquire)
+            ? 0 : originalResult;
+    }
+
+    if (heroPawn) {
         const uint8_t localTeam = currentLocalPawn
             ? Read<uint8_t>(currentLocalPawn + Offsets::Team) : 0;
         const uint8_t pawnTeam = Read<uint8_t>(static_cast<uintptr_t>(pawn) + Offsets::Team);
         const bool validTeam = pawnTeam == 2 || pawnTeam == 3;
         const bool ally = localTeam >= 2 && localTeam <= 3 && pawnTeam == localTeam;
-        const bool teamEspEnabled = ally ? allyEspEnabled : enemyEspEnabled;
         const bool teamGlowEnabled = ally ? allyGlowEnabled : enemyGlowEnabled;
-        const bool teamInvisibleChamsEnabled = ally
-            ? allyInvisibleChamsEnabled : enemyInvisibleChamsEnabled;
+        const bool teamChamsEnabled = ally ? allyChamsEnabled : enemyChamsEnabled;
         const float maxDistance = ally ? allyEspMaxDistance : enemyEspMaxDistance;
         bool withinDistance = true;
         if (currentLocalPositionReady) {
@@ -660,37 +710,22 @@ __int64 __fastcall HookPlayerOutline(
                 withinDistance = std::isfinite(distance) && distance <= maxDistance;
             }
         }
-        if (!validTeam) return originalResult;
-        if (!teamEspEnabled ||
-            (!teamGlowEnabled && !teamInvisibleChamsEnabled) ||
-            !withinDistance)
+        if (!validTeam)
+            return nativeGlowOpaqueOnlyPass.load(std::memory_order_acquire)
+                ? 0 : originalResult;
+        if (!teamGlowEnabled || !withinDistance)
             return 0;
-        const float* glowColor = teamInvisibleChamsEnabled
-            ? (ally ? allyInvisibleChamsColor : enemyInvisibleChamsColor)
-            : (ally ? teammateGlowColor : enemyGlowColor);
+        // Chams and native glow are mutually exclusive for the same target:
+        // visible target -> Chams, occluded target -> Glow.
+        if (teamChamsEnabled &&
+            IsPawnSceneVisible(static_cast<uintptr_t>(pawn)))
+            return 0;
+        const float* glowColor = ally ? teammateGlowColor : enemyGlowColor;
 
         float adjusted[4] = {
             glowColor[0], glowColor[1], glowColor[2], glowColor[3]};
-        if (teamInvisibleChamsEnabled) {
-            constexpr float saturationBoost = 1.25f;
-            const float average =
-                (glowColor[0] + glowColor[1] + glowColor[2]) / 3.0f;
-            adjusted[0] = std::clamp(
-                average + (glowColor[0] - average) * saturationBoost,
-                0.0f, 1.0f);
-            adjusted[1] = std::clamp(
-                average + (glowColor[1] - average) * saturationBoost,
-                0.0f, 1.0f);
-            adjusted[2] = std::clamp(
-                average + (glowColor[2] - average) * saturationBoost,
-                0.0f, 1.0f);
-            adjusted[3] = 1.0f;
-        }
         if (color) *color = GlowPackedColor(adjusted);
-        // Repeating the native fill to reach opaque coverage must not also
-        // accumulate its temporally-jittered edge blur. Invisible Chams use
-        // the solid interior mask only; ordinary Glow keeps its outline.
-        if (width) *width = teamInvisibleChamsEnabled ? 0.0f : 4.0f;
+        if (width) *width = 4.0f;
 
         // Preserve the existing HP-based mode. Normal fill now follows the
         // get_outline_mode hook contract supplied for the full outline: mode 2.
@@ -713,9 +748,14 @@ void __fastcall HookGlowComposite(
     void* context, int a2, int a3, int a4,
     int a5, int a6, int a7, int a8) {
     if (!originalGlowComposite) return;
-    const int passCount = nativeGlowCompositeActive ? 10 : 1;
-    for (int pass = 0; pass < passCount; ++pass)
-        originalGlowComposite(context, a2, a3, a4, a5, a6, a7, a8);
+    // The normal mixed mask uses one composite. A separately rebuilt mask
+    // containing only invisible-chams heroes uses nine composites, producing
+    // x10 total together with its one normal-pass layer.
+    originalGlowComposite(context, a2, a3, a4, a5, a6, a7, a8);
+    // This is the terminal operation for the deferred native-glow context.
+    // Release its identity immediately so the renderer may recycle the same
+    // context for the ordinary scene without suppressing Visible Chams.
+    UnmarkNativeGlowContext(context);
 }
 
 void EnsureGlowCompositeHook(void* renderContext) {
@@ -756,17 +796,12 @@ void EnsureGlowCompositeHook(void* renderContext) {
 void __fastcall HookPlayerHealthGlowRender(
     void* renderer, void* arg1, void* arg2, void* arg3) {
     if (originalPlayerHealthGlowRender) {
-        const bool useOpaqueGlowPass = enemyInvisibleChamsEnabled ||
-                                       allyInvisibleChamsEnabled;
         EnsureGlowCompositeHook(arg2);
-        if (useOpaqueGlowPass)
-            nativeGlowRenderPassCount.fetch_add(1, std::memory_order_acq_rel);
-        nativeGlowCompositeActive = useOpaqueGlowPass &&
-                                    glowCompositeTarget != nullptr;
+        MarkNativeGlowContext(arg2);
+        nativeGlowRenderPassCount.fetch_add(1, std::memory_order_acq_rel);
+        nativeGlowOpaqueOnlyPass.store(false, std::memory_order_release);
         originalPlayerHealthGlowRender(renderer, arg1, arg2, arg3);
-        nativeGlowCompositeActive = false;
-        if (useOpaqueGlowPass)
-            nativeGlowRenderPassCount.fetch_sub(1, std::memory_order_acq_rel);
+        nativeGlowRenderPassCount.fetch_sub(1, std::memory_order_acq_rel);
     }
 }
 
@@ -1003,25 +1038,25 @@ void __fastcall HookRenderDepthState(
         return;
     }
 
-    struct alignas(8) DepthStateWrapperView {
-        std::array<uint8_t, 0x10> prefix{};
-        ID3D11DepthStencilState* state{};
-    } replacement{};
     __try {
-        std::memcpy(replacement.prefix.data(), stateWrapper, 0x10);
         bool expected = false;
         if (invisiblePassDepthCaptured.compare_exchange_strong(
                 expected, true, std::memory_order_acq_rel)) {
             invisiblePassOriginalDepth.store(
-                reinterpret_cast<uintptr_t>(
-                    *reinterpret_cast<ID3D11DepthStencilState**>(
-                        reinterpret_cast<uintptr_t>(stateWrapper) + 0x10)),
+                Read<uintptr_t>(context + RenderContextDepthState),
                 std::memory_order_release);
             invisiblePassOriginalStencilRef.store(
-                stencilRef, std::memory_order_release);
+                Read<uint32_t>(context + RenderContextStencilRef),
+                std::memory_order_release);
         }
-        replacement.state = invisibleChamsDepthState;
-        originalRenderDepthState(context, &replacement, stencilRef);
+        Write<uintptr_t>(
+            context + RenderContextDepthState,
+            reinterpret_cast<uintptr_t>(invisibleChamsDepthState));
+        Write<uint32_t>(context + RenderContextStencilRef, stencilRef);
+        Write<uint32_t>(
+            context + RenderContextDirtyFlags,
+            Read<uint32_t>(context + RenderContextDirtyFlags) | 8u);
+        return;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         originalRenderDepthState(context, stateWrapper, stencilRef);
     }
@@ -1033,15 +1068,15 @@ void RestoreInvisiblePassDepthState() {
     if (!originalRenderDepthState ||
         !invisiblePassDepthCaptured.load(std::memory_order_acquire) || !context)
         return;
-    struct alignas(8) DepthStateWrapperView {
-        std::array<uint8_t, 0x10> prefix{};
-        ID3D11DepthStencilState* state{};
-    } restore{};
-    restore.state = reinterpret_cast<ID3D11DepthStencilState*>(
+    Write<uintptr_t>(
+        context + RenderContextDepthState,
         invisiblePassOriginalDepth.load(std::memory_order_acquire));
-    originalRenderDepthState(
-        context, &restore,
+    Write<uint32_t>(
+        context + RenderContextStencilRef,
         invisiblePassOriginalStencilRef.load(std::memory_order_acquire));
+    Write<uint32_t>(
+        context + RenderContextDirtyFlags,
+        Read<uint32_t>(context + RenderContextDirtyFlags) | 8u);
     invisiblePassDepthCaptured.store(false, std::memory_order_release);
     invisiblePassOriginalDepth.store(0, std::memory_order_release);
     invisiblePassOriginalStencilRef.store(0, std::memory_order_release);
@@ -1115,6 +1150,9 @@ void ProbeRenderDepthMethod(uintptr_t renderContext) {
 uintptr_t __fastcall HookLightSceneObject(
     uintptr_t thisptr, uintptr_t object, uintptr_t a3) {
     const bool apply = worldModulationEnabled && object;
+    std::unique_lock<std::recursive_mutex> lock(
+        lightSceneMutex, std::defer_lock);
+    if (apply) lock.lock();
     const std::array<float, 3> original = apply
         ? std::array<float, 3>{Read<float>(object + 0xE4),
                                Read<float>(object + 0xE8),
@@ -1122,12 +1160,16 @@ uintptr_t __fastcall HookLightSceneObject(
         : std::array<float, 3>{};
     if (apply) {
         const float intensity = std::clamp(lightBrightness, 0.0f, 50.0f);
-        Write<float>(object + 0xE4,
-                     std::clamp(lightColor[0] * intensity, 0.0f, 50.0f));
-        Write<float>(object + 0xE8,
-                     std::clamp(lightColor[1] * intensity, 0.0f, 50.0f));
-        Write<float>(object + 0xEC,
-                     std::clamp(lightColor[2] * intensity, 0.0f, 50.0f));
+        const float desired[3] = {
+            std::clamp(original[0] * lightColor[0] * intensity, 0.0f, 50000.0f),
+            std::clamp(original[1] * lightColor[1] * intensity, 0.0f, 50000.0f),
+            std::clamp(original[2] * lightColor[2] * intensity, 0.0f, 50000.0f)};
+        if (std::fabs(original[0] - desired[0]) > 0.0001f)
+            Write<float>(object + 0xE4, desired[0]);
+        if (std::fabs(original[1] - desired[1]) > 0.0001f)
+            Write<float>(object + 0xE8, desired[1]);
+        if (std::fabs(original[2] - desired[2]) > 0.0001f)
+            Write<float>(object + 0xEC, desired[2]);
     }
     const uintptr_t result = originalLightSceneObject
         ? originalLightSceneObject(thisptr, object, a3) : 0;
@@ -1143,68 +1185,135 @@ void __fastcall HookDrawSceneObjectArray(
     uintptr_t thisptr, uintptr_t a2, uintptr_t objectArray) {
     if (originalDrawSceneObjectArray)
         originalDrawSceneObjectArray(thisptr, a2, objectArray);
-    if (!worldModulationEnabled || !objectArray || !lightDataQueueGlobal)
+    constexpr bool useQueuedWorldColorPass = true;
+    if (!useQueuedWorldColorPass || !worldModulationEnabled ||
+        !objectArray || !lightDataQueueGlobal)
         return;
-
     const uintptr_t objectData = Read<uintptr_t>(objectArray + 0x08);
     const uintptr_t queue = Read<uintptr_t>(lightDataQueueGlobal);
     const uintptr_t base = queue ? Read<uintptr_t>(queue + 0x18) : 0;
     if (!objectData || !base) return;
     const int count = Read<int>(objectData + 0x04);
     const int index = Read<int>(objectData + 0x30);
-    if (count <= 0 || count > 4096 || index < 0 || index > 65535)
-        return;
+    if (count <= 0 || count > 4096 || index < 0 || index > 65535) return;
     const uintptr_t first = base + (static_cast<uintptr_t>(index) << 5);
-    const size_t span = static_cast<size_t>(count - 1) * 0x20 +
-                        sizeof(ColorRGBA);
-    if (!IsWritableRange(first, span)) return;
-
+    const size_t span = static_cast<size_t>(count - 1) * 0x20 + sizeof(ColorRGBA);
+    const float intensity = std::clamp(lightBrightness, 0.0f, 50.0f);
     const ColorRGBA color = {
-        static_cast<uint8_t>(std::clamp(worldColor[0], 0.0f, 1.0f) * 255.0f),
-        static_cast<uint8_t>(std::clamp(worldColor[1], 0.0f, 1.0f) * 255.0f),
-        static_cast<uint8_t>(std::clamp(worldColor[2], 0.0f, 1.0f) * 255.0f),
-        255};
-    for (int i = 0; i < count; ++i)
-        Write<ColorRGBA>(first + static_cast<uintptr_t>(i) * 0x20, color);
+        static_cast<uint8_t>(std::clamp(
+            worldColor[0] * lightColor[0] * intensity, 0.0f, 1.0f) * 255.0f),
+        static_cast<uint8_t>(std::clamp(
+            worldColor[1] * lightColor[1] * intensity, 0.0f, 1.0f) * 255.0f),
+        static_cast<uint8_t>(std::clamp(
+            worldColor[2] * lightColor[2] * intensity, 0.0f, 1.0f) * 255.0f), 255};
+    const uint32_t packed = static_cast<uint32_t>(color.r) |
+        (static_cast<uint32_t>(color.g) << 8) |
+        (static_cast<uint32_t>(color.b) << 16) |
+        (static_cast<uint32_t>(color.a) << 24);
+    const auto sameColor = [&color](const ColorRGBA& value) {
+        return value.r == color.r && value.g == color.g &&
+               value.b == color.b && value.a == color.a;
+    };
+
+    struct CachedWorldArray {
+        uintptr_t objectData{};
+        uintptr_t first{};
+        int count{};
+        uint32_t color{};
+    };
+    static std::array<CachedWorldArray, 256> arrayCache{};
+    auto& cached = arrayCache[(objectData >> 4) % arrayCache.size()];
+    if (cached.objectData == objectData && cached.first == first &&
+        cached.count == count && cached.color == packed) {
+        const int samples[4] = {0, count / 3, (count * 2) / 3, count - 1};
+        bool intact = true;
+        for (const int sample : samples) {
+            if (!sameColor(Read<ColorRGBA>(
+                    first + static_cast<uintptr_t>(sample) * 0x20))) {
+                intact = false;
+                break;
+            }
+        }
+        if (intact) return;
+    }
+
+    // The whole range has already been validated. A single guarded direct
+    // loop is substantially cheaper than thousands of individual Write<T>
+    // calls on the render thread.
+    if (!IsWritableRange(first, span)) return;
+    __try {
+        for (int i = 0; i < count; ++i) {
+            *reinterpret_cast<ColorRGBA*>(
+                first + static_cast<uintptr_t>(i) * 0x20) = color;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return;
+    }
+    cached = {objectData, first, count, packed};
 }
 
 uintptr_t __fastcall HookDrawSceneObject(
     uintptr_t a1, uintptr_t a2, uintptr_t batch, int batchCount,
     int a5, uintptr_t a6, uintptr_t a7, uintptr_t a8) {
+    std::unique_lock<std::recursive_mutex> worldLock(
+        worldSceneMutex, std::defer_lock);
+    if (worldModulationEnabled) worldLock.lock();
     struct SavedColor { uintptr_t mesh{}; uint32_t value{}; };
     std::array<SavedColor, 1024> saved{};
     size_t savedCount = 0;
-    if (worldModulationEnabled && batch && batchCount > 0 &&
-        batchCount <= static_cast<int>(saved.size())) {
+    struct CachedSceneOwner {
+        uint32_t handle{0xFFFFFFFFu};
+        uintptr_t owner{};
+        bool hero{};
+        bool sky{};
+        ULONGLONG refreshAt{};
+    };
+    static std::array<CachedSceneOwner, 512> sceneOwnerCache{};
+    constexpr bool useLegacySceneMeshWorldPass = true;
+    if (useLegacySceneMeshWorldPass && worldModulationEnabled && batch &&
+        batchCount > 0 && batchCount <= static_cast<int>(saved.size())) {
+        const ULONGLONG now = GetTickCount64();
         for (int i = 0; i < batchCount; ++i) {
             const uintptr_t mesh = batch + static_cast<uintptr_t>(i) * MeshEntryStride;
             const uintptr_t sceneObject = Read<uintptr_t>(mesh + MeshSceneObject);
-            const uint32_t handle = sceneObject
-                ? Read<uint32_t>(sceneObject + SceneObjectOwner) : 0xFFFFFFFFu;
-            const uintptr_t owner = handle != 0xFFFFFFFFu
-                ? ResolveEntity(handle) : 0;
-            const std::string className = owner
-                ? GetEntityClassName(owner) : std::string{};
-            if (owner == currentLocalPawn ||
-                className.find("CitadelPlayerPawn") != std::string::npos)
-                continue;
-            const bool sky = className.find("EnvSky") != std::string::npos;
-            const float* color = sky ? skyboxColor
-                                     : (owner ? propsColor : worldColor);
-            const float brightness = sky ? skyboxBrightness : 1.0f;
+            const uint32_t handle = sceneObject ? Read<uint32_t>(sceneObject + SceneObjectOwner) : 0xFFFFFFFFu;
+            uintptr_t owner = 0;
+            bool hero = false;
+            bool sky = false;
+            if (handle != 0xFFFFFFFFu) {
+                auto& cached = sceneOwnerCache[handle % sceneOwnerCache.size()];
+                if (cached.handle != handle || now >= cached.refreshAt) {
+                    cached.handle = handle;
+                    cached.owner = ResolveEntity(handle);
+                    const std::string className = cached.owner
+                        ? GetEntityClassName(cached.owner) : std::string{};
+                    cached.hero = cached.owner == currentLocalPawn ||
+                        className.find("CitadelPlayerPawn") != std::string::npos;
+                    cached.sky = className.find("EnvSky") != std::string::npos;
+                    cached.refreshAt = now + 3000;
+                }
+                owner = cached.owner;
+                hero = cached.hero;
+                sky = cached.sky;
+            }
+            if (hero) continue;
+            const float* color = sky ? skyboxColor : (owner ? propsColor : worldColor);
+            const float brightness = (sky ? skyboxBrightness : 1.0f) *
+                std::clamp(lightBrightness, 0.0f, 50.0f);
             const float components[4] = {
-                std::clamp(color[0] * brightness, 0.0f, 1.0f),
-                std::clamp(color[1] * brightness, 0.0f, 1.0f),
-                std::clamp(color[2] * brightness, 0.0f, 1.0f), 1.0f};
+                std::clamp(color[0] * lightColor[0] * brightness,
+                           0.0f, 1.0f),
+                std::clamp(color[1] * lightColor[1] * brightness,
+                           0.0f, 1.0f),
+                std::clamp(color[2] * lightColor[2] * brightness,
+                           0.0f, 1.0f), 1.0f};
             saved[savedCount++] = {mesh, Read<uint32_t>(mesh + MeshColor)};
             Write<uint32_t>(mesh + MeshColor, GlowPackedColor(components));
         }
     }
     const uintptr_t result = originalDrawSceneObject
-        ? originalDrawSceneObject(a1, a2, batch, batchCount,
-                                  a5, a6, a7, a8) : 0;
-    for (size_t i = 0; i < savedCount; ++i)
-        Write<uint32_t>(saved[i].mesh + MeshColor, saved[i].value);
+        ? originalDrawSceneObject(a1, a2, batch, batchCount, a5, a6, a7, a8) : 0;
+    for (size_t i = 0; i < savedCount; ++i) Write<uint32_t>(saved[i].mesh + MeshColor, saved[i].value);
     return result;
 }
 
@@ -1217,8 +1326,13 @@ void** __fastcall HookDrawModel(
     __int64* submittedMeshes = meshDraws;
     const int safeWorldCount = meshCount > 0 && meshCount < 512 ? meshCount : 0;
     const bool trooperChamsActive = enemyTrooperChams || allyTrooperChams || neutralChams;
-    if (trooperChamsActive &&
-        meshDraws && safeWorldCount > 0) {
+    // Once the regular flat chams resources are ready, the owner-aware pass
+    // below handles troopers directly. Copying every mesh and its full
+    // material descriptor here made particle-heavy draw batches extremely
+    // expensive even when they contained no trooper at all.
+    const bool copyWorldMeshes = trooperChamsActive &&
+        (!flatChamsMaterial || !invisibleChamsMaterial);
+    if (copyWorldMeshes && meshDraws && safeWorldCount > 0) {
         worldMeshes.resize(static_cast<size_t>(safeWorldCount));
         worldDescriptors.resize(static_cast<size_t>(safeWorldCount));
         const uintptr_t source = reinterpret_cast<uintptr_t>(meshDraws);
@@ -1243,9 +1357,30 @@ void** __fastcall HookDrawModel(
                 ? Read<uint32_t>(sceneObject + SceneObjectOwner) : 0xFFFFFFFFu;
             const uintptr_t owner = ownerHandle != 0xFFFFFFFFu
                 ? ResolveEntity(ownerHandle) : 0;
-            const bool hero = owner == currentLocalPawn || GetGlowHeroMeshPawn(entry) != 0;
-            const bool sky = owner &&
-                GetEntityClassName(owner).find("EnvSky") != std::string::npos;
+            const std::string className = owner
+                ? GetEntityClassName(owner) : std::string{};
+            const bool hero = owner == currentLocalPawn ||
+                className.find("CitadelPlayerPawn") != std::string::npos;
+            const bool sky = className.find("EnvSky") != std::string::npos;
+            if (worldModulationEnabled && !hero) {
+                const float* sourceColor = sky ? skyboxColor
+                    : (owner ? propsColor : worldColor);
+                const float brightness =
+                    (sky ? skyboxBrightness : 1.0f) *
+                    std::clamp(lightBrightness, 0.0f, 50.0f);
+                const float tint[4] = {
+                    std::clamp(sourceColor[0] * lightColor[0] * brightness,
+                               0.0f, 1.0f),
+                    std::clamp(sourceColor[1] * lightColor[1] * brightness,
+                               0.0f, 1.0f),
+                    std::clamp(sourceColor[2] * lightColor[2] * brightness,
+                               0.0f, 1.0f),
+                    1.0f};
+                SetGlowDescriptorTint(descriptorCopy.bytes, tint);
+                const uint32_t packed = GlowPackedColor(tint);
+                std::memcpy(mesh.bytes.data() + MeshColor,
+                            &packed, sizeof(packed));
+            }
             const float* trooperTint = GetTrooperChamsTint(owner);
             if (trooperTint) {
                 const float tint[4] = {
@@ -1269,25 +1404,59 @@ void** __fastcall HookDrawModel(
     // modulation only for this submission and restore it immediately after
     // the engine consumes the array.  Do not replace the scene pixel shader.
     struct SavedWorldColor { uintptr_t entry{}; uint32_t color{}; };
+    struct CachedWorldOwner {
+        uint32_t handle{0xFFFFFFFFu};
+        uintptr_t owner{};
+        bool hero{};
+        bool sky{};
+        ULONGLONG refreshAt{};
+    };
+    static std::array<CachedWorldOwner, 256> worldOwnerCache{};
     std::array<SavedWorldColor, 512> savedWorldColors{};
     size_t savedWorldColorCount = 0;
-    if (worldModulationEnabled && submittedMeshes && safeWorldCount > 0) {
+    // The current client applies world color in HookDrawSceneObject. Running
+    // this second modulation pass as well doubles the work for every mesh
+    // submission and is the main source of World-toggle stutter.
+    constexpr bool useDrawModelWorldPass = false;
+    if (useDrawModelWorldPass && worldModulationEnabled &&
+        submittedMeshes && safeWorldCount > 0) {
         const uintptr_t source = reinterpret_cast<uintptr_t>(submittedMeshes);
+        const ULONGLONG worldNow = GetTickCount64();
         for (int i = 0; i < safeWorldCount; ++i) {
             const uintptr_t entry = source + static_cast<uintptr_t>(i) * MeshEntryStride;
             const uintptr_t sceneObject = Read<uintptr_t>(entry + MeshSceneObject);
             const uint32_t handle = sceneObject ? Read<uint32_t>(sceneObject + SceneObjectOwner) : 0xFFFFFFFFu;
-            const uintptr_t owner = handle != 0xFFFFFFFFu ? ResolveEntity(handle) : 0;
-            const std::string className = owner ? GetEntityClassName(owner) : std::string{};
-            if (owner == currentLocalPawn || className.find("CitadelPlayerPawn") != std::string::npos)
+            uintptr_t owner = 0;
+            bool hero = false;
+            bool sky = false;
+            if (handle != 0xFFFFFFFFu) {
+                auto& cached = worldOwnerCache[handle % worldOwnerCache.size()];
+                if (cached.handle != handle || worldNow >= cached.refreshAt) {
+                    cached.handle = handle;
+                    cached.owner = ResolveEntity(handle);
+                    const std::string className = cached.owner
+                        ? GetEntityClassName(cached.owner) : std::string{};
+                    cached.hero = cached.owner == currentLocalPawn ||
+                        className.find("CitadelPlayerPawn") != std::string::npos;
+                    cached.sky = className.find("EnvSky") != std::string::npos;
+                    cached.refreshAt = worldNow + 2000;
+                }
+                owner = cached.owner;
+                hero = cached.hero;
+                sky = cached.sky;
+            }
+            if (hero)
                 continue;
-            const bool sky = className.find("EnvSky") != std::string::npos;
             const float* sourceColor = sky ? skyboxColor : (owner ? propsColor : worldColor);
-            const float brightness = sky ? skyboxBrightness : 1.0f;
+            const float brightness = (sky ? skyboxBrightness : 1.0f) *
+                std::clamp(lightBrightness, 0.0f, 50.0f);
             const float packedColor[4] = {
-                std::clamp(sourceColor[0] * brightness, 0.0f, 1.0f),
-                std::clamp(sourceColor[1] * brightness, 0.0f, 1.0f),
-                std::clamp(sourceColor[2] * brightness, 0.0f, 1.0f), 1.0f};
+                std::clamp(sourceColor[0] * lightColor[0] * brightness,
+                           0.0f, 1.0f),
+                std::clamp(sourceColor[1] * lightColor[1] * brightness,
+                           0.0f, 1.0f),
+                std::clamp(sourceColor[2] * lightColor[2] * brightness,
+                           0.0f, 1.0f), 1.0f};
             savedWorldColors[savedWorldColorCount++] = {
                 entry, Read<uint32_t>(entry + MeshColor)};
             Write<uint32_t>(entry + MeshColor, GlowPackedColor(packedColor));
@@ -1309,18 +1478,16 @@ void** __fastcall HookDrawModel(
         bool hero{};
         ULONGLONG nextHeroCheck{};
     };
-    thread_local std::array<CachedDrawOwner, 128> ownerCache{};
-    thread_local std::array<SavedChamsMesh, 256> savedChams{};
+    static std::array<CachedDrawOwner, 128> ownerCache{};
+    std::array<SavedChamsMesh, 256> savedChams{};
     size_t savedChamsCount = 0;
 
     const bool anyTrooperChams = enemyTrooperChams || allyTrooperChams ||
                                  neutralChams;
     const bool anyVisibleChams = enemyChamsEnabled || allyChamsEnabled ||
                                  anyTrooperChams;
-    const bool anyInvisibleChams = enemyInvisibleChamsEnabled ||
-                                   allyInvisibleChamsEnabled;
-    if ((anyVisibleChams || anyInvisibleChams) && flatChamsMaterial &&
-        invisibleChamsMaterial &&
+    constexpr bool anyInvisibleChams = false;
+    if (anyVisibleChams && flatChamsMaterial &&
         submittedMeshes && meshCount > 0 && meshCount <= 256) {
         const uintptr_t source = reinterpret_cast<uintptr_t>(submittedMeshes);
         uint32_t evaluatedHandle = 0xFFFFFFFFu;
@@ -1369,16 +1536,15 @@ void** __fastcall HookDrawModel(
                     const uint8_t pawnTeam = Read<uint8_t>(
                         cached.pawn + Offsets::Team);
                     const bool ally = pawnTeam == localTeam;
-                    evaluatedVisible = ally
-                        ? allyChamsEnabled : enemyChamsEnabled;
-                    evaluatedInvisible = ally
-                        ? allyInvisibleChamsEnabled
-                        : enemyInvisibleChamsEnabled;
+                    // Visible targets use Chams; occluded targets are left on
+                    // their original material so PlayerOutline can draw Glow.
+                    evaluatedVisible =
+                        (ally ? allyChamsEnabled : enemyChamsEnabled) &&
+                        IsPawnSceneVisible(cached.pawn);
+                    evaluatedInvisible = false;
                     const float* visibleColor =
                         ally ? allyChamsColor : enemyChamsColor;
-                    const float* invisibleColor = ally
-                        ? allyInvisibleChamsColor
-                        : enemyInvisibleChamsColor;
+                    const float* invisibleColor = visibleColor;
                     const float visibleComponents[4] = {
                         visibleColor[0], visibleColor[1], visibleColor[2], 1.0f};
                     const float invisibleComponents[4] = {
@@ -1413,52 +1579,136 @@ void** __fastcall HookDrawModel(
         }
     }
 
-    // Native PlayerHealthGlowRenderer already owns a stable through-wall
-    // render target and visibility mask.  During that pass replace only hero
-    // meshes with the opaque PBR material; do not touch the scene depth state.
-    if (savedChamsCount && anyInvisibleChams &&
-        nativeGlowRenderPassCount.load(std::memory_order_acquire) > 0) {
+    const bool nativeGlowPass =
+        nativeGlowRenderPassCount.load(std::memory_order_acquire) > 0 ||
+        IsNativeGlowContext(static_cast<uintptr_t>(dx11));
+    const bool opaqueOnlyPass = nativeGlowPass &&
+        nativeGlowOpaqueOnlyPass.load(std::memory_order_acquire);
+    std::array<MeshEntryCopy, 256> invisibleMeshes{};
+    size_t invisibleMeshCount = 0;
+    if (savedChamsCount && anyInvisibleChams) {
         for (size_t i = 0; i < savedChamsCount; ++i) {
             const auto& saved = savedChams[i];
-            if (!saved.invisible) continue;
-            Write<uintptr_t>(saved.entry + MeshMaterial,
-                             reinterpret_cast<uintptr_t>(
-                                 invisibleChamsMaterial));
-            Write<uint32_t>(saved.entry + MeshColor, saved.invisibleColor);
+            if (!saved.invisible || invisibleMeshCount >= invisibleMeshes.size())
+                continue;
+            auto& copy = invisibleMeshes[invisibleMeshCount];
+            if (!CopyReadableBytes(copy.bytes.data(),
+                                   reinterpret_cast<const void*>(saved.entry),
+                                   MeshEntryStride))
+                continue;
+            const uintptr_t material =
+                reinterpret_cast<uintptr_t>(invisibleChamsMaterial);
+            std::memcpy(copy.bytes.data() + MeshMaterial,
+                        &material, sizeof(material));
+            std::memcpy(copy.bytes.data() + MeshColor,
+                        &saved.invisibleColor,
+                        sizeof(saved.invisibleColor));
+            ++invisibleMeshCount;
         }
+    }
+
+    // PlayerOutline's list is prepared before the renderer callback and can
+    // therefore still contain normal x1 glow during an extra opacity pass.
+    // Filter the submitted mesh array itself: batches without an invisible
+    // hero are submitted with zero meshes, so blue glow cannot accumulate.
+    if (opaqueOnlyPass) {
         void** result = originalDrawModel(
-            sceneObjectDesc, dx11, submittedMeshes, meshCount,
+            sceneObjectDesc, dx11,
+            invisibleMeshCount
+                ? reinterpret_cast<__int64*>(invisibleMeshes.data())
+                : submittedMeshes,
+            static_cast<int>(invisibleMeshCount),
             sceneView, sceneLayer, a7);
-        for (size_t i = 0; i < savedChamsCount; ++i) {
-            const auto& saved = savedChams[i];
-            Write<uintptr_t>(saved.entry + MeshMaterial, saved.material);
-            Write<uint32_t>(saved.entry + MeshColor, saved.color);
-        }
         for (size_t i = 0; i < savedWorldColorCount; ++i)
             Write<uint32_t>(savedWorldColors[i].entry + MeshColor,
                             savedWorldColors[i].color);
         return result;
     }
 
-    for (size_t i = 0; i < savedChamsCount; ++i) {
-        const auto& saved = savedChams[i];
-        if (saved.visible) {
-            Write<uintptr_t>(saved.entry + MeshMaterial,
-                             reinterpret_cast<uintptr_t>(flatChamsMaterial));
-            Write<uint32_t>(saved.entry + MeshColor, saved.visibleColor);
-        } else {
-            Write<uintptr_t>(saved.entry + MeshMaterial, saved.material);
-            Write<uint32_t>(saved.entry + MeshColor, saved.color);
+    // The first native pass is still mixed. Add the opaque material only for
+    // invisible-chams heroes, then let the ordinary x1 batch render once.
+    bool restoreDepthAfterScenePass = false;
+    if (invisibleMeshCount && nativeGlowPass) {
+        originalDrawModel(
+            sceneObjectDesc, dx11,
+            reinterpret_cast<__int64*>(invisibleMeshes.data()),
+            static_cast<int>(invisibleMeshCount),
+            sceneView, sceneLayer, a7);
+    } else if (invisibleMeshCount) {
+        std::lock_guard<std::mutex> lock(invisiblePassMutex);
+        EnsureRenderDepthHook(static_cast<uintptr_t>(dx11));
+        renderInvisibleChamsContext.store(
+            static_cast<uintptr_t>(dx11), std::memory_order_release);
+        invisiblePassOriginalDepth.store(
+            Read<uintptr_t>(static_cast<uintptr_t>(dx11) +
+                            RenderContextDepthState),
+            std::memory_order_release);
+        invisiblePassOriginalStencilRef.store(
+            Read<uint32_t>(static_cast<uintptr_t>(dx11) +
+                           RenderContextStencilRef),
+            std::memory_order_release);
+        invisiblePassDepthCaptured.store(true, std::memory_order_release);
+        Write<uintptr_t>(
+            static_cast<uintptr_t>(dx11) + RenderContextDepthState,
+            reinterpret_cast<uintptr_t>(invisibleChamsDepthState));
+        Write<uint32_t>(
+            static_cast<uintptr_t>(dx11) + RenderContextDirtyFlags,
+            Read<uint32_t>(static_cast<uintptr_t>(dx11) +
+                           RenderContextDirtyFlags) | 8u);
+        originalDrawModel(
+            sceneObjectDesc, dx11,
+            reinterpret_cast<__int64*>(invisibleMeshes.data()),
+            static_cast<int>(invisibleMeshCount),
+            sceneView, sceneLayer, a7);
+        // Keep the no-depth cache alive until the normal scene submission has
+        // recorded its own state. Restoring here makes the queued chams draw
+        // inherit the normal depth state and turns it into visible-only chams.
+        renderInvisibleChamsContext.store(0, std::memory_order_release);
+        restoreDepthAfterScenePass = true;
+    }
+
+    // Submit Chams through a private mesh array. The native outline renderer
+    // reuses the game's original entries asynchronously; changing those
+    // entries in place makes the flat material leak into its through-wall mask.
+    std::array<MeshEntryCopy, 256> visibleMeshes{};
+    __int64* finalMeshes = submittedMeshes;
+    if (savedChamsCount && !nativeGlowPass && submittedMeshes &&
+        meshCount > 0 && meshCount <= static_cast<int>(visibleMeshes.size())) {
+        const uintptr_t source = reinterpret_cast<uintptr_t>(submittedMeshes);
+        bool complete = true;
+        for (int i = 0; i < meshCount; ++i) {
+            if (!CopyReadableBytes(
+                    visibleMeshes[static_cast<size_t>(i)].bytes.data(),
+                    reinterpret_cast<const void*>(
+                        source + static_cast<uintptr_t>(i) * MeshEntryStride),
+                    MeshEntryStride)) {
+                complete = false;
+                break;
+            }
+        }
+        if (complete) {
+            for (size_t i = 0; i < savedChamsCount; ++i) {
+                const auto& saved = savedChams[i];
+                if (!saved.visible || saved.entry < source) continue;
+                const size_t index =
+                    (saved.entry - source) / MeshEntryStride;
+                if (index >= static_cast<size_t>(meshCount)) continue;
+                auto& copy = visibleMeshes[index];
+                const uintptr_t material =
+                    reinterpret_cast<uintptr_t>(flatChamsMaterial);
+                std::memcpy(copy.bytes.data() + MeshMaterial,
+                            &material, sizeof(material));
+                std::memcpy(copy.bytes.data() + MeshColor,
+                            &saved.visibleColor, sizeof(saved.visibleColor));
+            }
+            finalMeshes = reinterpret_cast<__int64*>(visibleMeshes.data());
         }
     }
     void** result = originalDrawModel(
-        sceneObjectDesc, dx11, submittedMeshes, meshCount,
+        sceneObjectDesc, dx11, finalMeshes, meshCount,
         sceneView, sceneLayer, a7);
-    for (size_t i = 0; i < savedChamsCount; ++i) {
-        const auto& saved = savedChams[i];
-        Write<uintptr_t>(saved.entry + MeshMaterial, saved.material);
-        Write<uint32_t>(saved.entry + MeshColor, saved.color);
-    }
+    if (restoreDepthAfterScenePass)
+        RestoreInvisiblePassDepthState();
     for (size_t i = 0; i < savedWorldColorCount; ++i)
         Write<uint32_t>(savedWorldColors[i].entry + MeshColor,
                         savedWorldColors[i].color);
@@ -1632,6 +1882,19 @@ void RemoveHookTarget(void*& target) {
 }
 
 } // namespace
+
+void UpdateModelChamsVisibility(const std::vector<PlayerData>& players) {
+    for (const auto& player : players) {
+        if (!player.entity || player.entity == currentLocalPawn) continue;
+        Vector3 point = player.hasBodyBone ? player.bodyPos : player.pos;
+        if (!player.hasBodyBone) point.z += 48.0f;
+        bool visible = true;
+        // Unknown/stale trace states retain the previous result; scheduling a
+        // trace must never toggle the material for a single render frame.
+        if (TryGetWorldVisibilitySnapshot(point, player.entity, visible))
+            PublishChamsVisibility(player.entity, visible);
+    }
+}
 
 void RestoreWorldRenderState() {
     // Render-object values are restored synchronously inside their hook.

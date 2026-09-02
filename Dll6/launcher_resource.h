@@ -1,6 +1,6 @@
 #pragma once
 
 #define IDI_AXIOM_ICON 101
-#define IDR_PAYLOAD_DLL 201
 #define IDR_AXIOM_LOGO 202
 #define IDR_AXIOM_BACKGROUND 203
+#define IDR_AXIOM_MODULE 204

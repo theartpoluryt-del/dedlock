@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <unordered_map>
 
@@ -16,6 +17,7 @@ bool vindictaAutoSnipeEnabled = false;
 bool hazeSleepDaggerEnabled = false;
 bool shivSerratedKnivesEnabled = false;
 bool bebopAbility3Enabled = false;
+bool bebopAbility2AutoEnabled = false;
 bool drifterAbility2Enabled = false;
 bool heroScriptsShowFov = false;
 bool hazePredictionDot = true;
@@ -59,6 +61,8 @@ constexpr uintptr_t kSubclassVDataOffset = 0x390;
 // before this non-networked VData type is published, which previously left
 // all three offsets at zero and silently disabled projectile lead.
 constexpr uintptr_t kWeaponBulletSpeedFallback = 0xB4;
+constexpr uintptr_t kWeaponBulletLifetimeFallback = 0xC8;
+constexpr uintptr_t kWeaponRangeFallback = 0x48;
 constexpr uintptr_t kWeaponBulletGravityFallback = 0xBC;
 constexpr uintptr_t kWeaponBulletInheritFallback = 0xD0;
 // Current abilities.vdata stores Sleep Dagger's trajectory in m_WeaponInfo:
@@ -72,6 +76,7 @@ constexpr float kHeroProjectileOriginHeight = 52.0f;
 // C_CitadelPlayerPawn::m_angClientCamera, networked client-camera angles.
 // This is the same field updated by the reference post-move implementation.
 constexpr uintptr_t kClientCameraAnglesOffset = 0x1248;
+constexpr bool kHeroScriptDiagnostics = false;
 
 struct HeroOffsets {
     uintptr_t remainingCharges{};
@@ -80,6 +85,8 @@ struct HeroOffsets {
     uintptr_t weaponInfo{};
     uintptr_t abilityProperties{};
     uintptr_t bulletSpeed{};
+    uintptr_t bulletLifetime{};
+    uintptr_t weaponRange{};
     uintptr_t bulletGravity{};
     uintptr_t bulletInherit{};
     bool initialized{};
@@ -95,6 +102,7 @@ struct TargetSnapshot {
     int maxHealth{};
     uint32_t heroId{};
     ULONGLONG updatedAt{};
+    bool inAbilityRange{true};
 };
 
 struct TargetMotionSample {
@@ -125,6 +133,7 @@ struct CommandState {
 HeroOffsets offsets{};
 std::mutex targetMutex;
 TargetSnapshot targetSnapshot{};
+TargetSnapshot bebopAbility2TargetSnapshot{};
 CommandState commandState{};
 std::unordered_map<uintptr_t, TargetMotionSample> targetMotionSamples{};
 
@@ -139,9 +148,11 @@ QueryEntityStatFn queryEntityStat{};
 int32_t* abilityServiceContext{};
 std::mutex diagnosticsMutex;
 bool ScriptEnabled(uint32_t heroId);
+float EntityStat(int stat, uintptr_t entity);
 
 void LogDiagnostics(const char* stage, uint32_t heroId, uintptr_t ability,
                     uintptr_t target, int detail = 0) {
+    if constexpr (!kHeroScriptDiagnostics) return;
     std::lock_guard<std::mutex> lock(diagnosticsMutex);
     std::ofstream log(Dll6Paths::DataFileA("hero_scripts.log"), std::ios::app);
     if (!log) return;
@@ -198,12 +209,20 @@ void InitializeOffsets() {
         // Haze's dagger keeps a permanent zero speed and never gets a lead.
         static ULONGLONG lastProjectileRetry = 0;
         const ULONGLONG now = GetTickCount64();
-        if ((!offsets.bulletSpeed || !offsets.bulletGravity ||
+        if ((!offsets.bulletSpeed || !offsets.bulletLifetime ||
+             !offsets.weaponRange ||
+             !offsets.bulletGravity ||
              !offsets.bulletInherit) && now - lastProjectileRetry >= 1000) {
             lastProjectileRetry = now;
             if (!offsets.bulletSpeed)
                 offsets.bulletSpeed = ResolveRuntimeSchemaOffset(
                     "CCitadelWeaponInfo", "m_flBulletSpeed");
+            if (!offsets.bulletLifetime)
+                offsets.bulletLifetime = ResolveRuntimeSchemaOffset(
+                    "CCitadelWeaponInfo", "m_flBulletLifetime");
+            if (!offsets.weaponRange)
+                offsets.weaponRange = ResolveRuntimeSchemaOffset(
+                    "CCitadelWeaponInfo", "m_flRange");
             if (!offsets.bulletGravity)
                 offsets.bulletGravity = ResolveRuntimeSchemaOffset(
                     "CCitadelWeaponInfo", "m_flBulletGravityScale");
@@ -226,6 +245,10 @@ void InitializeOffsets() {
         "CitadelAbilityVData", "m_mapAbilityProperties");
     offsets.bulletSpeed = ResolveRuntimeSchemaOffset(
         "CCitadelWeaponInfo", "m_flBulletSpeed");
+    offsets.bulletLifetime = ResolveRuntimeSchemaOffset(
+        "CCitadelWeaponInfo", "m_flBulletLifetime");
+    offsets.weaponRange = ResolveRuntimeSchemaOffset(
+        "CCitadelWeaponInfo", "m_flRange");
     offsets.bulletGravity = ResolveRuntimeSchemaOffset(
         "CCitadelWeaponInfo", "m_flBulletGravityScale");
     offsets.bulletInherit = ResolveRuntimeSchemaOffset(
@@ -239,6 +262,9 @@ void InitializeOffsets() {
     if (!offsets.weaponInfo) offsets.weaponInfo = 0x158;
     if (!offsets.abilityProperties) offsets.abilityProperties = 0xE68;
     if (!offsets.bulletSpeed) offsets.bulletSpeed = kWeaponBulletSpeedFallback;
+    if (!offsets.bulletLifetime)
+        offsets.bulletLifetime = kWeaponBulletLifetimeFallback;
+    if (!offsets.weaponRange) offsets.weaponRange = kWeaponRangeFallback;
     if (!offsets.bulletGravity) offsets.bulletGravity = kWeaponBulletGravityFallback;
     if (!offsets.bulletInherit) offsets.bulletInherit = kWeaponBulletInheritFallback;
 
@@ -283,6 +309,8 @@ void InitializeOffsets() {
                 << " weapon=0x" << offsets.weaponInfo
                 << " properties=0x" << offsets.abilityProperties
                 << " speed=0x" << offsets.bulletSpeed
+                << " lifetime=0x" << offsets.bulletLifetime
+                << " range=0x" << offsets.weaponRange
                 << " gravity=0x" << offsets.bulletGravity
                 << " inherit=0x" << offsets.bulletInherit
                 << " compute=" << reinterpret_cast<uintptr_t>(computePropertyValue)
@@ -304,7 +332,8 @@ bool ScriptEnabled(uint32_t heroId) {
     if (heroId == kVindictaId) return vindictaAutoSnipeEnabled;
     if (heroId == kHazeId) return hazeSleepDaggerEnabled;
     if (heroId == kShivId) return shivSerratedKnivesEnabled;
-    if (heroId == kBebopId) return bebopAbility3Enabled;
+    if (heroId == kBebopId)
+        return bebopAbility3Enabled || bebopAbility2AutoEnabled;
     if (heroId == kDrifterId) return drifterAbility2Enabled;
     return false;
 }
@@ -345,6 +374,38 @@ uintptr_t FindAbility(int wantedSlot) {
             return ability;
     }
     return 0;
+}
+
+uintptr_t FindPrimaryWeapon() {
+    // Primary weapons normally live in the ability vector at
+    // ESlot_Weapon_Primary (0x15). Keep the active-weapon handle as a
+    // fallback for heroes/client states where that vector is incomplete.
+    uintptr_t weapon = FindAbility(0x15);
+    static uintptr_t weaponServicesOffset = 0;
+    static uintptr_t activeWeaponOffset = 0;
+    static ULONGLONG lastOffsetRetry = 0;
+    const ULONGLONG now = GetTickCount64();
+    if ((!weaponServicesOffset || !activeWeaponOffset) &&
+        now - lastOffsetRetry >= 1000) {
+        lastOffsetRetry = now;
+        if (!weaponServicesOffset) {
+            weaponServicesOffset = ResolveRuntimeSchemaOffset(
+                "C_BasePlayerPawn", "m_pWeaponServices");
+            if (!weaponServicesOffset) weaponServicesOffset = 0xEE8;
+        }
+        if (!activeWeaponOffset) {
+            activeWeaponOffset = ResolveRuntimeSchemaOffset(
+                "CPlayer_WeaponServices", "m_hActiveWeapon");
+            if (!activeWeaponOffset) activeWeaponOffset = 0x60;
+        }
+    }
+    const uintptr_t services = weaponServicesOffset
+        ? Read<uintptr_t>(currentLocalPawn + weaponServicesOffset) : 0;
+    const uint32_t weaponHandle = services && activeWeaponOffset
+        ? Read<uint32_t>(services + activeWeaponOffset) : 0xFFFFFFFFu;
+    if (!weapon && weaponHandle != 0xFFFFFFFFu)
+        weapon = ResolveEntity(weaponHandle);
+    return weapon;
 }
 
 bool AbilityReady(uintptr_t ability, bool requireCharge) {
@@ -436,11 +497,97 @@ float BebopHookRange(uintptr_t ability) {
     return 1200.0f;
 }
 
-bool BebopTargetInHookRange(uintptr_t ability, uintptr_t target) {
-    if (!ability || !target || !currentLocalPositionReady) return false;
+float ScriptProjectileRange(uint32_t heroId, uintptr_t ability) {
+    if (heroId == kVindictaId) return std::numeric_limits<float>::infinity();
+
+    // Direct travel/cast ranges take priority and include upgrades when the
+    // live property evaluator is available. Ignore small radius properties:
+    // those describe impact AoE, not projectile travel.
+    static constexpr const char* kDirectRangeProperties[]{
+        "ProjectileRange", "ProjectileDistance", "MaxProjectileRange",
+        "MaxRange", "CastRange", "AbilityCastRange", "HookRange", "Range"};
+    for (const char* name : kDirectRangeProperties) {
+        if (!FindAbilityProperty(ability, name)) continue;
+        const float value = AbilityProperty(ability, name, 0.0f);
+        if (std::isfinite(value) && value >= 400.0f && value <= 50000.0f)
+            return value;
+    }
+
+    // Primary weapons store their physical limit directly in the embedded
+    // CCitadelWeaponInfo rather than in m_mapAbilityProperties.
+    const uintptr_t vdata = ability
+        ? Read<uintptr_t>(ability + kSubclassVDataOffset) : 0;
+    const uintptr_t weaponInfo = vdata && offsets.weaponInfo
+        ? vdata + offsets.weaponInfo : 0;
+    float weaponLifetime = weaponInfo && offsets.bulletLifetime
+        ? Read<float>(weaponInfo + offsets.bulletLifetime) : 0.0f;
+    float weaponSpeed = weaponInfo && offsets.bulletSpeed
+        ? Read<float>(weaponInfo + offsets.bulletSpeed) : 0.0f;
+    if (heroId == 0) {
+        const float liveSpeed = EntityStat(0x4C, currentLocalPawn);
+        if (std::isfinite(liveSpeed) && liveSpeed > 100.0f &&
+            liveSpeed <= 100000.0f)
+            weaponSpeed = liveSpeed;
+    }
+    float physicalRange = std::numeric_limits<float>::infinity();
+    if (std::isfinite(weaponLifetime) && weaponLifetime >= 0.01f &&
+        weaponLifetime <= 20.0f && std::isfinite(weaponSpeed) &&
+        weaponSpeed > 100.0f && weaponSpeed <= 100000.0f)
+        physicalRange = weaponSpeed * weaponLifetime;
+
+    if (heroId == 0) {
+        // CCitadelWeaponInfo::m_flRange is the actual maximum attack travel
+        // distance. Falloff ranges only change damage and bullet lifetime is
+        // commonly much longer than this gameplay limit.
+        const float baseRange = weaponInfo && offsets.weaponRange
+            ? Read<float>(weaponInfo + offsets.weaponRange) : 0.0f;
+        const float liveRange = EntityStat(0x12, currentLocalPawn);
+        if (std::isfinite(liveRange) && liveRange >= 100.0f &&
+            liveRange <= 100000.0f && std::isfinite(baseRange) &&
+            baseRange >= 100.0f && liveRange >= baseRange * 0.25f)
+            return std::isfinite(physicalRange)
+                ? (std::min)(liveRange, physicalRange) : liveRange;
+        if (std::isfinite(baseRange) && baseRange >= 100.0f &&
+            baseRange <= 100000.0f)
+            return std::isfinite(physicalRange)
+                ? (std::min)(baseRange, physicalRange) : baseRange;
+        if (std::isfinite(physicalRange)) return physicalRange;
+    } else if (std::isfinite(physicalRange)) {
+        return physicalRange;
+    }
+
+    // Some projectile abilities publish lifetime as an ability property.
+    // Their physical travel limit is also speed * lifetime.
+    static constexpr const char* kLifetimeProperties[]{
+        "ProjectileLifetime", "ProjectileDuration", "ProjectileLifeTime"};
+    float lifetime = 0.0f;
+    for (const char* name : kLifetimeProperties) {
+        if (!FindAbilityProperty(ability, name)) continue;
+        const float value = AbilityProperty(ability, name, 0.0f);
+        if (std::isfinite(value) && value >= 0.1f && value <= 20.0f) {
+            lifetime = value;
+            break;
+        }
+    }
+    if (lifetime > 0.0f && std::isfinite(weaponSpeed) &&
+        weaponSpeed > 100.0f && weaponSpeed <= 100000.0f) {
+        return weaponSpeed * lifetime;
+    }
+
+    // Hook's current base range is known even before VData is available.
+    if (heroId == kBebopId) return BebopHookRange(ability);
+    return std::numeric_limits<float>::infinity();
+}
+
+bool TargetInProjectileRange(float range, uintptr_t target) {
+    if (!std::isfinite(range)) return true;
+    if (!target || !currentLocalPositionReady) return false;
     const uintptr_t sceneNode = Read<uintptr_t>(target + Offsets::GameSceneNode);
-    const Vector3 targetPosition = sceneNode
+    Vector3 targetPosition = sceneNode
         ? Read<Vector3>(sceneNode + Offsets::SceneNodeAbsOrigin) : Vector3{};
+    if (!std::isfinite(targetPosition.x) || !std::isfinite(targetPosition.y) ||
+        !std::isfinite(targetPosition.z))
+        targetPosition = Read<Vector3>(target + Offsets::Pos);
     if (!std::isfinite(targetPosition.x) || !std::isfinite(targetPosition.y) ||
         !std::isfinite(targetPosition.z)) return false;
     const float dx = targetPosition.x - currentLocalPosition.x;
@@ -448,8 +595,15 @@ bool BebopTargetInHookRange(uintptr_t ability, uintptr_t target) {
     const float dz = targetPosition.z - currentLocalPosition.z;
     // Preserve the hook's collision leeway at the edge of its range rather
     // than rejecting a valid torso hit because the pawn origin is centered.
-    const float range = BebopHookRange(ability) + 40.0f;
-    return dx * dx + dy * dy + dz * dz <= range * range;
+    const float collisionLeeway = range + 40.0f;
+    return dx * dx + dy * dy + dz * dz <=
+        collisionLeeway * collisionLeeway;
+}
+
+bool ScriptTargetInAbilityRange(uint32_t heroId, uintptr_t ability,
+                                uintptr_t target) {
+    return TargetInProjectileRange(
+        ScriptProjectileRange(heroId, ability), target);
 }
 
 float EntityStat(int stat, uintptr_t entity) {
@@ -896,6 +1050,11 @@ TargetSnapshot ReadTarget() {
     return targetSnapshot;
 }
 
+TargetSnapshot ReadBebopAbility2Target() {
+    std::lock_guard<std::mutex> lock(targetMutex);
+    return bebopAbility2TargetSnapshot;
+}
+
 bool TargetUsable(const TargetSnapshot& target, uint32_t heroId) {
     return target.entity && target.heroId == heroId &&
         GetTickCount64() - target.updatedAt <= 200;
@@ -911,7 +1070,9 @@ bool TargetCenteredOnScreen(const TargetSnapshot& target) {
     return dx * dx + dy * dy <= 6.0f * 6.0f;
 }
 
-bool QueueSilentHeroTarget(const TargetSnapshot& target, bool attack) {
+bool QueueSilentHeroTarget(const TargetSnapshot& target, bool attack,
+                           bool overridePrimaryAim = true) {
+    if (!target.inAbilityRange) return false;
     Vector3 source{};
     if (!ResolveHeroAimSource(target.heroId, source)) return false;
     const Vector3 angles = CalculateAngles(source, target.point);
@@ -923,11 +1084,11 @@ bool QueueSilentHeroTarget(const TargetSnapshot& target, bool attack) {
     // Projectile casts launch after their animation, so their angle must keep
     // priority over held primary fire until PostFire ends, not only on the
     // initial Ability 1 command.
-    QueueHeroSilentAngles(silentAngles, attack,
-                          target.heroId == kHazeId ||
-                          target.heroId == kShivId ||
-                          target.heroId == kBebopId ||
-                          target.heroId == kDrifterId);
+    QueueHeroSilentAngles(
+        silentAngles, attack,
+        overridePrimaryAim &&
+            (target.heroId == kHazeId || target.heroId == kShivId ||
+             target.heroId == kBebopId || target.heroId == kDrifterId));
     return true;
 }
 
@@ -967,7 +1128,59 @@ void ResetCommandState(bool keepHeld = false) {
     if (keepHeld) commandState.wasAbility1Held = held;
 }
 
+float CachedPrimaryWeaponRange() {
+    InitializeOffsets();
+    static uintptr_t cachedPawn = 0;
+    static uintptr_t cachedWeapon = 0;
+    static float cachedRange = std::numeric_limits<float>::infinity();
+    static ULONGLONG lastRefresh = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (cachedPawn != currentLocalPawn || now - lastRefresh >= 250) {
+        cachedPawn = currentLocalPawn;
+        cachedWeapon = FindPrimaryWeapon();
+        cachedRange = cachedWeapon
+            ? ScriptProjectileRange(0, cachedWeapon)
+            : std::numeric_limits<float>::infinity();
+        lastRefresh = now;
+    }
+    // Drifter's swipe projectile has a verified 1080-unit travel limit. Its
+    // subclass can expose a generic ability range before the embedded weapon
+    // fields are ready, so clamp that transient value to the physical limit.
+    constexpr uint32_t kDrifterHeroId = 64;
+    const uint32_t heroId = currentLocalPawn
+        ? Read<uint32_t>(currentLocalPawn + Offsets::HeroComponent +
+                         Offsets::HeroSpawnedId)
+        : 0;
+    if (heroId == kDrifterHeroId)
+        return std::isfinite(cachedRange)
+            ? (std::min)(cachedRange, 1080.0f) : 1080.0f;
+    return cachedRange;
+}
+
 } // namespace
+
+bool PrimaryWeaponTargetInRange(uintptr_t target) {
+    // Missing range metadata means the weapon is hitscan or currently cannot
+    // be classified, so fail open. A published finite projectile range is
+    // enforced with the same collision allowance as scripted abilities.
+    if (!target || !currentLocalPawn || !currentLocalPositionReady)
+        return true;
+    return TargetInProjectileRange(CachedPrimaryWeaponRange(), target);
+}
+
+bool PrimaryWeaponPointInRange(const Vector3& point) {
+    if (!currentLocalPawn || !currentLocalPositionReady) return true;
+    const float range = CachedPrimaryWeaponRange();
+    if (!std::isfinite(range)) return true;
+    if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
+        !std::isfinite(point.z)) return false;
+    Vector3 source = currentLocalPosition;
+    source.z += kHeroProjectileOriginHeight;
+    const float dx = point.x - source.x;
+    const float dy = point.y - source.y;
+    const float dz = point.z - source.z;
+    return dx * dx + dy * dy + dz * dz <= range * range;
+}
 
 Vector3 PredictPlayerAimPoint(uintptr_t target, const Vector3& point,
                               const Vector3& targetOrigin) {
@@ -980,31 +1193,7 @@ Vector3 PredictPlayerAimPoint(uintptr_t target, const Vector3& point,
     // the same embedded CCitadelWeaponInfo used by projectile hero abilities.
     // m_hActiveWeapon is a CBasePlayerWeapon and is only a fallback: treating
     // it as CitadelAbilityVData made prediction silently return the raw point.
-    uintptr_t weapon = FindAbility(0x15);
-    static uintptr_t weaponServicesOffset = 0;
-    static uintptr_t activeWeaponOffset = 0;
-    static ULONGLONG lastOffsetRetry = 0;
-    const ULONGLONG now = GetTickCount64();
-    if ((!weaponServicesOffset || !activeWeaponOffset) &&
-        now - lastOffsetRetry >= 1000) {
-        lastOffsetRetry = now;
-        if (!weaponServicesOffset) {
-            weaponServicesOffset = ResolveRuntimeSchemaOffset(
-                "C_BasePlayerPawn", "m_pWeaponServices");
-            if (!weaponServicesOffset) weaponServicesOffset = 0xEE8;
-        }
-        if (!activeWeaponOffset) {
-            activeWeaponOffset = ResolveRuntimeSchemaOffset(
-                "CPlayer_WeaponServices", "m_hActiveWeapon");
-            if (!activeWeaponOffset) activeWeaponOffset = 0x60;
-        }
-    }
-    const uintptr_t services = weaponServicesOffset
-        ? Read<uintptr_t>(currentLocalPawn + weaponServicesOffset) : 0;
-    const uint32_t weaponHandle = services && activeWeaponOffset
-        ? Read<uint32_t>(services + activeWeaponOffset) : 0xFFFFFFFFu;
-    if (!weapon && weaponHandle != 0xFFFFFFFFu)
-        weapon = ResolveEntity(weaponHandle);
+    uintptr_t weapon = FindPrimaryWeapon();
     if (!weapon) return point;
 
     const Vector3 observedTargetVelocity =
@@ -1024,7 +1213,7 @@ Vector3 PredictPlayerAimPoint(uintptr_t target, const Vector3& point,
 
 bool HeroScriptsNeedPlayerBones() {
     return vindictaAutoSnipeEnabled || hazeSleepDaggerEnabled ||
-           shivSerratedKnivesEnabled || bebopAbility3Enabled ||
+           shivSerratedKnivesEnabled ||
            drifterAbility2Enabled;
 }
 
@@ -1036,12 +1225,77 @@ void UpdateHeroScriptTargets(const std::vector<PlayerData>& players) {
         !currentLocalPawn || !currentLocalPositionReady) {
         std::lock_guard<std::mutex> lock(targetMutex);
         targetSnapshot = {};
+        bebopAbility2TargetSnapshot = {};
         return;
     }
 
     const uint8_t localTeam = Read<uint8_t>(currentLocalPawn + Offsets::Team);
     const float centerX = ImGui::GetIO().DisplaySize.x * 0.5f;
     const float centerY = ImGui::GetIO().DisplaySize.y * 0.5f;
+
+    if (heroId == kBebopId) {
+        TargetSnapshot autoTarget{};
+        if (bebopAbility2AutoEnabled) {
+            const uintptr_t stickyBomb = FindAbility(1);
+            const float castRange = AbilityProperty(
+                stickyBomb, "AbilityCastRange", 240.0f);
+            float nearestDistanceSquared = std::numeric_limits<float>::infinity();
+            for (const PlayerData& player : players) {
+                if (!player.entity || player.health <= 0 ||
+                    player.team == localTeam ||
+                    !TargetInProjectileRange(castRange, player.entity))
+                    continue;
+                Vector3 point{};
+                float screenDistance = 0.0f;
+                int boneIndex = -1;
+                if (!FirstVisibleAimPoint(
+                        player, kBebopId, centerX, centerY, 100000.0f, -1,
+                        false, point, screenDistance, boneIndex)) {
+                    // Sticky Bomb does not need a skeleton-specific hit point.
+                    // Keep the automatic cast available during short bone
+                    // snapshot gaps, but still require a live visibility trace.
+                    point = player.hasBodyBone
+                        ? player.bodyPos
+                        : Vector3{player.worldPos.x, player.worldPos.y,
+                                  player.worldPos.z + 52.0f};
+                    if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
+                        !std::isfinite(point.z) ||
+                        !IsWorldAimPointVisible(point, player.entity))
+                        continue;
+                }
+                const float dx = player.worldPos.x - currentLocalPosition.x;
+                const float dy = player.worldPos.y - currentLocalPosition.y;
+                const float dz = player.worldPos.z - currentLocalPosition.z;
+                const float distanceSquared = dx * dx + dy * dy + dz * dz;
+                if (distanceSquared >= nearestDistanceSquared) continue;
+                nearestDistanceSquared = distanceSquared;
+                autoTarget.entity = player.entity;
+                autoTarget.point = point;
+                autoTarget.boneIndex = boneIndex;
+                autoTarget.heroId = kBebopId;
+                autoTarget.health = player.health;
+                autoTarget.maxHealth = player.maxHealth;
+                autoTarget.updatedAt = GetTickCount64();
+                autoTarget.inAbilityRange = true;
+                Vector3 aimSource{};
+                if (ResolveHeroAimSource(kBebopId, aimSource))
+                    autoTarget.rawAngles = CalculateAngles(aimSource, point);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(targetMutex);
+            bebopAbility2TargetSnapshot = autoTarget;
+        }
+        if (!bebopAbility3Enabled) {
+            std::lock_guard<std::mutex> lock(targetMutex);
+            targetSnapshot = {};
+            return;
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(targetMutex);
+        bebopAbility2TargetSnapshot = {};
+    }
+
     const float fov = ScriptFov(heroId);
     const TargetSnapshot previous = ReadTarget();
     const Vector3 observedLocalVelocity = SampleTargetVelocity(
@@ -1056,9 +1310,6 @@ void UpdateHeroScriptTargets(const std::vector<PlayerData>& players) {
             player.entity == aimLockedTarget;
         if (aimLockedTarget && !forcedTarget) continue;
         if (heroId == kVindictaId && !VindictaCanKill(player, ability))
-            continue;
-        if (heroId == kBebopId &&
-            !BebopTargetInHookRange(ability, player.entity))
             continue;
         Vector3 point{};
         float distance = 0.0f;
@@ -1076,8 +1327,30 @@ void UpdateHeroScriptTargets(const std::vector<PlayerData>& players) {
             player.entity == previous.entity ? previous.boneIndex : -1;
         if (!FirstVisibleAimPoint(player, heroId, centerX, centerY,
                                   candidateFov, lockedBoneIndex, forcedTarget,
-                                  point,
-                                  distance, boneIndex)) continue;
+                                  point, distance, boneIndex)) {
+            if (heroId != kBebopId) continue;
+            // Hook targets the pawn body and does not require a complete
+            // seven-bone pose. Avoid rebuilding every hero skeleton on the
+            // engine callback merely because either Bebop script is enabled.
+            point = {player.worldPos.x, player.worldPos.y,
+                     player.worldPos.z + 52.0f};
+            if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
+                !std::isfinite(point.z) ||
+                !IsWorldAimPointVisible(point, player.entity))
+                continue;
+            Vector2 screen{};
+            if (!WorldToScreen(point, screen, currentViewMatrix)) {
+                if (!forcedTarget) continue;
+                distance = 0.0f;
+            } else {
+                const float dx = screen.x - centerX;
+                const float dy = screen.y - centerY;
+                distance = dx * dx + dy * dy;
+                if (!forcedTarget && distance >= candidateFov * candidateFov)
+                    continue;
+            }
+            boneIndex = -1;
+        }
         if (forcedTarget) {
             // The shared player lock bypasses every aim FOV, including hero
             // scripts. Visibility and each script's readiness rules remain.
@@ -1104,6 +1377,8 @@ void UpdateHeroScriptTargets(const std::vector<PlayerData>& players) {
         next.health = player.health;
         next.maxHealth = player.maxHealth;
         next.updatedAt = GetTickCount64();
+        next.inAbilityRange = ScriptTargetInAbilityRange(
+            heroId, ability, player.entity);
         Vector3 aimSource{};
         if (!ResolveHeroAimSource(heroId, aimSource)) continue;
         next.rawAngles = CalculateAngles(aimSource, point);
@@ -1120,7 +1395,7 @@ void UpdateHeroScriptTargets(const std::vector<PlayerData>& players) {
     // Visibility results are produced on the gameplay thread and can miss one
     // render frame while a trace is refreshed. Keep the last valid lock for a
     // very short grace period instead of cancelling an already opened scope.
-    if (heroId != kHazeId && !next.entity && previous.entity &&
+    if (heroId == kVindictaId && !next.entity && previous.entity &&
         previous.heroId == heroId &&
         GetTickCount64() - previous.updatedAt <= 150) {
         next = previous;
@@ -1178,6 +1453,38 @@ bool ProcessHeroScriptsUserCmd(CUserCmd* command, bool processInput,
     commandState.writeAngles = false;
     const TargetSnapshot target = ReadTarget();
     const float now = GetClientGameTime();
+
+    if (heroId == kBebopId && bebopAbility2AutoEnabled) {
+        static ULONGLONG nextAutomaticCastAt = 0;
+        static uintptr_t stickyAimCommand = 0;
+        if (stickyAimCommand &&
+            stickyAimCommand != reinterpret_cast<uintptr_t>(command)) {
+            ClearHeroSilentAngles();
+            stickyAimCommand = 0;
+        }
+        const ULONGLONG commandNow = GetTickCount64();
+        const TargetSnapshot stickyTarget = ReadBebopAbility2Target();
+        const uintptr_t stickyBomb = FindAbility(1);
+        const float castRange = AbilityProperty(
+            stickyBomb, "AbilityCastRange", 240.0f);
+        const bool validStickyTarget = stickyTarget.entity &&
+            stickyTarget.heroId == kBebopId &&
+            commandNow - stickyTarget.updatedAt <= 350 &&
+            TargetInProjectileRange(castRange, stickyTarget.entity) &&
+            IsWorldAimPointVisible(stickyTarget.point, stickyTarget.entity);
+        if (commandNow >= nextAutomaticCastAt && validStickyTarget &&
+            AbilityReady(stickyBomb, false)) {
+            ResetCommandState(true);
+            commandState.lastCommand = reinterpret_cast<uintptr_t>(command);
+            if (QueueSilentHeroTarget(stickyTarget, false, false)) {
+                commandState.tapMask |= kAbility2Mask;
+                stickyAimCommand = reinterpret_cast<uintptr_t>(command);
+                nextAutomaticCastAt = commandNow + 300;
+                ApplyButtonMasks(command, 0, 0, commandState.tapMask);
+                return true;
+            }
+        }
+    }
 
     // A newly selected shared lock must take effect immediately. Do not let a
     // script finish an old scope/aim state against a different pawn.
@@ -1247,25 +1554,36 @@ bool ProcessHeroScriptsUserCmd(CUserCmd* command, bool processInput,
         commandState.wasAbility1Held = held;
         const uintptr_t ability = FindAbility(ScriptAbilitySlot(heroId));
         const bool requireCharge = heroId == kShivId;
+        const bool targetUsable = TargetUsable(target, heroId);
+        const bool targetInRange = targetUsable && target.inAbilityRange &&
+            ScriptTargetInAbilityRange(heroId, ability, target.entity);
+        // The original physical press is already present in CUserCmd before
+        // hero scripts run. Explicitly remove it when the selected target is
+        // beyond the projectile's travel distance.
+        if (held && targetUsable && !targetInRange)
+            commandState.clearMask |= abilityMask;
         if (freshPress)
             LogDiagnostics("ability1-press", heroId, ability, target.entity,
                            AbilityReady(ability, requireCharge) ? 1 : 0);
         if (commandState.state == ScriptState::Idle && freshPress &&
-            TargetUsable(target, heroId) && AbilityReady(ability, requireCharge) &&
-            (heroId != kBebopId ||
-             BebopTargetInHookRange(ability, target.entity))) {
+            targetUsable && targetInRange &&
+            AbilityReady(ability, requireCharge)) {
             commandState.state = ScriptState::Aiming;
             commandState.lockedEntity = target.entity;
         }
         if (commandState.state == ScriptState::Aiming) {
             commandState.clearMask |= abilityMask;
-            if (!TargetUsable(target, heroId) ||
+            if (!targetUsable ||
                 (heroId != kHazeId &&
                  target.entity != commandState.lockedEntity) ||
                 !AbilityReady(ability, requireCharge) ||
-                (heroId == kBebopId &&
-                 !BebopTargetInHookRange(ability, target.entity))) {
+                !targetInRange) {
+                const bool blockOutOfRange = targetUsable && !targetInRange;
                 ResetCommandState(true);
+                if (blockOutOfRange) {
+                    ApplyButtonMasks(command, abilityMask, 0, 0);
+                    return true;
+                }
                 return false;
             }
             if (heroId == kHazeId) {
@@ -1306,17 +1624,22 @@ bool ProcessHeroScriptsUserCmd(CUserCmd* command, bool processInput,
             }
         } else if (commandState.state == ScriptState::Firing) {
             commandState.clearMask |= abilityMask;
-            if (!TargetUsable(target, heroId) ||
+            if (!targetUsable || !targetInRange ||
                 target.entity != commandState.lockedEntity ||
                 !AbilityReady(ability, false)) {
+                const bool blockOutOfRange = targetUsable && !targetInRange;
                 ResetCommandState(true);
+                if (blockOutOfRange) {
+                    ApplyButtonMasks(command, abilityMask, 0, 0);
+                    return true;
+                }
                 return false;
             }
             commandState.tapMask |= abilityMask;
             commandState.state = ScriptState::PostFire;
             commandState.nextActionTime = now + 0.2f;
         } else if (commandState.state == ScriptState::PostFire) {
-            if (TargetUsable(target, heroId) &&
+            if (targetUsable && targetInRange &&
                 (heroId == kHazeId ||
                  target.entity == commandState.lockedEntity) &&
                 now < commandState.nextActionTime) {
@@ -1385,6 +1708,7 @@ void ResetHeroScripts() {
     {
         std::lock_guard<std::mutex> lock(targetMutex);
         targetSnapshot = {};
+        bebopAbility2TargetSnapshot = {};
     }
     targetMotionSamples.clear();
     ResetCommandState();

@@ -39,7 +39,7 @@ void SetMenuOpen(bool open) {
 namespace {
 
 const char* AimKeyName(int key) {
-    static thread_local std::string name;
+    static std::string name;
     name = GetVirtualKeyDisplayName(key);
     return name.c_str();
 }
@@ -1287,15 +1287,21 @@ bool StabilizeEspScreenBox(uintptr_t entity, float rawLeft, float rawTop,
             track.velocityY *= velocityDecay;
         }
 
-        // Correct directly toward the latest primary-swap-chain sample.
-        // Do not extrapolate screen velocity: camera rotation is part of the
-        // screen displacement, and treating it as pawn velocity caused the
-        // filter to overshoot and amplify a matrix jump.
-        const float residualX = rawCenterX - track.centerX;
-        const float residualY = rawCenterY - track.centerY;
+        // Compensate only a fraction of one frame. The strict clamp prevents
+        // camera turns or teleports from producing the former overshoot while
+        // removing the visible delay of an asynchronously completed frame.
+        const float predictionTime = (std::min)(dt * 0.75f, 0.008f);
+        const float predictionX = std::clamp(
+            track.velocityX * predictionTime, -12.0f, 12.0f);
+        const float predictionY = std::clamp(
+            track.velocityY * predictionTime, -12.0f, 12.0f);
+        const float targetCenterX = rawCenterX + predictionX;
+        const float targetCenterY = rawCenterY + predictionY;
+        const float residualX = targetCenterX - track.centerX;
+        const float residualY = targetCenterY - track.centerY;
         const float residual = std::hypot(residualX, residualY);
-        const float responseRate = 90.0f +
-            (std::min)(residual * 4.0f, 130.0f);
+        const float responseRate = 32.0f +
+            (std::min)(residual * 1.5f, 90.0f);
         const float centerAlpha = 1.0f - std::exp(-responseRate * dt);
         track.centerX += residualX * centerAlpha;
         track.centerY += residualY * centerAlpha;
@@ -1303,7 +1309,7 @@ bool StabilizeEspScreenBox(uintptr_t entity, float rawLeft, float rawTop,
         // Width/height have no useful directional velocity. A fast
         // frame-rate-independent response removes capsule publication noise
         // without visibly changing the box size relative to the model.
-        const float sizeAlpha = 1.0f - std::exp(-90.0f * dt);
+        const float sizeAlpha = 1.0f - std::exp(-45.0f * dt);
         track.width += (rawWidth - track.width) * sizeAlpha;
         track.height += (rawHeight - track.height) * sizeAlpha;
 
@@ -1474,6 +1480,15 @@ bool GetCurrentCameraForward(Vector3& forward) {
     return GetCurrentCameraForwardImpl(forward);
 }
 
+bool ReadLiveViewMatrixSnapshot(Matrix4x4& matrix) {
+    return ReadCurrentViewMatrix(matrix);
+}
+
+static std::atomic<std::shared_ptr<const VisualFrameSnapshot>>
+    publishedVisualFrame{};
+static std::atomic<uint64_t> visualFrameSequence{0};
+static std::atomic_bool visualFrameSnapshotRequested{true};
+
 std::vector<PlayerData> GetPlayers() {
     std::vector<PlayerData> players;
     espStatus = {};
@@ -1484,6 +1499,20 @@ std::vector<PlayerData> GetPlayers() {
         ULONGLONG observedAt{};
     };
     static std::unordered_map<uintptr_t, CooldownObservation> cooldownObservations;
+    struct AbilitySnapshotCache {
+        std::array<AbilityEspData, 4> abilities{};
+        ULONGLONG sampledAt{};
+    };
+    static std::unordered_map<uintptr_t, AbilitySnapshotCache> abilitySnapshots;
+    if (abilitySnapshots.size() > 128) abilitySnapshots.clear();
+    struct IdentitySnapshotCache {
+        std::string value;
+        ULONGLONG sampledAt{};
+    };
+    static std::unordered_map<uintptr_t, IdentitySnapshotCache> heroNameSnapshots;
+    static std::unordered_map<uintptr_t, IdentitySnapshotCache> playerNameSnapshots;
+    if (heroNameSnapshots.size() > 128) heroNameSnapshots.clear();
+    if (playerNameSnapshots.size() > 128) playerNameSnapshots.clear();
 
     if (!clientBase) return players;
 
@@ -1508,6 +1537,7 @@ std::vector<PlayerData> GetPlayers() {
         std::lock_guard<std::mutex> lock(heroPawnsMutex);
         pawns = heroPawns;
     }
+    players.reserve(pawns.size());
     espStatus.heroPawnsFound = !pawns.empty();
 
     Vector3 localPos{};
@@ -1570,9 +1600,8 @@ std::vector<PlayerData> GetPlayers() {
         (aimToggleMode ? aimToggleActive : aimKeyDown);
     const bool farmNeedsBones = farmAssist &&
         (farmToggleMode ? farmToggleActive : farmKeyDown);
-    const bool needPlayerBones = drawBones || enemyBonesEnabled || allyBonesEnabled ||
-        aimNeedsBones || farmNeedsBones || aimLockedTarget != 0 ||
-        HeroScriptsNeedPlayerBones();
+    const bool gameplayNeedsBones = aimNeedsBones || farmNeedsBones ||
+        aimLockedTarget != 0 || HeroScriptsNeedPlayerBones();
     for (const uintptr_t entity : pawns) {
         // World snapshots may contain the local third-person pawn. It must
         // never be treated as an ESP target: its render skeleton is updated
@@ -1623,41 +1652,45 @@ std::vector<PlayerData> GetPlayers() {
         player.modelMinZ = validBounds ? collisionMins.z : 0.0f;
         player.modelMaxZ = validBounds ? collisionMaxs.z : 80.0f;
         player.modelHeight = player.modelMaxZ - player.modelMinZ;
-        if (needPlayerBones) {
-            player.hasHeadBone = GetEntityBonePosition(entity, "head", player.headPos);
-            // spine_3 is the stable upper-neck/shoulder joint used by the
-            // existing skeleton chain immediately below head. It provides a
-            // non-head aim point for Anti-Frog without inventing an offset.
-            player.hasNeckBone = GetEntityBonePosition(
-                entity, "spine_3", player.neckPos);
-            player.hasBodyBone = GetEntityBonePosition(entity, "spine_2", player.bodyPos);
-            if (!player.hasBodyBone) {
-                player.hasBodyBone = GetEntityBonePosition(
-                    entity, "spine_0", player.bodyPos);
-            }
-            player.hasLeftArmBone = GetEntityBonePosition(
-                entity, "arm_upper_L", player.leftArmPos);
-            player.hasRightArmBone = GetEntityBonePosition(
-                entity, "arm_upper_R", player.rightArmPos);
-            player.hasLeftLegBone = GetEntityBonePosition(
-                entity, "leg_upper_L", player.leftLegPos);
-            player.hasRightLegBone = GetEntityBonePosition(
-                entity, "leg_upper_R", player.rightLegPos);
-            const bool ally = localTeam != 0 && team == localTeam;
-            const bool skeletonEnabled = drawBones ||
-                (ally ? allyBonesEnabled : enemyBonesEnabled);
-            if (skeletonEnabled)
-                GetEntityBoneSkeleton(entity, player.bones);
+        const bool ally = localTeam != 0 && team == localTeam;
+        const bool skeletonEnabled = drawBones ||
+            (ally ? (allyEspEnabled && allyBonesEnabled)
+                  : (enemyEspEnabled && enemyBonesEnabled));
+        if (gameplayNeedsBones || skeletonEnabled) {
+            PopulatePlayerAimBones(entity, player, skeletonEnabled);
         }
         player.health = health;
         player.maxHealth = Read<int>(entity + Offsets::MaxHealth);
         if (controller) {
             const int liveMaxHealth = Read<int>(controller + Offsets::ControllerPlayerData + Offsets::PlayerDataHealthMax);
             if (liveMaxHealth > 0 && liveMaxHealth < 100000) player.maxHealth = liveMaxHealth;
-            player.playerName = ReadPlayerName(controller);
+            const ULONGLONG identityNow = GetTickCount64();
+            auto& nameSnapshot = playerNameSnapshots[controller];
+            if (!nameSnapshot.sampledAt ||
+                identityNow - nameSnapshot.sampledAt >= 2000) {
+                nameSnapshot.value = ReadPlayerName(controller);
+                nameSnapshot.sampledAt = identityNow;
+            }
+            player.playerName = nameSnapshot.value;
         }
         player.team = team;
-        player.heroName = ReadHeroName(entity);
+        const ULONGLONG identityNow = GetTickCount64();
+        auto& heroSnapshot = heroNameSnapshots[entity];
+        if (!heroSnapshot.sampledAt ||
+            identityNow - heroSnapshot.sampledAt >= 2000) {
+            heroSnapshot.value = ReadHeroName(entity);
+            heroSnapshot.sampledAt = identityNow;
+        }
+        player.heroName = heroSnapshot.value;
+        const bool allyPlayer = localTeam != 0 && team == localTeam;
+        const bool abilitiesRequested = allyPlayer
+            ? allyAbilitiesEnabled : enemyAbilitiesEnabled;
+        const ULONGLONG abilityNow = GetTickCount64();
+        auto& abilitySnapshot = abilitySnapshots[entity];
+        if (abilitiesRequested && abilitySnapshot.sampledAt &&
+            abilityNow - abilitySnapshot.sampledAt < 100) {
+            player.abilities = abilitySnapshot.abilities;
+        } else if (abilitiesRequested) {
         // Ability handles and their replicated state are resolved through the
         // runtime schema offsets.  Only the four hero slots are kept; weapons
         // and items occupy other slots in the same network vector.
@@ -1747,23 +1780,8 @@ std::vector<PlayerData> GetPlayers() {
                 }
             }
         }
-        {
-            constexpr uintptr_t abilityUpgradeStateStride = 0x38;
-            std::string state = player.heroName + " count=" + std::to_string(upgradeStateCount);
-            for (int index = 0; index < upgradeStateCount && upgradeStates; ++index) {
-                const uintptr_t entry = upgradeStates +
-                    static_cast<uintptr_t>(index) * abilityUpgradeStateStride;
-                state += " " + std::to_string(Read<uint32_t>(entry + 0x30)) + ":" +
-                    std::to_string(Read<uint32_t>(entry + Offsets::AbilityUpgradeStateInfo));
-            }
-            static std::unordered_map<uintptr_t, std::string> lastLoggedUpgradeStates;
-            if (lastLoggedUpgradeStates[entity] != state) {
-                lastLoggedUpgradeStates[entity] = state;
-                std::ofstream log(
-                    Dll6Paths::DataFileA("ability_levels.log"),
-                    std::ios::app);
-                if (log) log << state << '\n';
-            }
+        abilitySnapshot.abilities = player.abilities;
+        abilitySnapshot.sampledAt = abilityNow;
         }
         const float dx = pos.x - distanceOrigin.x;
         const float dy = pos.y - distanceOrigin.y;
@@ -1774,9 +1792,9 @@ std::vector<PlayerData> GetPlayers() {
                               : 0.0f;
         if (!std::isfinite(player.distance)) continue;
 
-        // AbsOrigin and the camera matrix are sampled in this fenced Present.
-        // This matches the proven c3 ESP path without adding screen-space
-        // smoothing, so starts/stops remain exact and stable.
+        // Use the interpolated transform consumed by scene rendering. The
+        // replicated AbsOrigin advances at simulation tick rate and makes ESP
+        // visibly stair-step on high-refresh displays.
         const bool hasScreenBounds = currentViewMatrixReady &&
             GetEntityScreenBounds(entity, pos, viewMatrix,
                                   player.boxLeft, player.boxTop,
@@ -1795,6 +1813,36 @@ std::vector<PlayerData> GetPlayers() {
     }
 
     return players;
+}
+
+void RequestVisualFrameSnapshot() {
+    visualFrameSnapshotRequested.store(true, std::memory_order_release);
+}
+
+void PublishVisualFrameSnapshot() {
+    if (!imguiInitialized || !clientBase ||
+        overlayProjectionWidth.load(std::memory_order_acquire) <= 0.0f ||
+        overlayProjectionHeight.load(std::memory_order_acquire) <= 0.0f)
+        return;
+    // ClientOutput may run more than once between two Presents. A full entity
+    // and bone snapshot is useful only once to the next rendered frame.
+    if (!visualFrameSnapshotRequested.exchange(
+            false, std::memory_order_acq_rel))
+        return;
+
+    std::lock_guard<std::mutex> stateLock(visualFrameStateMutex);
+    auto frame = std::make_shared<VisualFrameSnapshot>();
+    frame->players = GetPlayers();
+    if (!currentViewMatrixReady) return;
+    frame->viewMatrix = currentViewMatrix;
+    frame->sequence = visualFrameSequence.fetch_add(
+        1, std::memory_order_relaxed) + 1;
+    frame->capturedAt = GetTickCount64();
+    publishedVisualFrame.store(std::move(frame), std::memory_order_release);
+}
+
+std::shared_ptr<const VisualFrameSnapshot> AcquireVisualFrameSnapshot() {
+    return publishedVisualFrame.load(std::memory_order_acquire);
 }
 
 ID3D11ShaderResourceView* GetAbilityIconSrv(const std::string& heroName, int slot) {
@@ -2776,10 +2824,6 @@ void RenderESP(const std::vector<PlayerData>& players) {
             continue;
         }
 
-        // The visual snapshot is now fenced to the completed game frame.
-        // Draw its exact projection. The previous screen-space correction was
-        // compensating for mixed-frame samples and made the box trail behind
-        // the rendered model even after the source data became coherent.
         const float frameLeft = rawFrameLeft;
         const float frameTop = rawFrameTop;
         const float frameRight = rawFrameRight;
@@ -3147,7 +3191,7 @@ static void RenderMenuLegacy(size_t playerCount) {
                           ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
         ImGui::TableNextColumn();
         if (ImGui::CollapsingHeader("Aim", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::Checkbox("Aim assist", &aimAssist);
+            ImGui::Checkbox("Aimbot", &aimAssist);
             ImGui::SameLine();
             if (ImGui::RadioButton("Normal##AimMode", !aimSilentMode && !aimMixedMode)) {
                 aimSilentMode = false;
@@ -3287,7 +3331,7 @@ static void RenderMenuV1(size_t playerCount) {
     ImGui::TextColored(accent, "DEADLOCK");
     ImGui::TextColored(muted, "internal control");
     ImGui::Spacing();
-    const char* names[] = { "Visuals", "Aim assist", "Farm assist", "Misc" };
+    const char* names[] = { "Visuals", "Aimbot", "Farm assist", "Misc" };
     const char* descriptions[] = { "ESP & world", "Targeting", "Creeps & orbs", "Utility" };
     for (int i = 0; i < 4; ++i) {
         ImGui::PushID(i);
@@ -3342,8 +3386,8 @@ static void RenderMenuV1(size_t playerCount) {
         ImGui::ColorEdit4("Teammate box color", teammateBoxColor, ImGuiColorEditFlags_NoInputs);
         EndCard();
     } else if (tab == 1) {
-        Card("Aim assist", "Target selection and silent aim behavior");
-        Toggle("Enable aim assist", &aimAssist);
+        Card("Aimbot", "Target selection and silent aim behavior");
+        Toggle("Enable aimbot", &aimAssist);
         Toggle("Visibility check", &aimVisibilityCheck);
         const char* modes[] = { "Normal", "pSilent", "Mixed" };
         int mode = aimMixedMode ? 2 : (aimSilentMode ? 1 : 0);
@@ -3626,7 +3670,7 @@ static void RenderMenuV2(size_t playerCount) {
     ImGui::BeginChild("##sidebar_v2", ImVec2(205, 588), false, 0);
     ImGui::SetCursorPos(ImVec2(14, 22));
     ImGui::TextColored(secondary, "MODULES");
-    const char* tabNames[] = { "Visuals", "Aim assist", "Farm assist", "Misc" };
+    const char* tabNames[] = { "Visuals", "Aimbot", "Farm assist", "Misc" };
     const char* tabGlyphs[] = { "V", "A", "F", "M" };
     const char* tabDescriptions[] = { "ESP and rendering", "Combat targeting", "Creeps and souls", "Utility settings" };
     for (int i = 0; i < 4; ++i) {
@@ -3724,7 +3768,7 @@ static void RenderMenuV2(size_t playerCount) {
             EndPanel();
         } else if (activeTab == 1) {
             BeginPanel("##aim_general", "General", "Main targeting behavior", 490);
-            Toggle("Aim assist", "Enable player targeting", &aimAssist);
+            Toggle("Aimbot", "Enable player targeting", &aimAssist);
             Toggle("Visibility check", "Ignore occluded targets", &aimVisibilityCheck);
             int aimMode = aimMixedMode ? 2 : (aimSilentMode ? 1 : 0);
             const char* aimModes[] = { "Normal", "pSilent", "Mixed" };
@@ -4126,7 +4170,7 @@ void RenderMenu(size_t playerCount) {
     ImGui::SetCursorPos(ImVec2(0, headerHeight));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, side);
     ImGui::BeginChild("##reference_sidebar", ImVec2(sidebarWidth, bodyHeight), false, 0);
-    const char* tabNames[] = { "Visuals", "Aim assist", "Farm assist", "Misc" };
+    const char* tabNames[] = { "Visuals", "Aimbot", "Farm assist", "Misc" };
     for (int i = 0; i < 4; ++i) {
         ImGui::SetCursorPos(ImVec2(17, 18 + i * 77.0f));
         ImGui::PushID(i);
@@ -4249,7 +4293,7 @@ void RenderMenu(size_t playerCount) {
             Toggle("Health value", &drawHealthValues, teammateHealthColor);
             Toggle("Skeleton", &drawBones, enemyNameColor);
         } else if (activeTab == 1) {
-            Toggle("Enable aim assist", &aimAssist, nullptr);
+            Toggle("Enable aimbot", &aimAssist, nullptr);
             Toggle("Visibility check", &aimVisibilityCheck, nullptr);
             int aimMode = aimMixedMode ? 2 : (aimSilentMode ? 1 : 0);
             const char* aimModes[] = { "Normal", "pSilent", "Mixed" };

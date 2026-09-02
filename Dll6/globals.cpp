@@ -4,6 +4,9 @@
 #include "portable_paths.h"
 #include "resource.h"
 #include <cwctype>
+#include <fstream>
+#include <iterator>
+#include <sstream>
 bool freeCam=false;
 bool disableDrifterDarkness=false;
 bool autoActiveReload=false;
@@ -26,9 +29,6 @@ std::atomic<unsigned long long> wishDirectionCalls{0};
 std::atomic<unsigned long long> wishDirectionCorrectionCalls{0};
 std::mutex movementDebugTargetMutex; Vector3 movementDebugTarget{}; bool movementDebugTargetReady=false;
 std::mutex movementDebugWishMutex; Vector3 movementDebugWishDirection{}; bool movementDebugWishReady=false;
-#include <fstream>
-#include <sstream>
-
 std::wstring GetVirtualKeyDisplayNameW(int key) {
     if (key <= 0) return L"Not bound";
     switch (key) {
@@ -79,9 +79,97 @@ std::string GetVirtualKeyDisplayName(int key) {
 
 volatile ULONGLONG lastSilentAttackAppliedAt = 0;
 volatile LONG autoOrbAttackAppliedCount = 0;
-uintptr_t clientBase=0; bool menuOpen=false,drawEsp=true,drawBoxes=true,drawHealth=true,drawHealthValues=true,drawNames=true,drawDistance=true,drawSnaplines=false,drawFovCircle=true,drawFarmFovCircle=false,drawBones=false,drawCreepEsp=false,farmAssist=false,autoLastHitOrbs=false,drawOrbEsp=false,drawSpectatorList=false,collisionDiagnostics=false,remSizedHull=false,glowEnabled=true,aimAssist=true,autoParry=true,imguiInitialized=false,consoleAttached=false; float aimFov=180.0f,farmFov=180.0f,aimSmooth=6.0f,fovCircleAlpha=110.0f,farmFovAlpha=110.0f,snaplineAlpha=180.0f; bool aimVisibilityCheck=true; Vector3 currentLocalPosition{}; bool currentLocalPositionReady=false; Vector3 currentCameraPosition{}; bool currentCameraPositionReady=false; uintptr_t currentLocalPawn=0; uint32_t currentLocalPawnHandle=0xFFFFFFFFu; std::mutex meleeObjectsMutex; std::vector<uintptr_t> meleeObjects; std::mutex silentAnglesMutex; Vector3 pendingSilentAngles{}; bool pendingSilentAnglesReady=false,pendingSilentAttack=false; std::mutex humanSilentMutex,creepSilentMutex,orbSilentMutex; Vector3 pendingHumanAngles{},pendingCreepAngles{},pendingOrbAngles{}; bool pendingHumanReady=false,pendingCreepReady=false,pendingOrbReady=false,pendingOrbAttack=false; std::mutex farmTargetsMutex; std::vector<FarmTarget> farmTargets; std::mutex orbTargetsMutex; std::vector<OrbTarget> orbTargets; std::mutex worldEspTargetsMutex; std::vector<WorldEspTarget> worldEspTargets;
+uintptr_t clientBase=0; bool menuOpen=false,drawEsp=true,drawBoxes=true,drawHealth=true,drawHealthValues=true,drawNames=true,drawDistance=true,drawSnaplines=false,drawFovCircle=true,drawFarmFovCircle=false,drawBones=false,drawCreepEsp=false,farmAssist=false,autoLastHitOrbs=false,drawOrbEsp=false,drawSpectatorList=false,collisionDiagnostics=false,remSizedHull=false,glowEnabled=true,aimAssist=true,autoParry=true,imguiInitialized=false,consoleAttached=false; float aimFov=180.0f,farmFov=180.0f,aimSmooth=6.0f,fovCircleAlpha=110.0f,farmFovAlpha=110.0f,snaplineAlpha=180.0f; bool aimVisibilityCheck=true; Vector3 currentLocalPosition{}; std::atomic_bool currentLocalPositionReady=false; Vector3 currentCameraPosition{}; std::atomic_bool currentCameraPositionReady=false; std::atomic<uintptr_t> currentLocalPawn=0; std::atomic<uint32_t> currentLocalPawnHandle=0xFFFFFFFFu; std::mutex meleeObjectsMutex; std::vector<uintptr_t> meleeObjects; std::mutex silentAnglesMutex; Vector3 pendingSilentAngles{}; bool pendingSilentAnglesReady=false,pendingSilentAttack=false; std::mutex humanSilentMutex,creepSilentMutex,orbSilentMutex; Vector3 pendingHumanAngles{},pendingCreepAngles{},pendingOrbAngles{}; bool pendingHumanReady=false,pendingCreepReady=false,pendingOrbReady=false,pendingOrbAttack=false; std::mutex farmTargetsMutex; std::vector<FarmTarget> farmTargets; std::mutex orbTargetsMutex; std::vector<OrbTarget> orbTargets; std::mutex worldEspTargetsMutex; std::vector<WorldEspTarget> worldEspTargets;
 ID3D11Texture2D* depthStaging=nullptr; UINT depthWidth=0,depthHeight=0; DXGI_FORMAT depthFormat=DXGI_FORMAT_UNKNOWN; bool depthSnapshotReady=false; int depthDiagnosticState=-1; Matrix4x4 currentViewMatrix{}; bool currentViewMatrixReady=false;
-ID3D11Device* pDevice=nullptr; ID3D11DeviceContext* pContext=nullptr; ID3D11RenderTargetView* pRenderTargetView=nullptr; HWND gameWindow=nullptr; WNDPROC oWndProc=nullptr; HMODULE moduleHandle=nullptr; HANDLE moduleInstanceGuard=nullptr,moduleReadyEvent=nullptr; void** presentVTable=nullptr; volatile LONG unloadRequested=0,unloadThreadStarted=0; std::mutex glowMutex,heroPawnsMutex; std::unordered_set<uintptr_t> registeredGlows,queuedGlows; EspStatus espStatus; std::unordered_map<uintptr_t,bool> combatVTables; std::vector<uintptr_t> heroVTables,heroPawns; HANDLE heroDiscoveryThread=nullptr,glowApplyThread=nullptr,farmTargetThread=nullptr,stopHeroDiscoveryEvent=nullptr; PresentFn oPresent=nullptr;
+bool pendingOrbHoldAttack = false;
+std::atomic_bool gameTextInputActive{false};
+namespace {
+std::atomic_bool gameConsoleInputActive{false};
+std::atomic_bool gameChatInputActive{false};
+std::atomic_bool consoleToggleHeld{false};
+std::atomic_bool enterHeld{false};
+std::atomic_bool escapeHeld{false};
+std::atomic_bool gameCursorReleased{false};
+
+void PublishGameTextInputState() {
+    gameTextInputActive.store(
+        gameConsoleInputActive.load(std::memory_order_acquire) ||
+        gameChatInputActive.load(std::memory_order_acquire),
+        std::memory_order_release);
+}
+}
+
+bool AreCustomBindsSuppressed() {
+    return menuOpen || gameTextInputActive.load(std::memory_order_acquire) ||
+        gameCursorReleased.load(std::memory_order_acquire);
+}
+
+void UpdateGameTextInputKey(int key, bool down) {
+    std::atomic_bool* held = nullptr;
+    // Deadlock's shipped/current user_keys.vcfg binds toggleconsole to F7.
+    // Keep OEM_3 as the standard Source fallback.
+    if (key == VK_OEM_3 || key == VK_F7) held = &consoleToggleHeld;
+    else if (key == VK_RETURN) held = &enterHeld;
+    else if (key == VK_ESCAPE) held = &escapeHeld;
+    else return;
+
+    const bool wasDown = held->exchange(down, std::memory_order_acq_rel);
+    if (!down || wasDown || menuOpen) return;
+
+    if (key == VK_OEM_3 || key == VK_F7) {
+        const bool active = !gameConsoleInputActive.load(
+            std::memory_order_acquire);
+        gameConsoleInputActive.store(active, std::memory_order_release);
+        if (active)
+            gameChatInputActive.store(false, std::memory_order_release);
+    } else if (key == VK_RETURN) {
+        // Enter executes a console command without closing the console. It
+        // only opens/closes the ordinary game chat when the console is shut.
+        if (!gameConsoleInputActive.load(std::memory_order_acquire)) {
+            const bool active = !gameChatInputActive.load(
+                std::memory_order_acquire);
+            gameChatInputActive.store(active, std::memory_order_release);
+        }
+    } else {
+        gameConsoleInputActive.store(false, std::memory_order_release);
+        gameChatInputActive.store(false, std::memory_order_release);
+    }
+    PublishGameTextInputState();
+}
+
+void ResetGameTextInputState() {
+    gameConsoleInputActive.store(false, std::memory_order_release);
+    gameChatInputActive.store(false, std::memory_order_release);
+    consoleToggleHeld.store(false, std::memory_order_release);
+    enterHeld.store(false, std::memory_order_release);
+    escapeHeld.store(false, std::memory_order_release);
+    gameCursorReleased.store(false, std::memory_order_release);
+    gameTextInputActive.store(false, std::memory_order_release);
+}
+
+void SetGameImeInputActive() {
+    gameChatInputActive.store(true, std::memory_order_release);
+    PublishGameTextInputState();
+}
+
+void NotifyGameCursorCapture(bool captured) {
+    if (menuOpen) return;
+    if (!captured) {
+        gameCursorReleased.store(true, std::memory_order_release);
+        return;
+    }
+    // Clicking the Panorama console's close button restores relative mouse
+    // capture without sending the console toggle key or Escape.
+    if (gameCursorReleased.exchange(false, std::memory_order_acq_rel)) {
+        gameConsoleInputActive.store(false, std::memory_order_release);
+        consoleToggleHeld.store(false, std::memory_order_release);
+        PublishGameTextInputState();
+    }
+}
+std::atomic<float> overlayProjectionWidth{0.0f};
+std::atomic<float> overlayProjectionHeight{0.0f};
+std::mutex visualFrameStateMutex;
+ID3D11Device* pDevice=nullptr; ID3D11DeviceContext* pContext=nullptr; ID3D11RenderTargetView* pRenderTargetView=nullptr; HWND gameWindow=nullptr; WNDPROC oWndProc=nullptr; HMODULE moduleHandle=nullptr; HANDLE moduleInstanceGuard=nullptr,moduleReadyEvent=nullptr,manualMapInfoHandle=nullptr; bool manualMappedModule=false; void** presentVTable=nullptr; volatile LONG unloadRequested=0,unloadThreadStarted=0; std::mutex glowMutex,heroPawnsMutex; std::unordered_set<uintptr_t> registeredGlows,queuedGlows; EspStatus espStatus; std::unordered_map<uintptr_t,bool> combatVTables; std::vector<uintptr_t> heroVTables,heroPawns; HANDLE heroDiscoveryThread=nullptr,glowApplyThread=nullptr,farmTargetThread=nullptr,stopHeroDiscoveryEvent=nullptr; PresentFn oPresent=nullptr; ResizeBuffersFn oResizeBuffers=nullptr;
 bool humanAimTargetFound = false;
 bool aimSilentMode = false;
 bool aimMixedMode = false;
@@ -157,9 +245,6 @@ int enemyGlowMode = 0, allyGlowMode = 0;
 bool enemyChamsEnabled = false, allyChamsEnabled = false;
 float enemyChamsColor[4] = {1.00f, 0.35f, 0.75f, 1.00f};
 float allyChamsColor[4] = {0.25f, 0.65f, 1.00f, 1.00f};
-bool enemyInvisibleChamsEnabled = false, allyInvisibleChamsEnabled = false;
-float enemyInvisibleChamsColor[4] = {0.72f, 0.18f, 0.95f, 1.00f};
-float allyInvisibleChamsColor[4] = {0.12f, 0.42f, 0.95f, 1.00f};
 float enemyNameColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
 float teammateNameColor[4] = {0.35f, 0.75f, 1.00f, 1.00f};
 float enemySkeletonColor[4] = {1.00f, 1.00f, 1.00f, 1.00f};
@@ -204,6 +289,8 @@ float campTimerMinimapSize = 15.0f;
 std::mutex campTimersMutex; std::vector<CampTimerData> campTimers;
 namespace {
 std::string configPathOverride;
+std::mutex configFileMutex;
+std::unordered_map<std::string, std::string> savedConfigContents;
 
 std::string ConfigPath() {
     if (!configPathOverride.empty()) return configPathOverride;
@@ -509,8 +596,6 @@ void LoadConfig() {
         else if (key == "enemyRadarEnabled") enemyRadarEnabled = value;
         else if (key == "enemyChamsEnabled") enemyChamsEnabled = value;
         else if (key == "allyChamsEnabled") allyChamsEnabled = value;
-        else if (key == "enemyInvisibleChamsEnabled") enemyInvisibleChamsEnabled = value;
-        else if (key == "allyInvisibleChamsEnabled") allyInvisibleChamsEnabled = value;
         else if (key == "enemyChamsR") enemyChamsColor[0] = static_cast<float>(number);
         else if (key == "enemyChamsG") enemyChamsColor[1] = static_cast<float>(number);
         else if (key == "enemyChamsB") enemyChamsColor[2] = static_cast<float>(number);
@@ -519,14 +604,6 @@ void LoadConfig() {
         else if (key == "allyChamsG") allyChamsColor[1] = static_cast<float>(number);
         else if (key == "allyChamsB") allyChamsColor[2] = static_cast<float>(number);
         else if (key == "allyChamsA") allyChamsColor[3] = static_cast<float>(number);
-        else if (key == "enemyInvisibleChamsR") enemyInvisibleChamsColor[0] = static_cast<float>(number);
-        else if (key == "enemyInvisibleChamsG") enemyInvisibleChamsColor[1] = static_cast<float>(number);
-        else if (key == "enemyInvisibleChamsB") enemyInvisibleChamsColor[2] = static_cast<float>(number);
-        else if (key == "enemyInvisibleChamsA") enemyInvisibleChamsColor[3] = static_cast<float>(number);
-        else if (key == "allyInvisibleChamsR") allyInvisibleChamsColor[0] = static_cast<float>(number);
-        else if (key == "allyInvisibleChamsG") allyInvisibleChamsColor[1] = static_cast<float>(number);
-        else if (key == "allyInvisibleChamsB") allyInvisibleChamsColor[2] = static_cast<float>(number);
-        else if (key == "allyInvisibleChamsA") allyInvisibleChamsColor[3] = static_cast<float>(number);
         if (key == "creepBoxR") creepBoxColor[0] = static_cast<float>(number);
         else if (key == "creepBoxG") creepBoxColor[1] = static_cast<float>(number);
         else if (key == "creepBoxB") creepBoxColor[2] = static_cast<float>(number);
@@ -655,6 +732,7 @@ void LoadConfig() {
         else if (key == "hazeSleepDaggerEnabled") hazeSleepDaggerEnabled = value;
         else if (key == "shivSerratedKnivesEnabled") shivSerratedKnivesEnabled = value;
         else if (key == "bebopAbility3Enabled") bebopAbility3Enabled = value;
+        else if (key == "bebopAbility2AutoEnabled") bebopAbility2AutoEnabled = value;
         else if (key == "drifterAbility2Enabled") drifterAbility2Enabled = value;
         else if (key == "heroScriptsShowFov") heroScriptsShowFov = value;
         else if (key == "hazePredictionDot") hazePredictionDot = value;
@@ -747,8 +825,9 @@ bool LoadConfigProfile(const std::wstring& name) {
 }
 
 void SaveConfig() {
-    std::ofstream output(ConfigPath(), std::ios::trunc);
-    if (!output) return;
+    std::lock_guard<std::mutex> lock(configFileMutex);
+    const std::string path = ConfigPath();
+    std::ostringstream output;
     output << "drawEsp " << drawEsp << '\n'
            << "previewEnemyHero " << GetPanoramaPreviewHeroForRole(0) << '\n'
            << "previewAllyHero " << GetPanoramaPreviewHeroForRole(1) << '\n'
@@ -890,16 +969,6 @@ void SaveConfig() {
            << "allyChamsG " << allyChamsColor[1] << '\n'
            << "allyChamsB " << allyChamsColor[2] << '\n'
            << "allyChamsA " << allyChamsColor[3] << '\n'
-           << "enemyInvisibleChamsEnabled " << enemyInvisibleChamsEnabled << '\n'
-           << "allyInvisibleChamsEnabled " << allyInvisibleChamsEnabled << '\n'
-           << "enemyInvisibleChamsR " << enemyInvisibleChamsColor[0] << '\n'
-           << "enemyInvisibleChamsG " << enemyInvisibleChamsColor[1] << '\n'
-           << "enemyInvisibleChamsB " << enemyInvisibleChamsColor[2] << '\n'
-           << "enemyInvisibleChamsA " << enemyInvisibleChamsColor[3] << '\n'
-           << "allyInvisibleChamsR " << allyInvisibleChamsColor[0] << '\n'
-           << "allyInvisibleChamsG " << allyInvisibleChamsColor[1] << '\n'
-           << "allyInvisibleChamsB " << allyInvisibleChamsColor[2] << '\n'
-           << "allyInvisibleChamsA " << allyInvisibleChamsColor[3] << '\n'
            << "enemyHealthBarR " << enemyHealthBarColor[0] << '\n'
            << "enemyHealthBarG " << enemyHealthBarColor[1] << '\n'
            << "enemyHealthBarB " << enemyHealthBarColor[2] << '\n'
@@ -1029,6 +1098,7 @@ void SaveConfig() {
            << "hazeSleepDaggerEnabled " << hazeSleepDaggerEnabled << '\n'
            << "shivSerratedKnivesEnabled " << shivSerratedKnivesEnabled << '\n'
            << "bebopAbility3Enabled " << bebopAbility3Enabled << '\n'
+           << "bebopAbility2AutoEnabled " << bebopAbility2AutoEnabled << '\n'
            << "drifterAbility2Enabled " << drifterAbility2Enabled << '\n'
            << "heroScriptsShowFov " << heroScriptsShowFov << '\n'
            << "hazePredictionDot " << hazePredictionDot << '\n'
@@ -1047,4 +1117,44 @@ void SaveConfig() {
            << "drifterAbility2Fov " << drifterAbility2Fov << '\n'
            << "drifterAbility2SmoothX " << drifterAbility2SmoothX << '\n'
            << "drifterAbility2SmoothY " << drifterAbility2SmoothY << '\n';
+    if (!output.good()) return;
+
+    const std::string contents = output.str();
+    auto cached = savedConfigContents.find(path);
+    if (cached == savedConfigContents.end()) {
+        std::ifstream existing(path, std::ios::binary);
+        std::string existingContents;
+        if (existing) {
+            existingContents.assign(std::istreambuf_iterator<char>(existing),
+                                    std::istreambuf_iterator<char>());
+        }
+        cached = savedConfigContents.emplace(path, std::move(existingContents)).first;
+    }
+
+    const DWORD attributes = GetFileAttributesA(path.c_str());
+    const bool targetExists =
+        attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    if (targetExists && cached->second == contents) return;
+
+    const std::string temporary = path + ".tmp";
+    std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+    if (!file) return;
+    file.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+    file.flush();
+    if (!file.good()) {
+        file.close();
+        DeleteFileA(temporary.c_str());
+        return;
+    }
+    file.close();
+    // Never truncate the live config. A crash or game termination can at
+    // worst leave the temporary file behind; the previous menu.ini remains
+    // intact and is still loaded on the next start.
+    if (MoveFileExA(temporary.c_str(), path.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        cached->second = contents;
+    } else {
+        DeleteFileA(temporary.c_str());
+    }
 }

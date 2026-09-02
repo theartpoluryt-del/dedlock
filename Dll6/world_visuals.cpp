@@ -16,9 +16,14 @@ uintptr_t postProcessEnable{};
 bool oldPostProcessEnable{true}, postProcessCaptured{}, postProcessSuppressed{};
 EnvSkyUpdateFn updateSky{};
 ULONGLONG nextScan{};
+uint32_t nextEntityIndex{};
 uintptr_t skyTint{}, skyLightTint{}, skyBrightness{}, skyEnabled{};
 bool resolved{};
 bool worldStateApplied{};
+bool appliedSkySettingsValid{};
+ColorRGBA appliedSkyTint{}, appliedLightTint{};
+float appliedSkyBrightness{};
+bool appliedSkyEnabled{};
 
 bool Readable(uintptr_t address, size_t size = sizeof(uintptr_t)) {
     if (address < 0x10000 || !size) return false;
@@ -33,6 +38,10 @@ ColorRGBA ColorFrom(const float* value) {
     return {static_cast<uint8_t>(std::clamp(value[0], 0.f, 1.f) * 255.f + .5f),
             static_cast<uint8_t>(std::clamp(value[1], 0.f, 1.f) * 255.f + .5f),
             static_cast<uint8_t>(std::clamp(value[2], 0.f, 1.f) * 255.f + .5f), 255};
+}
+
+bool SameColor(const ColorRGBA& a, const ColorRGBA& b) {
+    return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
 }
 
 void ResolveFields() {
@@ -72,24 +81,31 @@ void NotifySky(uintptr_t entity) {
     __try { updateSky(entity); } __except (EXCEPTION_EXECUTE_HANDLER) { updateSky = nullptr; }
 }
 
-void ApplySky(uintptr_t entity) {
+void ApplySky(uintptr_t entity, const ColorRGBA& tint,
+              const ColorRGBA& lightingTint, float brightness,
+              bool enabled, bool force = false) {
     if (!skyTint || !skyLightTint || !skyBrightness || !skyEnabled) return;
     auto [it, fresh] = skyStates.try_emplace(entity);
     if (fresh) it->second = {Read<ColorRGBA>(entity + skyTint), Read<ColorRGBA>(entity + skyLightTint),
                              Read<float>(entity + skyBrightness), Read<bool>(entity + skyEnabled)};
-    const bool blackSky = skyboxBrightness <= 0.0001f;
-    const float black[4] = {0.f, 0.f, 0.f, 1.f};
-    Write<ColorRGBA>(entity + skyTint,
-                     ColorFrom(blackSky ? black : skyboxColor));
-    Write<ColorRGBA>(entity + skyLightTint, ColorFrom(lightColor));
-    // Source 2 treats an exact zero brightness scale as "not supplied" and
-    // falls back to the material's default exposure.  A black tint plus a
-    // tiny positive scale produces an actually black sky at the slider's 0.
-    Write<float>(entity + skyBrightness,
-                 blackSky ? 0.0001f
-                          : std::clamp(skyboxBrightness, 0.0001f, 50.f));
-    Write<bool>(entity + skyEnabled, !disableSkybox);
-    NotifySky(entity);
+    bool changed = force || fresh;
+    if (force || !SameColor(Read<ColorRGBA>(entity + skyTint), tint)) {
+        Write<ColorRGBA>(entity + skyTint, tint);
+        changed = true;
+    }
+    if (force || !SameColor(Read<ColorRGBA>(entity + skyLightTint), lightingTint)) {
+        Write<ColorRGBA>(entity + skyLightTint, lightingTint);
+        changed = true;
+    }
+    if (force || std::fabs(Read<float>(entity + skyBrightness) - brightness) > 0.0001f) {
+        Write<float>(entity + skyBrightness, brightness);
+        changed = true;
+    }
+    if (force || Read<bool>(entity + skyEnabled) != enabled) {
+        Write<bool>(entity + skyEnabled, enabled);
+        changed = true;
+    }
+    if (changed) NotifySky(entity);
 }
 
 }
@@ -128,6 +144,9 @@ void RestoreWorldVisuals() {
     }
     skyStates.clear();
     worldStateApplied = false;
+    appliedSkySettingsValid = false;
+    nextEntityIndex = 0;
+    nextScan = 0;
 }
 
 void UpdateWorldVisuals() {
@@ -142,14 +161,58 @@ void UpdateWorldVisuals() {
         return;
     }
     worldStateApplied = true;
-    SetCVarBool(drawSkybox, !disableSkybox); SetCVarBool(draw3dSkybox, !disableSkybox);
+    const bool skyVisible = !disableSkybox;
+    if (drawSkybox && CVarBool(drawSkybox) != skyVisible)
+        SetCVarBool(drawSkybox, skyVisible);
+    if (draw3dSkybox && CVarBool(draw3dSkybox) != skyVisible)
+        SetCVarBool(draw3dSkybox, skyVisible);
+
+    const bool blackSky = skyboxBrightness <= 0.0001f;
+    const float black[4] = {0.f, 0.f, 0.f, 1.f};
+    const ColorRGBA desiredSkyTint = ColorFrom(blackSky ? black : skyboxColor);
+    const ColorRGBA desiredLightTint = ColorFrom(lightColor);
+    const float desiredBrightness = blackSky
+        ? 0.0001f : std::clamp(skyboxBrightness, 0.0001f, 50.f);
+    const bool settingsChanged = !appliedSkySettingsValid ||
+        !SameColor(appliedSkyTint, desiredSkyTint) ||
+        !SameColor(appliedLightTint, desiredLightTint) ||
+        std::fabs(appliedSkyBrightness - desiredBrightness) > 0.0001f ||
+        appliedSkyEnabled != skyVisible;
+    if (settingsChanged) {
+        appliedSkyTint = desiredSkyTint;
+        appliedLightTint = desiredLightTint;
+        appliedSkyBrightness = desiredBrightness;
+        appliedSkyEnabled = skyVisible;
+        appliedSkySettingsValid = true;
+        for (const auto& [entity, unused] : skyStates) {
+            (void)unused;
+            if (Readable(entity, sizeof(uintptr_t)))
+                ApplySky(entity, desiredSkyTint, desiredLightTint,
+                         desiredBrightness, skyVisible, true);
+        }
+    }
+
+    // A full 4096-entity scan every 100 ms caused a visible CPU hitch. Spread
+    // discovery across frames: one complete pass now takes roughly two
+    // seconds at 120 FPS, while already discovered skies update immediately.
     const ULONGLONG now = GetTickCount64();
     if (now < nextScan) return;
-    nextScan = now + 100;
-    for (uint32_t index = 0; index < 4096; ++index) {
+    constexpr uint32_t ScanBudget = 32;
+    bool completedScan = false;
+    for (uint32_t scanned = 0; scanned < ScanBudget; ++scanned) {
+        const uint32_t index = nextEntityIndex++;
+        if (nextEntityIndex >= 4096) {
+            nextEntityIndex = 0;
+            completedScan = true;
+        }
         const uintptr_t entity = ResolveEntityIndex(index);
         if (!entity) continue;
         const std::string name = GetEntityClassName(entity);
-        if (name.find("EnvSky") != std::string::npos) ApplySky(entity);
+        if (name.find("EnvSky") != std::string::npos)
+            ApplySky(entity, desiredSkyTint, desiredLightTint,
+                     desiredBrightness, skyVisible);
     }
+    // A completed discovery pass is enough for the current map. Recheck only
+    // occasionally for reconnects or newly created sky entities.
+    nextScan = now + (completedScan ? 5000 : 16);
 }

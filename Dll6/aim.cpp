@@ -1,4 +1,5 @@
 #include "shared.h"
+#include "hero_scripts.h"
 #include "portable_paths.h"
 #include <cstring>
 #include <fstream>
@@ -17,12 +18,15 @@ bool WorldToScreen(const Vector3& pos, Vector2& screen, const Matrix4x4& matrix)
     float x = matrix.m[0][0] * pos.x + matrix.m[0][1] * pos.y + matrix.m[0][2] * pos.z + matrix.m[0][3];
     float y = matrix.m[1][0] * pos.x + matrix.m[1][1] * pos.y + matrix.m[1][2] * pos.z + matrix.m[1][3];
 
-    const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
-    if (displaySize.x <= 0.0f || displaySize.y <= 0.0f) return false;
+    const float displayWidth =
+        overlayProjectionWidth.load(std::memory_order_acquire);
+    const float displayHeight =
+        overlayProjectionHeight.load(std::memory_order_acquire);
+    if (displayWidth <= 0.0f || displayHeight <= 0.0f) return false;
 
     float invW = 1.0f / w;
-    screen.x = (displaySize.x * 0.5f) + (x * invW * displaySize.x * 0.5f);
-    screen.y = (displaySize.y * 0.5f) - (y * invW * displaySize.y * 0.5f);
+    screen.x = (displayWidth * 0.5f) + (x * invW * displayWidth * 0.5f);
+    screen.y = (displayHeight * 0.5f) - (y * invW * displayHeight * 0.5f);
     return std::isfinite(screen.x) && std::isfinite(screen.y);
 }
 
@@ -185,8 +189,16 @@ static std::vector<uint8_t> depthSnapshotData;
 static UINT depthSnapshotRowPitch = 0;
 static std::mutex trackedDepthMutex;
 static std::atomic<bool> trackedDepthArmed{true};
+static ID3D11Query* frameFenceQuery = nullptr;
+static std::atomic<bool> mainDepthSeen{false};
+static std::atomic<bool> frameFenceIssued{false};
+// Native engine traces own all aim visibility in the current build. Keep the
+// depth implementation available as a fallback, but do not track or read back
+// D3D depth resources while it is unused.
+constexpr bool EnableNativeAimTrace = true;
 
 void ArmGameDepthCapture() {
+    mainDepthSeen.store(false, std::memory_order_release);
     trackedDepthArmed.store(true, std::memory_order_release);
 }
 
@@ -228,15 +240,33 @@ void TrackGameDepthStencil(ID3D11DepthStencilView* depthView) {
         texture->Release();
         return;
     }
+    mainDepthSeen.store(true, std::memory_order_release);
     std::lock_guard<std::mutex> lock(trackedDepthMutex);
     if (cachedGameDepth) cachedGameDepth->Release();
     cachedGameDepth = texture;
 }
 
+void SignalEarlyFrameFence(ID3D11DeviceContext* context) {
+    if (!context || context != pContext || !pDevice ||
+        !mainDepthSeen.load(std::memory_order_acquire))
+        return;
+    bool expected = false;
+    if (!frameFenceIssued.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel))
+        return;
+    if (!frameFenceQuery) {
+        const D3D11_QUERY_DESC description{D3D11_QUERY_EVENT, 0};
+        if (FAILED(pDevice->CreateQuery(&description, &frameFenceQuery))) {
+            frameFenceIssued.store(false, std::memory_order_release);
+            return;
+        }
+    }
+    context->End(frameFenceQuery);
+}
+
 // Native visibility is resolved from the live client image. TraceShape, the
 // manager global and the complete CTraceFilter constructor all move between
 // game patches, so none of them is kept as a hardcoded RVA.
-constexpr bool EnableNativeAimTrace = true;
 constexpr char TraceShapePattern[] =
     "48 89 5C 24 20 48 89 4C 24 08 55 56 41 54 41 55 41 56 "
     "48 8D AC 24 10 E0 FF FF B8 F0 20 00 00 E8 ? ? ? ? "
@@ -386,12 +416,16 @@ bool ResolveNativeVisibility() {
 
 struct VisibilityTraceRequest {
     Vector3 point{};
+    Vector3 start{};
     uintptr_t targetEntity{};
+    uintptr_t cacheKey{};
     ULONGLONG requestedAt{};
+    bool customStart = false;
 };
 
 struct VisibilityTraceCacheEntry {
     Vector3 point{};
+    Vector3 start{};
     bool visible = true;
     ULONGLONG completedAt{};
 };
@@ -632,6 +666,92 @@ bool GetAimAnglesFromScreen(float screenX, float screenY, Vector3& angles) {
     return std::isfinite(angles.x) && std::isfinite(angles.y);
 }
 
+bool PopulatePlayerAimBones(uintptr_t entity, PlayerData& player,
+                            bool includeSkeleton) {
+    if (!entity) return false;
+    ResolveBoneFunctions();
+    if (!boneFunctions.getBoneIdByName) return false;
+    const uintptr_t sceneNode =
+        Read<uintptr_t>(entity + Offsets::GameSceneNode);
+    if (!sceneNode) return false;
+
+    __try {
+        // Rendered heroes already own a current world-space pose. Forcing the
+        // engine to rebuild it for every hero on every visual frame duplicated
+        // animation work and reduced the game's FPS. Only initialize a pose
+        // when the engine has not published its bone array yet.
+        uintptr_t bones = Read<uintptr_t>(sceneNode + 0x1D0);
+        if (!bones && boneFunctions.calcWorldSpaceBones) {
+            boneFunctions.calcWorldSpaceBones(sceneNode, 0xFFFFFu);
+            bones = Read<uintptr_t>(sceneNode + 0x1D0);
+        }
+        if (!bones) return false;
+        const auto readBone = [&](const char* name, Vector3& position) {
+            const int index = boneFunctions.getBoneIdByName(entity, name);
+            if (index < 0 || index > 512) return false;
+            const uintptr_t address =
+                bones + static_cast<uintptr_t>(index) * 0x20;
+            const Vector3 first = Read<Vector3>(address);
+            const Vector3 second = Read<Vector3>(address);
+            if (std::memcmp(&first, &second, sizeof(first)) != 0) return false;
+            position = second;
+            return std::isfinite(position.x) && std::isfinite(position.y) &&
+                   std::isfinite(position.z);
+        };
+        player.hasHeadBone = readBone("head", player.headPos);
+        player.hasNeckBone = readBone("spine_3", player.neckPos);
+        player.hasBodyBone = readBone("spine_2", player.bodyPos);
+        if (!player.hasBodyBone)
+            player.hasBodyBone = readBone("spine_0", player.bodyPos);
+        player.hasLeftArmBone =
+            readBone("arm_upper_L", player.leftArmPos);
+        player.hasRightArmBone =
+            readBone("arm_upper_R", player.rightArmPos);
+        player.hasLeftLegBone =
+            readBone("leg_upper_L", player.leftLegPos);
+        player.hasRightLegBone =
+            readBone("leg_upper_R", player.rightLegPos);
+        if (includeSkeleton) {
+            struct BonePair { const char* start; const char* end; };
+            static constexpr BonePair pairs[] = {
+                {"spine_0", "spine_1"}, {"spine_1", "spine_2"},
+                {"spine_2", "spine_3"}, {"spine_3", "head"},
+                {"spine_3", "arm_upper_L"},
+                {"arm_upper_L", "arm_lower_L"},
+                {"arm_lower_L", "arm_lower_L_TWIST"},
+                {"arm_lower_L_TWIST", "arm_lower_L_TWIST1"},
+                {"arm_lower_L", "hand_L"},
+                {"arm_upper_L", "forearm_L"}, {"forearm_L", "hand_L"},
+                {"arm_upper_L", "elbow_L"}, {"elbow_L", "wrist_L"},
+                {"spine_3", "arm_upper_R"},
+                {"arm_upper_R", "arm_lower_R"},
+                {"arm_lower_R", "arm_lower_R_TWIST"},
+                {"arm_lower_R_TWIST", "arm_lower_R_TWIST1"},
+                {"arm_lower_R", "hand_R"},
+                {"arm_upper_R", "forearm_R"}, {"forearm_R", "hand_R"},
+                {"arm_upper_R", "elbow_R"}, {"elbow_R", "wrist_R"},
+                {"spine_0", "leg_upper_L"},
+                {"leg_upper_L", "leg_lower_L"},
+                {"leg_lower_L", "leg_L_IKTARGET"},
+                {"spine_0", "leg_upper_R"},
+                {"leg_upper_R", "leg_lower_R"},
+                {"leg_lower_R", "leg_R_IKTARGET"}
+            };
+            player.bones.clear();
+            player.bones.reserve(std::size(pairs));
+            for (const auto& pair : pairs) {
+                Vector3 start{}, end{};
+                if (readBone(pair.start, start) && readBone(pair.end, end))
+                    player.bones.push_back({start, end});
+            }
+        }
+        return player.hasHeadBone || player.hasNeckBone ||
+               player.hasBodyBone;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool GetAimAnglesToWorldPoint(const Vector3& point, Vector3& angles) {
     Vector3 source{};
     bool sourceReady = currentCameraPositionReady;
@@ -741,7 +861,8 @@ bool QueueAimVisibilityTrace(const Vector3& point, uintptr_t targetEntity) {
     const uintptr_t key = targetEntity ? targetEntity : 1;
     const ULONGLONG now = GetTickCount64();
     std::lock_guard<std::mutex> lock(visibilityTraceMutex);
-    pendingVisibilityTraces[key] = {point, targetEntity, now};
+    pendingVisibilityTraces[key] = {
+        point, {}, targetEntity, key, now, false};
 
     const auto cached = visibilityTraceCache.find(key);
     // Unknown visibility must never be treated as visible. That optimistic
@@ -757,6 +878,35 @@ bool QueueAimVisibilityTrace(const Vector3& point, uintptr_t targetEntity) {
     // require a fresh trace after a teleport or a materially different point.
     if (dx * dx + dy * dy + dz * dz > 96.0f * 96.0f) return false;
     return cached->second.visible;
+}
+
+bool TryGetWorldVisibilitySnapshot(
+    const Vector3& point, uintptr_t targetEntity, bool& visible) {
+    if (!currentCameraPositionReady) return false;
+    constexpr uintptr_t CameraVisibilityKey =
+        uintptr_t{1} << (sizeof(uintptr_t) * 8 - 1);
+    const uintptr_t entityKey = targetEntity ? targetEntity : 1;
+    const uintptr_t key = entityKey ^ CameraVisibilityKey;
+    const ULONGLONG now = GetTickCount64();
+    std::lock_guard<std::mutex> lock(visibilityTraceMutex);
+    pendingVisibilityTraces[key] = {
+        point, currentCameraPosition, targetEntity, key, now, true};
+    const auto cached = visibilityTraceCache.find(key);
+    if (cached == visibilityTraceCache.end() ||
+        now - cached->second.completedAt > 100)
+        return false;
+    const float dx = cached->second.point.x - point.x;
+    const float dy = cached->second.point.y - point.y;
+    const float dz = cached->second.point.z - point.z;
+    if (dx * dx + dy * dy + dz * dz > 96.0f * 96.0f)
+        return false;
+    const float sx = cached->second.start.x - currentCameraPosition.x;
+    const float sy = cached->second.start.y - currentCameraPosition.y;
+    const float sz = cached->second.start.z - currentCameraPosition.z;
+    if (sx * sx + sy * sy + sz * sz > 32.0f * 32.0f)
+        return false;
+    visible = cached->second.visible;
+    return true;
 }
 
 void ProcessAimVisibilityTraces() {
@@ -776,20 +926,82 @@ void ProcessAimVisibilityTraces() {
         }
     }
 
-    Vector3 traceStart = currentLocalPosition;
-    traceStart.z += 64.0f;
     for (const auto& request : requests) {
+        Vector3 traceStart = request.start;
+        if (!request.customStart) {
+            traceStart = currentLocalPosition;
+            traceStart.z += 64.0f;
+        }
         const bool visible =
             PhysicsTraceVisible(traceStart, request.point, request.targetEntity);
-        const uintptr_t key = request.targetEntity ? request.targetEntity : 1;
+        const uintptr_t key = request.cacheKey
+            ? request.cacheKey
+            : (request.targetEntity ? request.targetEntity : 1);
         std::lock_guard<std::mutex> lock(visibilityTraceMutex);
         visibilityTraceCache[key] =
-            {request.point, visible, GetTickCount64()};
+            {request.point, traceStart, visible, GetTickCount64()};
     }
 }
 
 bool CaptureDepthSnapshot() {
     depthSnapshotReady = false;
+    if constexpr (EnableNativeAimTrace) {
+        if (!pContext || !pDevice) return true;
+        if (!frameFenceQuery) {
+            const D3D11_QUERY_DESC description{D3D11_QUERY_EVENT, 0};
+            if (FAILED(pDevice->CreateQuery(&description, &frameFenceQuery)))
+                return true;
+        }
+        bool expected = false;
+        if (frameFenceIssued.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            // Fallback for render paths that never explicitly unbind the main
+            // depth target. Normally the query was already issued earlier.
+            pContext->End(frameFenceQuery);
+        }
+        LARGE_INTEGER frequency{}, started{};
+        QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&started);
+        unsigned spinCount = 0;
+        for (;;) {
+            // Submit pending commands once. Further polls must not repeatedly
+            // flush the immediate context while the GPU catches up.
+            const UINT flags = spinCount == 0
+                ? 0u : D3D11_ASYNC_GETDATA_DONOTFLUSH;
+            const HRESULT status = pContext->GetData(
+                frameFenceQuery, nullptr, 0, flags);
+            if (status == S_OK) {
+                frameFenceIssued.store(false, std::memory_order_release);
+                return true;
+            }
+            if (FAILED(status)) {
+                frameFenceIssued.store(false, std::memory_order_release);
+                return false;
+            }
+            LARGE_INTEGER current{};
+            QueryPerformanceCounter(&current);
+            const double elapsedMs = frequency.QuadPart
+                ? (current.QuadPart - started.QuadPart) * 1000.0 /
+                      frequency.QuadPart
+                : 0.0;
+            if (elapsedMs >= 16.0) {
+                frameFenceQuery->Release();
+                frameFenceQuery = nullptr;
+                frameFenceIssued.store(false, std::memory_order_release);
+                return false;
+            }
+            if ((++spinCount & 0xFFu) == 0)
+                SwitchToThread();
+            else
+                YieldProcessor();
+        }
+    }
+    if (frameFenceQuery) {
+        frameFenceQuery->Release();
+        frameFenceQuery = nullptr;
+    }
+    frameFenceIssued.store(false, std::memory_order_release);
+    mainDepthSeen.store(false, std::memory_order_release);
     auto setDepthState = [](int state) {
         if (depthDiagnosticState == state) return;
         depthDiagnosticState = state;
@@ -922,6 +1134,12 @@ bool CaptureDepthSnapshot() {
 }
 
 void ReleaseAimResources() {
+    if (frameFenceQuery) {
+        frameFenceQuery->Release();
+        frameFenceQuery = nullptr;
+    }
+    frameFenceIssued.store(false, std::memory_order_release);
+    mainDepthSeen.store(false, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(trackedDepthMutex);
         if (cachedGameDepth) {
@@ -1069,7 +1287,9 @@ bool GetAimPointScreen(const PlayerData& player, float height, Vector2& screen) 
 
 void FarmAimAssist(const std::vector<PlayerData>& players) {
     farmNormalActive = false;
-    const bool configuredFarmKeyDown = (GetAsyncKeyState(farmAssistKey) & 0x8000) != 0;
+    const bool textInputActive = AreCustomBindsSuppressed();
+    const bool configuredFarmKeyDown = !textInputActive &&
+        (GetAsyncKeyState(farmAssistKey) & 0x8000) != 0;
     const bool configuredFarmKeyPressed = configuredFarmKeyDown && !farmToggleLastDown;
     if (farmAssist && farmToggleMode && configuredFarmKeyPressed) {
         farmToggleActive = !farmToggleActive;
@@ -1080,8 +1300,9 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
         ClearPendingCreepAngles();
         return;
     }
-    const bool farmAiming = farmToggleMode ? farmToggleActive : configuredFarmKeyDown;
-    if (menuOpen || !currentViewMatrixReady || !farmAiming) {
+    const bool farmAiming = !textInputActive &&
+        (farmToggleMode ? farmToggleActive : configuredFarmKeyDown);
+    if (!currentViewMatrixReady || !farmAiming) {
         ClearPendingCreepAngles();
         return;
     }
@@ -1155,6 +1376,7 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
         // populated for every NPC_Trooper variant).
         Vector3 point{ candidate.target.pos.x, candidate.target.pos.y,
                        candidate.target.pos.z + 64.0f };
+        if (!PrimaryWeaponPointInRange(point)) continue;
         if (aimVisibilityCheck && depthAvailable &&
             !IsWorldAimPointVisible(point, candidate.target.entity)) continue;
         Vector2 screen{};
@@ -1201,7 +1423,9 @@ void FarmAimAssist(const std::vector<PlayerData>& players) {
 
 void AutoLastHitOrbs() {
     static bool orbToggleLastDown = false;
-    const bool configuredKeyDown = (GetAsyncKeyState(autoLastHitOrbsKey) & 0x8000) != 0;
+    const bool textInputActive = AreCustomBindsSuppressed();
+    const bool configuredKeyDown = !textInputActive &&
+        (GetAsyncKeyState(autoLastHitOrbsKey) & 0x8000) != 0;
     const bool configuredKeyPressed = configuredKeyDown && !orbToggleLastDown;
     if (autoLastHitOrbs && autoLastHitOrbsToggleMode && configuredKeyPressed) {
         autoLastHitOrbsActive = !autoLastHitOrbsActive;
@@ -1209,13 +1433,22 @@ void AutoLastHitOrbs() {
     orbToggleLastDown = configuredKeyDown;
     if (!autoLastHitOrbs) autoLastHitOrbsActive = false;
     else if (!autoLastHitOrbsToggleMode) autoLastHitOrbsActive = configuredKeyDown;
-    const bool orbAimActive = autoLastHitOrbs && autoLastHitOrbsActive;
+    const bool orbAimActive = autoLastHitOrbs && autoLastHitOrbsActive &&
+        !textInputActive;
     if (!orbAimActive || menuOpen || !currentViewMatrixReady) {
         std::lock_guard<std::mutex> lock(orbSilentMutex);
         pendingOrbAttack = false;
+        pendingOrbHoldAttack = false;
         pendingOrbReady = false;
         return;
     }
+
+    constexpr uint32_t kBebopHeroId = 15;
+    const uint32_t localHeroId = currentLocalPawn
+        ? Read<uint32_t>(currentLocalPawn + Offsets::HeroComponent +
+                         Offsets::HeroSpawnedId) : 0;
+    const bool bebopWindup = localHeroId == kBebopHeroId &&
+        autoLastHitOrbsAutoFire;
 
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     const float centerX = display.x * 0.5f;
@@ -1223,9 +1456,11 @@ void AutoLastHitOrbs() {
     OrbTarget best{};
     Vector2 bestScreen{};
     float bestDistance = FLT_MAX;
+    bool bestAttackable = false;
     static uintptr_t lastOrb = 0;
     static LONG attackBaseline = 0;
     static ULONGLONG attackStarted = 0;
+    static ULONGLONG bebopHoldEnds = 0;
     static ULONGLONG lastAttackApplied = 0;
     static uint8_t attackPulsesApplied = 0;
     static ULONGLONG firstAttackDelay = 0;
@@ -1239,7 +1474,8 @@ void AutoLastHitOrbs() {
             if (!IsXpOrbAlive(orb.entity, orb.handle)) continue;
             // The orb is visible immediately after launch, but it has no
             // hitbox until CItemXP.m_flAttackableTime has elapsed.
-            if (!IsXpOrbAttackable(orb.entity, orb.handle)) continue;
+            const bool attackable = IsXpOrbAttackable(orb.entity, orb.handle);
+            if (!attackable && !bebopWindup) continue;
             Vector3 point{};
             // Keep orb aim on the same visual position as ESP and the
             // scanner; this is also the coordinate used for stale detection.
@@ -1248,6 +1484,7 @@ void AutoLastHitOrbs() {
                 point = orb.pos;
             }
             if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) continue;
+            if (!PrimaryWeaponPointInRange(point)) continue;
             if (orbAimVisibilityCheck && (EnableNativeAimTrace
                 ? clientBase != 0 : depthSnapshotReady) &&
                 !IsWorldAimPointVisible(point, orb.entity)) continue;
@@ -1258,17 +1495,20 @@ void AutoLastHitOrbs() {
             const float dx = screen.x - centerX;
             const float dy = screen.y - centerY;
             const float distance = dx * dx + dy * dy;
-            if (distance < bestDistance) {
+            if ((attackable && !bestAttackable) ||
+                (attackable == bestAttackable && distance < bestDistance)) {
                 best = orb;
                 best.pos = point;
                 bestScreen = screen;
                 bestDistance = distance;
+                bestAttackable = attackable;
             }
         }
     }
     if (!best.entity) {
         std::lock_guard<std::mutex> lock(orbSilentMutex);
         pendingOrbAttack = false;
+        pendingOrbHoldAttack = false;
         pendingOrbReady = false;
         lastOrb = 0;
         lastAttackApplied = 0;
@@ -1276,13 +1516,20 @@ void AutoLastHitOrbs() {
     }
 
     Vector3 commandAngles{};
-    if (!GetAimAnglesFromScreen(bestScreen.x, bestScreen.y, commandAngles)) return;
+    if (!GetAimAnglesFromScreen(bestScreen.x, bestScreen.y, commandAngles)) {
+        std::lock_guard<std::mutex> lock(orbSilentMutex);
+        pendingOrbAttack = false;
+        pendingOrbHoldAttack = false;
+        pendingOrbReady = false;
+        return;
+    }
 
     const ULONGLONG now = GetTickCount64();
     if (best.entity != lastOrb) {
         lastOrb = best.entity;
         attackBaseline = autoOrbAttackAppliedCount;
         attackStarted = now;
+        bebopHoldEnds = bebopWindup ? now + 250 + 360 : 0;
         lastAttackApplied = 0;
         attackPulsesApplied = 0;
         firstAttackDelay = static_cast<ULONGLONG>(firstDelayDistribution(jitterRng));
@@ -1298,14 +1545,17 @@ void AutoLastHitOrbs() {
             secondAttackDelay = static_cast<ULONGLONG>(secondDelayDistribution(jitterRng));
         }
     }
-    const bool fire = autoLastHitOrbsAutoFire && attackPulsesApplied < 2 &&
-        ((attackPulsesApplied == 0 && now - attackStarted >= firstAttackDelay) ||
-         (attackPulsesApplied == 1 && now - lastAttackApplied >= secondAttackDelay)) &&
-        now - attackStarted < 800;
+    const bool fire = bebopWindup
+        ? now - attackStarted >= 250 && now < bebopHoldEnds
+        : autoLastHitOrbsAutoFire && attackPulsesApplied < 2 &&
+            ((attackPulsesApplied == 0 && now - attackStarted >= firstAttackDelay) ||
+             (attackPulsesApplied == 1 && now - lastAttackApplied >= secondAttackDelay)) &&
+            now - attackStarted < 800;
     {
         std::lock_guard<std::mutex> lock(orbSilentMutex);
         pendingOrbAngles = commandAngles;
         pendingOrbAttack = fire;
+        pendingOrbHoldAttack = bebopWindup && fire;
         pendingOrbReady = true;
     }
 }
@@ -1378,7 +1628,7 @@ bool AntiFrogUsesBodySlot() {
 bool RollHitchance() {
     if (aimHitchance >= 99.99f) return true;
     if (aimHitchance <= 0.01f) return false;
-    thread_local std::mt19937 generator(std::random_device{}());
+    static std::mt19937 generator(std::random_device{}());
     std::uniform_real_distribution<float> distribution(0.0f, 100.0f);
     return distribution(generator) <= std::clamp(aimHitchance, 0.0f, 100.0f);
 }
@@ -1436,7 +1686,7 @@ void UpdateAimTargetLock(const std::vector<PlayerData>& players) {
         }
     }
 
-    const bool keyDown = aimLockKey > 0 &&
+    const bool keyDown = !AreCustomBindsSuppressed() && aimLockKey > 0 &&
         (GetAsyncKeyState(aimLockKey) & 0x8000) != 0;
     const bool keyPressed = keyDown && !aimLockKeyLastDown;
     aimLockKeyLastDown = keyDown;
@@ -1496,7 +1746,7 @@ void NotifyAntiFrogDamage(int attackerEntityIndex, int victimEntityIndex,
     const float threshold = std::clamp(antiFrogHsThreshold, 1.0f, 99.0f);
     const float targetRatio = threshold / 100.0f;
     const float currentRatio = antiFrogHeadshotPercent / 100.0f;
-    thread_local std::mt19937 generator(std::random_device{}());
+    static std::mt19937 generator(std::random_device{}());
     std::uniform_real_distribution<float> probability(0.0f, 1.0f);
     const float roll = probability(generator);
     antiFrogHeadSlot = false;
@@ -1542,8 +1792,11 @@ const char* GetAntiFrogSlotLabel() {
 
 void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     humanAimTargetFound = false;
-    const bool leftButtonDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-    const bool rightButtonDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    const bool textInputActive = AreCustomBindsSuppressed();
+    const bool leftButtonDown = !textInputActive &&
+        (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    const bool rightButtonDown = !textInputActive &&
+        (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
     // Treat the two persisted booleans as one mode. Older menu variants and
     // configs could leave both true; in that state the old ternaries made
     // Mixed wait for LMB as if it were pure pSilent and its visible pass died.
@@ -1553,14 +1806,15 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
     aimSilentActive = silentPass;
     if ((!mixedMode && !leftButtonDown) || (!silentMode && !mixedMode))
         ClearPendingSilentAngles();
-    const bool configuredAimKeyDown = (GetAsyncKeyState(aimAssistKey) & 0x8000) != 0;
+    const bool configuredAimKeyDown = !textInputActive &&
+        (GetAsyncKeyState(aimAssistKey) & 0x8000) != 0;
     const bool configuredAimKeyPressed = configuredAimKeyDown && !aimToggleLastDown;
     if (aimToggleMode && configuredAimKeyPressed) aimToggleActive = !aimToggleActive;
     aimToggleLastDown = configuredAimKeyDown;
     const bool keyActive = aimToggleMode ? aimToggleActive : configuredAimKeyDown;
     aimNormalActive = !silentMode && !mixedMode && keyActive;
     const bool aiming = silentMode ? (keyActive && leftButtonDown) : keyActive;
-    if (!aimAssist || menuOpen || !aiming || !currentViewMatrixReady) {
+    if (!aimAssist || textInputActive || !aiming || !currentViewMatrixReady) {
         cachedVisibleAimReady = false;
         ResetNormalMouseAim();
         aimSilentActive = false;
@@ -1590,6 +1844,7 @@ void AimAtClosestEnemy(const std::vector<PlayerData>& players) {
         const bool forcedTarget = aimLockedTarget &&
             player.entity == aimLockedTarget;
         if (aimLockedTarget && !forcedTarget) continue;
+        if (!PrimaryWeaponTargetInRange(player.entity)) continue;
         const float modelHeight = player.modelHeight > 20.0f ? player.modelHeight : 80.0f;
         const float modelMinZ = std::isfinite(player.modelMinZ) ? player.modelMinZ : 0.0f;
         const float fallbackHead = modelMinZ + modelHeight * 0.92f;

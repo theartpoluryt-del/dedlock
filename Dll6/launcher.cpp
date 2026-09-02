@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -18,6 +19,7 @@
 #include <thread>
 #include <vector>
 
+#include "launcher_auth.h"
 #include "launcher_resource.h"
 
 #pragma comment(lib, "bcrypt.lib")
@@ -30,16 +32,12 @@ constexpr wchar_t kWindowClass[] = L"AxiomLauncherWindow";
 constexpr wchar_t kWindowTitle[] = L"Axiom Launcher";
 constexpr wchar_t kTargetProcess[] = L"deadlock.exe";
 constexpr wchar_t kSteamLaunchUri[] = L"steam://rungameid/1422450";
-constexpr wchar_t kDefaultLocalKey[] = L"ARTPO-LOCAL-2026";
 constexpr int kChromeHeight = 38;
 constexpr int kContentLift = 28;
 constexpr UINT kLaunchFinished = WM_APP + 1;
-
-// SHA-256 of the normalized local key. Replace this validator with the server
-// implementation later; the UI and launch pipeline do not depend on it.
-constexpr std::array<std::wstring_view, 1> kLocalKeyHashes{
-    L"77b4f5801fa4d5c3041c198039e797fa0e989f45b8d8e35c46e4c33d1e761c5b"
-};
+constexpr UINT kLaunchProgress = WM_APP + 2;
+constexpr DWORD kRemoteCallTimeoutMs = 20000;
+constexpr DWORD kInitializerTimeoutMs = 30000;
 
 HWND g_keyEdit{};
 HWND g_launchButton{};
@@ -57,9 +55,11 @@ int g_chromePressed{};
 std::wstring g_statusText{L"Готов к запуску"};
 COLORREF g_statusColor{RGB(152, 158, 172)};
 bool g_launching{};
+DWORD g_remoteCallExitCode{};
+bool g_remoteCallTimedOut{};
 
 struct ScopedHandle {
-    HANDLE value{INVALID_HANDLE_VALUE};
+    HANDLE value{ INVALID_HANDLE_VALUE };
     ScopedHandle() = default;
     explicit ScopedHandle(HANDLE handle) : value(handle) {}
     ~ScopedHandle() {
@@ -71,80 +71,574 @@ struct ScopedHandle {
     bool valid() const { return value && value != INVALID_HANDLE_VALUE; }
 };
 
-std::wstring TrimAndNormalize(std::wstring value) {
-    const auto whitespace = [](wchar_t character) {
-        return iswspace(character) != 0;
+uintptr_t FindRemoteModule(DWORD processId, std::wstring_view moduleName) {
+    ScopedHandle snapshot(CreateToolhelp32Snapshot(
+        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId));
+    if (!snapshot.valid()) return 0;
+    MODULEENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (!Module32FirstW(snapshot, &entry)) return 0;
+    do {
+        if (_wcsicmp(entry.szModule, moduleName.data()) == 0)
+            return reinterpret_cast<uintptr_t>(entry.modBaseAddr);
+    } while (Module32NextW(snapshot, &entry));
+    return 0;
+}
+
+bool FitsIn(size_t offset, size_t size, size_t total) {
+    return offset <= total && size <= total - offset;
+}
+
+struct RemoteCallContext {
+    uintptr_t function;
+    uintptr_t argument1;
+    uint64_t argument2;
+    uintptr_t argument3;
+    uintptr_t result;
+};
+
+bool RemoteCall3(HANDLE process, uintptr_t function, uintptr_t argument1,
+                 uint64_t argument2, uintptr_t argument3,
+                 uintptr_t& result) {
+    g_remoteCallExitCode = 0;
+    g_remoteCallTimedOut = false;
+    static constexpr uint8_t code[] = {
+        0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9,
+        0x48, 0x8B, 0x03, 0x48, 0x8B, 0x4B, 0x08, 0x48,
+        0x8B, 0x53, 0x10, 0x4C, 0x8B, 0x43, 0x18, 0xFF,
+        0xD0,
+        0x48, 0x89, 0x43, 0x20, 0x48, 0x83, 0xC4, 0x20,
+        0x5B, 0xC3
     };
-    value.erase(value.begin(), std::find_if_not(value.begin(), value.end(), whitespace));
-    value.erase(std::find_if_not(value.rbegin(), value.rend(), whitespace).base(), value.end());
-    std::transform(value.begin(), value.end(), value.begin(), towupper);
-    return value;
-}
-
-std::string WideToUtf8(const std::wstring& value) {
-    if (value.empty()) return {};
-    const int size = WideCharToMultiByte(CP_UTF8, 0, value.data(),
-        static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
-    if (size <= 0) return {};
-    std::string result(static_cast<size_t>(size), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
-        result.data(), size, nullptr, nullptr);
-    return result;
-}
-
-bool Sha256(const std::string& value, std::array<unsigned char, 32>& digest) {
-    BCRYPT_ALG_HANDLE algorithm{};
-    BCRYPT_HASH_HANDLE hash{};
-    DWORD objectSize = 0;
-    DWORD hashSize = 0;
-    DWORD received = 0;
-    std::vector<unsigned char> object;
-
-    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM,
-                                    nullptr, 0) < 0) return false;
-    const auto closeAlgorithm = std::unique_ptr<void, decltype([](void* handle) {
-        if (handle) BCryptCloseAlgorithmProvider(
-            static_cast<BCRYPT_ALG_HANDLE>(handle), 0);
-    })>(algorithm, {});
-    if (BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
-                          reinterpret_cast<PUCHAR>(&objectSize),
-                          sizeof(objectSize), &received, 0) < 0 ||
-        BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH,
-                          reinterpret_cast<PUCHAR>(&hashSize),
-                          sizeof(hashSize), &received, 0) < 0 ||
-        hashSize != digest.size()) return false;
-    object.resize(objectSize);
-    if (BCryptCreateHash(algorithm, &hash, object.data(), objectSize,
-                         nullptr, 0, 0) < 0) return false;
-    const auto closeHash = std::unique_ptr<void, decltype([](void* handle) {
-        if (handle) BCryptDestroyHash(static_cast<BCRYPT_HASH_HANDLE>(handle));
-    })>(hash, {});
-    if (BCryptHashData(hash,
-                       reinterpret_cast<PUCHAR>(const_cast<char*>(value.data())),
-                       static_cast<ULONG>(value.size()), 0) < 0) return false;
-    return BCryptFinishHash(hash, digest.data(),
-                            static_cast<ULONG>(digest.size()), 0) >= 0;
-}
-
-std::wstring HexDigest(const std::array<unsigned char, 32>& digest) {
-    static constexpr wchar_t digits[] = L"0123456789abcdef";
-    std::wstring result;
-    result.resize(digest.size() * 2);
-    for (size_t i = 0; i < digest.size(); ++i) {
-        result[i * 2] = digits[digest[i] >> 4];
-        result[i * 2 + 1] = digits[digest[i] & 0x0F];
+    const SIZE_T contextSize = sizeof(RemoteCallContext);
+    const SIZE_T totalSize = contextSize + sizeof(code);
+    void* remote = VirtualAllocEx(process, nullptr, totalSize,
+                                  MEM_COMMIT | MEM_RESERVE,
+                                  PAGE_EXECUTE_READWRITE);
+    if (!remote) return false;
+    RemoteCallContext context{function, argument1, argument2, argument3, 0};
+    const auto cleanup = [&] {
+        VirtualFreeEx(process, remote, 0, MEM_RELEASE);
+    };
+    if (!WriteProcessMemory(process, remote, &context, contextSize, nullptr) ||
+        !WriteProcessMemory(process,
+            static_cast<uint8_t*>(remote) + contextSize,
+            code, sizeof(code), nullptr)) {
+        cleanup();
+        return false;
     }
-    return result;
+    FlushInstructionCache(process,
+        static_cast<uint8_t*>(remote) + contextSize, sizeof(code));
+    ScopedHandle thread(CreateRemoteThread(process, nullptr, 0,
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(
+            static_cast<uint8_t*>(remote) + contextSize),
+        remote, 0, nullptr));
+    if (!thread.valid()) {
+        cleanup();
+        return false;
+    }
+    const DWORD waitResult = WaitForSingleObject(thread, kRemoteCallTimeoutMs);
+    if (waitResult != WAIT_OBJECT_0) {
+        g_remoteCallTimedOut = true;
+        // The thread may still execute the trampoline. Its memory must remain
+        // valid until the target process exits.
+        return false;
+    }
+    GetExitCodeThread(thread, &g_remoteCallExitCode);
+    if (!ReadProcessMemory(process, remote, &context, contextSize, nullptr)) {
+        cleanup();
+        return false;
+    }
+    result = context.result;
+    cleanup();
+    return true;
 }
 
-bool ValidateLocalLicense(const std::wstring& rawKey) {
-    const std::wstring normalized = TrimAndNormalize(rawKey);
-    if (normalized.empty()) return false;
-    std::array<unsigned char, 32> digest{};
-    if (!Sha256(WideToUtf8(normalized), digest)) return false;
-    const std::wstring encoded = HexDigest(digest);
-    return std::find(kLocalKeyHashes.begin(), kLocalKeyHashes.end(), encoded) !=
-           kLocalKeyHashes.end();
+uintptr_t RemoteAddressForLocal(DWORD processId, const void* address) {
+    HMODULE owner{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(address), &owner)) return 0;
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleFileNameW(owner, path, static_cast<DWORD>(std::size(path))))
+        return 0;
+    const wchar_t* name = wcsrchr(path, L'\\');
+    name = name ? name + 1 : path;
+    const uintptr_t remoteBase = FindRemoteModule(processId, name);
+    if (!remoteBase) return 0;
+    return remoteBase + reinterpret_cast<uintptr_t>(address) -
+           reinterpret_cast<uintptr_t>(owner);
+}
+
+uintptr_t RemoteLoadDependency(HANDLE process, DWORD processId,
+                               const char* moduleName) {
+    wchar_t wideName[MAX_PATH]{};
+    const int converted = MultiByteToWideChar(
+        CP_ACP, 0, moduleName, -1, wideName, static_cast<int>(std::size(wideName)));
+    if (converted > 0) {
+        const uintptr_t existing = FindRemoteModule(processId, wideName);
+        if (existing) return existing;
+    }
+    const HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    const FARPROC loadLibrary = kernel
+        ? GetProcAddress(kernel, "LoadLibraryA") : nullptr;
+    const uintptr_t remoteLoadLibrary = loadLibrary
+        ? RemoteAddressForLocal(processId, loadLibrary) : 0;
+    if (!remoteLoadLibrary) return 0;
+    const SIZE_T bytes = strlen(moduleName) + 1;
+    void* remoteName = VirtualAllocEx(process, nullptr, bytes,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!remoteName) return 0;
+    if (!WriteProcessMemory(process, remoteName, moduleName, bytes, nullptr)) {
+        VirtualFreeEx(process, remoteName, 0, MEM_RELEASE);
+        return 0;
+    }
+    uintptr_t result = 0;
+    const bool called = RemoteCall3(process, remoteLoadLibrary,
+        reinterpret_cast<uintptr_t>(remoteName), 0, 0, result);
+    VirtualFreeEx(process, remoteName, 0, MEM_RELEASE);
+    return called ? result : 0;
+}
+
+bool ReadRemoteString(HANDLE process, uintptr_t address, std::string& value) {
+    value.clear();
+    for (size_t offset = 0; offset < 1024; offset += 128) {
+        char block[128]{};
+        SIZE_T received = 0;
+        if (!ReadProcessMemory(process,
+                reinterpret_cast<void*>(address + offset), block,
+                sizeof(block), &received) || !received) return false;
+        const char* end = static_cast<const char*>(
+            memchr(block, '\0', received));
+        value.append(block, end ? static_cast<size_t>(end - block) : received);
+        if (end) return true;
+    }
+    return false;
+}
+
+uintptr_t ResolveRemoteExport(HANDLE process, DWORD processId,
+                              uintptr_t moduleBase, const char* functionName,
+                              WORD ordinal, bool byOrdinal, int depth = 0) {
+    if (!moduleBase || depth > 8) return 0;
+    IMAGE_DOS_HEADER dos{};
+    IMAGE_NT_HEADERS64 nt{};
+    if (!ReadProcessMemory(process, reinterpret_cast<void*>(moduleBase),
+                           &dos, sizeof(dos), nullptr) ||
+        dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 0 ||
+        !ReadProcessMemory(process,
+            reinterpret_cast<void*>(moduleBase + dos.e_lfanew),
+            &nt, sizeof(nt), nullptr) || nt.Signature != IMAGE_NT_SIGNATURE)
+        return 0;
+    const auto& directory =
+        nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!directory.VirtualAddress ||
+        directory.Size < sizeof(IMAGE_EXPORT_DIRECTORY)) return 0;
+    IMAGE_EXPORT_DIRECTORY exports{};
+    if (!ReadProcessMemory(process,
+            reinterpret_cast<void*>(moduleBase + directory.VirtualAddress),
+            &exports, sizeof(exports), nullptr) ||
+        !exports.NumberOfFunctions || exports.NumberOfFunctions > 1'000'000 ||
+        exports.NumberOfNames > exports.NumberOfFunctions)
+        return 0;
+    std::vector<DWORD> functions(exports.NumberOfFunctions);
+    if (!ReadProcessMemory(process,
+            reinterpret_cast<void*>(moduleBase + exports.AddressOfFunctions),
+            functions.data(), functions.size() * sizeof(DWORD), nullptr))
+        return 0;
+    DWORD functionIndex = UINT32_MAX;
+    if (byOrdinal) {
+        if (ordinal < exports.Base ||
+            static_cast<DWORD>(ordinal - exports.Base) >= exports.NumberOfFunctions)
+            return 0;
+        functionIndex = ordinal - exports.Base;
+    } else {
+        std::vector<DWORD> names(exports.NumberOfNames);
+        std::vector<WORD> ordinals(exports.NumberOfNames);
+        if (!ReadProcessMemory(process,
+                reinterpret_cast<void*>(moduleBase + exports.AddressOfNames),
+                names.data(), names.size() * sizeof(DWORD), nullptr) ||
+            !ReadProcessMemory(process,
+                reinterpret_cast<void*>(moduleBase + exports.AddressOfNameOrdinals),
+                ordinals.data(), ordinals.size() * sizeof(WORD), nullptr))
+            return 0;
+        std::string candidate;
+        for (DWORD i = 0; i < exports.NumberOfNames; ++i) {
+            if (!ReadRemoteString(process, moduleBase + names[i], candidate))
+                return 0;
+            if (candidate == functionName) {
+                functionIndex = ordinals[i];
+                break;
+            }
+        }
+        if (functionIndex == UINT32_MAX ||
+            functionIndex >= exports.NumberOfFunctions) return 0;
+    }
+    const DWORD functionRva = functions[functionIndex];
+    if (!functionRva) return 0;
+    const uint64_t exportEnd = static_cast<uint64_t>(directory.VirtualAddress) +
+                               directory.Size;
+    if (functionRva >= directory.VirtualAddress && functionRva < exportEnd) {
+        std::string forwarder;
+        if (!ReadRemoteString(process, moduleBase + functionRva, forwarder))
+            return 0;
+        const size_t separator = forwarder.rfind('.');
+        if (separator == std::string::npos || separator == 0 ||
+            separator + 1 >= forwarder.size()) return 0;
+        std::string forwardedModule = forwarder.substr(0, separator);
+        if (forwardedModule.find('.') == std::string::npos)
+            forwardedModule += ".dll";
+        const std::string forwardedName = forwarder.substr(separator + 1);
+        const uintptr_t forwardedBase = RemoteLoadDependency(
+            process, processId, forwardedModule.c_str());
+        if (!forwardedBase) return 0;
+        if (forwardedName[0] == '#') {
+            const unsigned long value = strtoul(forwardedName.c_str() + 1,
+                                                nullptr, 10);
+            if (!value || value > 0xFFFF) return 0;
+            return ResolveRemoteExport(process, processId, forwardedBase,
+                                       nullptr, static_cast<WORD>(value), true,
+                                       depth + 1);
+        }
+        return ResolveRemoteExport(process, processId, forwardedBase,
+                                   forwardedName.c_str(), 0, false, depth + 1);
+    }
+    return moduleBase + functionRva;
+}
+
+DWORD SectionProtection(DWORD characteristics) {
+    const bool execute = (characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+    const bool read = (characteristics & IMAGE_SCN_MEM_READ) != 0;
+    const bool write = (characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+    if (execute) {
+        if (write) return PAGE_EXECUTE_READWRITE;
+        if (read) return PAGE_EXECUTE_READ;
+        return PAGE_EXECUTE;
+    }
+    if (write) return PAGE_READWRITE;
+    if (read) return PAGE_READONLY;
+    return PAGE_NOACCESS;
+}
+
+bool ManualMapInject(HANDLE process, const uint8_t* dllData, size_t dllSize,
+                     uintptr_t& baseAddress, std::wstring& detail) {
+    baseAddress = 0;
+    detail.clear();
+    const auto reject = [&](const wchar_t* stage) {
+        detail = L"Manual Map: " + std::wstring(stage);
+        return false;
+    };
+    if (!dllData || !FitsIn(0, sizeof(IMAGE_DOS_HEADER), dllSize))
+        return reject(L"проверка DOS-заголовка");
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(dllData);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0)
+        return reject(L"проверка DOS-заголовка");
+    const size_t ntOffset = static_cast<size_t>(dos->e_lfanew);
+    if (!FitsIn(ntOffset, sizeof(IMAGE_NT_HEADERS64), dllSize))
+        return reject(L"проверка NT-заголовка");
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(dllData + ntOffset);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64))
+        return reject(L"проверка формата PE64");
+    const auto& opt = nt->OptionalHeader;
+    if (!opt.SizeOfImage || opt.SizeOfHeaders > opt.SizeOfImage ||
+        !FitsIn(0, opt.SizeOfHeaders, dllSize))
+        return reject(L"проверка размера образа");
+    const size_t sectionOffset = ntOffset + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) +
+                                 nt->FileHeader.SizeOfOptionalHeader;
+    const size_t sectionBytes = static_cast<size_t>(nt->FileHeader.NumberOfSections) *
+                                sizeof(IMAGE_SECTION_HEADER);
+    if (!FitsIn(sectionOffset, sectionBytes, dllSize))
+        return reject(L"проверка таблицы секций");
+    const auto* sections = reinterpret_cast<const IMAGE_SECTION_HEADER*>(
+        dllData + sectionOffset);
+
+    std::vector<uint8_t> image(opt.SizeOfImage, 0);
+    memcpy(image.data(), dllData, opt.SizeOfHeaders);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        const auto& section = sections[i];
+        const size_t mappedSize = (std::max)(
+            static_cast<size_t>(section.Misc.VirtualSize),
+            static_cast<size_t>(section.SizeOfRawData));
+        if (mappedSize &&
+            !FitsIn(section.VirtualAddress, mappedSize, image.size()))
+            return reject(L"проверка виртуального размера секции");
+        if (section.SizeOfRawData) {
+            if (!FitsIn(section.PointerToRawData, section.SizeOfRawData, dllSize) ||
+                !FitsIn(section.VirtualAddress, section.SizeOfRawData, image.size()))
+                return reject(L"проверка данных секции");
+            memcpy(image.data() + section.VirtualAddress,
+                   dllData + section.PointerToRawData, section.SizeOfRawData);
+        }
+    }
+
+    baseAddress = reinterpret_cast<uintptr_t>(VirtualAllocEx(process,
+        reinterpret_cast<void*>(opt.ImageBase), opt.SizeOfImage,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!baseAddress) {
+        baseAddress = reinterpret_cast<uintptr_t>(VirtualAllocEx(process,
+            nullptr, opt.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    }
+    if (!baseAddress) return reject(L"выделение памяти");
+    std::wstring stage = L"подготовка образа";
+    bool exceptionRegistered = false;
+    uintptr_t exceptionTable = 0;
+    uintptr_t remoteDeleteFunctionTable = 0;
+    const auto fail = [&] {
+        if (g_remoteCallTimedOut) {
+            baseAddress = 0;
+            detail = L"Manual Map: " + stage + L" (таймаут 20 с)";
+            return false;
+        }
+        if (exceptionRegistered && remoteDeleteFunctionTable) {
+            uintptr_t ignored = 0;
+            RemoteCall3(process, remoteDeleteFunctionTable,
+                        exceptionTable, 0, 0, ignored);
+        }
+        VirtualFreeEx(process, reinterpret_cast<void*>(baseAddress), 0,
+                      MEM_RELEASE);
+        baseAddress = 0;
+        detail = L"Manual Map: " + stage;
+        return false;
+    };
+
+    stage = L"релокации";
+    const uintptr_t delta = baseAddress - opt.ImageBase;
+    if (delta) {
+        const auto& directory = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        if (!directory.VirtualAddress || !directory.Size ||
+            !FitsIn(directory.VirtualAddress, directory.Size, image.size()))
+            return fail();
+        size_t offset = 0;
+        while (offset < directory.Size) {
+            if (!FitsIn(directory.VirtualAddress + offset,
+                        sizeof(IMAGE_BASE_RELOCATION), image.size())) return fail();
+            auto* block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
+                image.data() + directory.VirtualAddress + offset);
+            if (block->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
+                block->SizeOfBlock > directory.Size - offset) return fail();
+            const size_t count = (block->SizeOfBlock -
+                                  sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+            const auto* entries = reinterpret_cast<const WORD*>(block + 1);
+            for (size_t i = 0; i < count; ++i) {
+                const WORD type = entries[i] >> 12;
+                const DWORD rva = block->VirtualAddress + (entries[i] & 0x0FFF);
+                if (type == IMAGE_REL_BASED_ABSOLUTE) continue;
+                if (type != IMAGE_REL_BASED_DIR64 ||
+                    !FitsIn(rva, sizeof(uint64_t), image.size())) return fail();
+                *reinterpret_cast<uint64_t*>(image.data() + rva) += delta;
+            }
+            offset += block->SizeOfBlock;
+        }
+    }
+
+    const DWORD processId = GetProcessId(process);
+    stage = L"импорты";
+    const auto& importDirectory = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (importDirectory.VirtualAddress) {
+        if (importDirectory.Size < sizeof(IMAGE_IMPORT_DESCRIPTOR) ||
+            !FitsIn(importDirectory.VirtualAddress,
+                    importDirectory.Size, image.size())) return fail();
+        auto* descriptor = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
+            image.data() + importDirectory.VirtualAddress);
+        for (;;) {
+            const size_t descriptorOffset = reinterpret_cast<uint8_t*>(descriptor) -
+                                            image.data();
+            if (descriptorOffset < importDirectory.VirtualAddress ||
+                !FitsIn(descriptorOffset, sizeof(*descriptor),
+                        static_cast<size_t>(importDirectory.VirtualAddress) +
+                            importDirectory.Size))
+                return fail();
+            if (!descriptor->Name) break;
+            if (!FitsIn(descriptor->Name, 1, image.size())) return fail();
+            const char* moduleName = reinterpret_cast<const char*>(
+                image.data() + descriptor->Name);
+            const size_t remaining = image.size() - descriptor->Name;
+            if (!memchr(moduleName, '\0', remaining)) return fail();
+            const std::wstring importModule(moduleName,
+                moduleName + strlen(moduleName));
+            stage = L"импорты: " + importModule;
+            const uintptr_t remoteModule = RemoteLoadDependency(
+                process, processId, moduleName);
+            if (!remoteModule) return fail();
+            const DWORD lookupRva = descriptor->OriginalFirstThunk
+                ? descriptor->OriginalFirstThunk : descriptor->FirstThunk;
+            size_t index = 0;
+            bool importsOk = true;
+            for (;;) {
+                const size_t lookupOffset = lookupRva + index * sizeof(IMAGE_THUNK_DATA64);
+                const size_t iatOffset = descriptor->FirstThunk +
+                                         index * sizeof(IMAGE_THUNK_DATA64);
+                if (!FitsIn(lookupOffset, sizeof(IMAGE_THUNK_DATA64), image.size()) ||
+                    !FitsIn(iatOffset, sizeof(IMAGE_THUNK_DATA64), image.size())) {
+                    importsOk = false;
+                    break;
+                }
+                const auto* lookup = reinterpret_cast<const IMAGE_THUNK_DATA64*>(
+                    image.data() + lookupOffset);
+                if (!lookup->u1.AddressOfData) break;
+                std::wstring importName;
+                bool byOrdinal = false;
+                WORD importOrdinal = 0;
+                const char* functionName = nullptr;
+                if (IMAGE_SNAP_BY_ORDINAL64(lookup->u1.Ordinal)) {
+                    byOrdinal = true;
+                    importOrdinal = static_cast<WORD>(
+                        IMAGE_ORDINAL64(lookup->u1.Ordinal));
+                    importName = L"#" + std::to_wstring(importOrdinal);
+                } else {
+                    const size_t nameOffset = static_cast<size_t>(lookup->u1.AddressOfData);
+                    if (!FitsIn(nameOffset, sizeof(WORD) + 1, image.size())) {
+                        importsOk = false;
+                        break;
+                    }
+                    functionName = reinterpret_cast<const char*>(
+                        image.data() + nameOffset + sizeof(WORD));
+                    if (!memchr(functionName, '\0', image.size() - nameOffset - sizeof(WORD))) {
+                        importsOk = false;
+                        break;
+                    }
+                    importName.assign(functionName,
+                                      functionName + strlen(functionName));
+                }
+                stage = L"импорты: " + importModule + L"!" + importName;
+                const uintptr_t remoteFunction = ResolveRemoteExport(
+                    process, processId, remoteModule, functionName,
+                    importOrdinal, byOrdinal);
+                if (!remoteFunction) {
+                    importsOk = false;
+                    break;
+                }
+                reinterpret_cast<IMAGE_THUNK_DATA64*>(image.data() + iatOffset)
+                    ->u1.Function = remoteFunction;
+                ++index;
+            }
+            if (!importsOk) return fail();
+            ++descriptor;
+        }
+    }
+
+    stage = L"запись образа";
+    if (!WriteProcessMemory(process, reinterpret_cast<void*>(baseAddress),
+                            image.data(), image.size(), nullptr)) return fail();
+
+    stage = L"защита секций";
+    DWORD oldProtection{};
+    if (!VirtualProtectEx(process, reinterpret_cast<void*>(baseAddress),
+                          opt.SizeOfHeaders, PAGE_READONLY, &oldProtection))
+        return fail();
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        const auto& section = sections[i];
+        const SIZE_T size = section.Misc.VirtualSize
+            ? section.Misc.VirtualSize : section.SizeOfRawData;
+        if (!size) continue;
+        if (!VirtualProtectEx(process,
+            reinterpret_cast<void*>(baseAddress + section.VirtualAddress),
+            size, SectionProtection(section.Characteristics), &oldProtection))
+            return fail();
+    }
+    FlushInstructionCache(process, reinterpret_cast<void*>(baseAddress),
+                          opt.SizeOfImage);
+
+    stage = L"таблица исключений";
+    const auto& exceptionDirectory =
+        opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (exceptionDirectory.VirtualAddress && exceptionDirectory.Size) {
+        if (!FitsIn(exceptionDirectory.VirtualAddress,
+                    exceptionDirectory.Size, image.size()) ||
+            exceptionDirectory.Size % sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY) != 0)
+            return fail();
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        const FARPROC addFunctionTable = ntdll
+            ? GetProcAddress(ntdll, "RtlAddFunctionTable") : nullptr;
+        const uintptr_t remoteAddFunctionTable = addFunctionTable
+            ? RemoteAddressForLocal(processId, addFunctionTable) : 0;
+        const FARPROC deleteFunctionTable = ntdll
+            ? GetProcAddress(ntdll, "RtlDeleteFunctionTable") : nullptr;
+        remoteDeleteFunctionTable = deleteFunctionTable
+            ? RemoteAddressForLocal(processId, deleteFunctionTable) : 0;
+        exceptionTable = baseAddress + exceptionDirectory.VirtualAddress;
+        uintptr_t registered = 0;
+        if (!remoteAddFunctionTable || !remoteDeleteFunctionTable ||
+            !RemoteCall3(process, remoteAddFunctionTable,
+                exceptionTable,
+                exceptionDirectory.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY),
+                baseAddress, registered) || !registered) return fail();
+        exceptionRegistered = true;
+    }
+
+    stage = L"TLS callbacks";
+    const auto& tlsDirectory = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (tlsDirectory.VirtualAddress) {
+        if (!FitsIn(tlsDirectory.VirtualAddress,
+                    sizeof(IMAGE_TLS_DIRECTORY64), image.size())) return fail();
+        const auto* tls = reinterpret_cast<const IMAGE_TLS_DIRECTORY64*>(
+            image.data() + tlsDirectory.VirtualAddress);
+        if (tls->AddressOfCallBacks) {
+            if (tls->AddressOfCallBacks < baseAddress) return fail();
+            const size_t callbackOffset = static_cast<size_t>(
+                tls->AddressOfCallBacks - baseAddress);
+            for (size_t index = 0;; ++index) {
+                const size_t slot = callbackOffset + index * sizeof(uintptr_t);
+                if (!FitsIn(slot, sizeof(uintptr_t), image.size())) return fail();
+                const uintptr_t callback = *reinterpret_cast<const uintptr_t*>(
+                    image.data() + slot);
+                if (!callback) break;
+                uintptr_t callbackResult = 0;
+                if (!RemoteCall3(process, callback, baseAddress,
+                                 DLL_PROCESS_ATTACH, 0, callbackResult))
+                    return fail();
+            }
+        }
+    }
+
+    stage = L"точка входа DLL";
+    if (opt.AddressOfEntryPoint) {
+        if (!FitsIn(opt.AddressOfEntryPoint, 1, image.size())) return fail();
+        uintptr_t entryResult = 0;
+        if (!RemoteCall3(process, baseAddress + opt.AddressOfEntryPoint,
+                         baseAddress, DLL_PROCESS_ATTACH, 0, entryResult) ||
+            !entryResult) {
+            wchar_t code[32]{};
+            swprintf_s(code, L" (0x%08X)", g_remoteCallExitCode);
+            stage += code;
+            return fail();
+        }
+    }
+
+    stage = L"инициализация DLL";
+    const uintptr_t initializer = ResolveRemoteExport(
+        process, processId, baseAddress, "AxiomManualMapInitialize",
+        0, false);
+    if (initializer) {
+        ScopedHandle initializeThread(CreateRemoteThread(
+            process, nullptr, 0,
+            reinterpret_cast<LPTHREAD_START_ROUTINE>(initializer),
+            nullptr, 0, nullptr));
+        if (!initializeThread.valid())
+            return fail();
+        const DWORD waitResult = WaitForSingleObject(
+            initializeThread, kInitializerTimeoutMs);
+        if (waitResult != WAIT_OBJECT_0) {
+            // Do not unmap code that the timed-out thread may still execute.
+            baseAddress = 0;
+            detail = waitResult == WAIT_TIMEOUT
+                ? L"Manual Map: инициализация DLL (таймаут 30 с)"
+                : L"Manual Map: ошибка ожидания инициализации DLL";
+            return false;
+        }
+        DWORD initializeCode = 0;
+        if (!GetExitCodeThread(initializeThread, &initializeCode) ||
+            initializeCode >= 0xC0000000) {
+            wchar_t code[32]{};
+            swprintf_s(code, L" (0x%08X)", initializeCode);
+            stage += code;
+            return fail();
+        }
+    }
+
+    return true;
 }
 
 DWORD FindProcessId(std::wstring_view executable) {
@@ -160,19 +654,6 @@ DWORD FindProcessId(std::wstring_view executable) {
     return 0;
 }
 
-uintptr_t FindRemoteModule(DWORD processId, std::wstring_view moduleName) {
-    ScopedHandle snapshot(CreateToolhelp32Snapshot(
-        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId));
-    if (!snapshot.valid()) return 0;
-    MODULEENTRY32W entry{};
-    entry.dwSize = sizeof(entry);
-    if (!Module32FirstW(snapshot, &entry)) return 0;
-    do {
-        if (_wcsicmp(entry.szModule, moduleName.data()) == 0)
-            return reinterpret_cast<uintptr_t>(entry.modBaseAddr);
-    } while (Module32NextW(snapshot, &entry));
-    return 0;
-}
 
 bool HasVisibleGameWindow(DWORD processId) {
     struct SearchContext {
@@ -231,6 +712,50 @@ bool IsPayloadReady(DWORD processId) {
     return ready;
 }
 
+uintptr_t ReadManualMapBase(DWORD processId, ScopedHandle& mapping) {
+    const std::wstring name = L"Local\\Dll6_Deadlock_ManualMap_" +
+                              std::to_wstring(processId);
+    mapping.value = OpenFileMappingW(FILE_MAP_READ, FALSE, name.c_str());
+    if (!mapping.valid()) return 0;
+    const void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0,
+                                     sizeof(uintptr_t));
+    if (!view) return 0;
+    const uintptr_t base = *static_cast<const uintptr_t*>(view);
+    UnmapViewOfFile(view);
+    return base;
+}
+
+bool ReleaseManualMappedImage(DWORD processId, uintptr_t baseAddress) {
+    ScopedHandle process(OpenProcess(PROCESS_CREATE_THREAD |
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
+        PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, processId));
+    if (!process.valid()) return false;
+    IMAGE_DOS_HEADER dos{};
+    IMAGE_NT_HEADERS64 nt{};
+    if (!ReadProcessMemory(process, reinterpret_cast<void*>(baseAddress),
+                           &dos, sizeof(dos), nullptr) ||
+        dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 0 ||
+        !ReadProcessMemory(process,
+            reinterpret_cast<void*>(baseAddress + dos.e_lfanew),
+            &nt, sizeof(nt), nullptr) || nt.Signature != IMAGE_NT_SIGNATURE)
+        return false;
+    const auto& exceptionDirectory =
+        nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (exceptionDirectory.VirtualAddress && exceptionDirectory.Size) {
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        const FARPROC deleteFunctionTable = ntdll
+            ? GetProcAddress(ntdll, "RtlDeleteFunctionTable") : nullptr;
+        const uintptr_t remoteDelete = deleteFunctionTable
+            ? RemoteAddressForLocal(processId, deleteFunctionTable) : 0;
+        uintptr_t removed = 0;
+        if (!remoteDelete || !RemoteCall3(process, remoteDelete,
+                baseAddress + exceptionDirectory.VirtualAddress,
+                0, 0, removed) || !removed) return false;
+    }
+    return VirtualFreeEx(process, reinterpret_cast<void*>(baseAddress), 0,
+                         MEM_RELEASE) != FALSE;
+}
+
 HWND FindGameWindow(DWORD processId) {
     struct SearchContext {
         DWORD processId;
@@ -256,6 +781,8 @@ HWND FindGameWindow(DWORD processId) {
 
 bool UnloadPayload(DWORD processId, std::wstring& error) {
     if (!IsPayloadLoaded(processId)) return true;
+    ScopedHandle manualMapInfo;
+    const uintptr_t manualMapBase = ReadManualMapBase(processId, manualMapInfo);
     const HWND window = FindGameWindow(processId);
     if (!window) {
         error = L"Не удалось найти окно Deadlock для выгрузки DLL.";
@@ -269,7 +796,16 @@ bool UnloadPayload(DWORD processId, std::wstring& error) {
     PostMessageW(window, WM_APP + 0x6D6, 0, 0);
     const ULONGLONG deadline = GetTickCount64() + 15000;
     while (GetTickCount64() < deadline) {
-        if (!IsPayloadLoaded(processId)) return true;
+        if (!IsPayloadLoaded(processId)) {
+            if (manualMapBase) {
+                Sleep(100);
+                if (!ReleaseManualMappedImage(processId, manualMapBase)) {
+                    error = L"DLL завершила работу, но её образ не удалось освободить.";
+                    return false;
+                }
+            }
+            return true;
+        }
         Sleep(50);
     }
     error = L"Предыдущая DLL не успела корректно выгрузиться.";
@@ -304,65 +840,8 @@ DWORD WaitForDeadlock(std::wstring& error) {
     return 0;
 }
 
-bool ExtractEmbeddedDll(HINSTANCE instance, std::filesystem::path& output,
-                        std::wstring& error) {
-    const HRSRC resource = FindResourceW(
-        instance, MAKEINTRESOURCEW(IDR_PAYLOAD_DLL), RT_RCDATA);
-    if (!resource) {
-        error = L"В EXE отсутствует встроенная DLL.";
-        return false;
-    }
-    const DWORD size = SizeofResource(instance, resource);
-    const HGLOBAL loaded = LoadResource(instance, resource);
-    const void* data = loaded ? LockResource(loaded) : nullptr;
-    if (!data || size < 0x1000) {
-        error = L"Встроенная DLL повреждена.";
-        return false;
-    }
-    std::array<unsigned char, 32> payloadDigest{};
-    const std::string payloadBytes(static_cast<const char*>(data), size);
-    if (!Sha256(payloadBytes, payloadDigest)) {
-        error = L"Не удалось проверить встроенную DLL.";
-        return false;
-    }
-
-    PWSTR localAppData = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE,
-                                    nullptr, &localAppData))) {
-        error = L"Не удалось открыть LOCALAPPDATA.";
-        return false;
-    }
-    const std::wstring payloadId = HexDigest(payloadDigest).substr(0, 16);
-    output = std::filesystem::path(localAppData) / L"Axiom" / L"launcher" /
-             (L"Axiom-" + payloadId + L".dll");
-    CoTaskMemFree(localAppData);
-    std::error_code directoryError;
-    std::filesystem::create_directories(output.parent_path(), directoryError);
-    if (directoryError) {
-        error = L"Не удалось создать папку launcher.";
-        return false;
-    }
-    std::error_code existingError;
-    if (std::filesystem::exists(output, existingError) && !existingError &&
-        std::filesystem::file_size(output, existingError) == size &&
-        !existingError) return true;
-
-    std::ofstream file(output, std::ios::binary | std::ios::trunc);
-    if (!file) {
-        error = L"Не удалось извлечь встроенную DLL.";
-        return false;
-    }
-    file.write(static_cast<const char*>(data), size);
-    file.close();
-    if (!file) {
-        error = L"Ошибка записи встроенной DLL.";
-        return false;
-    }
-    return true;
-}
-
 bool LoadPayload(DWORD processId, const std::filesystem::path& dllPath,
-                 std::wstring& error) {
+    std::wstring& error) {
     if (!UnloadPayload(processId, error)) return false;
     ScopedHandle process(OpenProcess(PROCESS_CREATE_THREAD |
         PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
@@ -372,53 +851,33 @@ bool LoadPayload(DWORD processId, const std::filesystem::path& dllPath,
         return false;
     }
 
-    const std::wstring path = dllPath.wstring();
-    const SIZE_T bytes = (path.size() + 1) * sizeof(wchar_t);
-    void* remotePath = VirtualAllocEx(process, nullptr, bytes,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!remotePath) {
-        error = L"Не удалось выделить память в процессе Deadlock.";
+    // Читаем DLL в память
+    std::ifstream file(dllPath, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        error = L"Не удалось открыть DLL-файл.";
         return false;
     }
-    const auto remoteDeleter = [&](void* address) {
-        if (address) VirtualFreeEx(process, address, 0, MEM_RELEASE);
-    };
-    const auto freeRemote = std::unique_ptr<void, decltype(remoteDeleter)>(
-        remotePath, remoteDeleter);
-    if (!WriteProcessMemory(process, remotePath, path.c_str(), bytes, nullptr)) {
-        error = L"Не удалось передать путь DLL в процесс Deadlock.";
+    std::streamsize size = file.tellg();
+    if (size <= 0 || size > 512ll * 1024 * 1024) {
+        error = L"DLL-файл имеет некорректный размер.";
+        return false;
+    }
+    file.seekg(0, std::ios::beg);
+    std::vector<uint8_t> dllData(size);
+    if (!file.read(reinterpret_cast<char*>(dllData.data()), size)) {
+        error = L"Не удалось прочитать DLL-файл.";
         return false;
     }
 
-    const HMODULE localKernel = GetModuleHandleW(L"kernel32.dll");
-    const auto localLoadLibrary = reinterpret_cast<uintptr_t>(
-        GetProcAddress(localKernel, "LoadLibraryW"));
-    const uintptr_t remoteKernel = FindRemoteModule(processId, L"kernel32.dll");
-    if (!localKernel || !localLoadLibrary || !remoteKernel) {
-        error = L"Не удалось найти LoadLibraryW в процессе Deadlock.";
+    // Manual Map инжект
+    uintptr_t baseAddress = 0;
+    if (!ManualMapInject(process, dllData.data(), dllData.size(), baseAddress,
+                         error)) {
+        if (error.empty()) error = L"Manual Map инжект не удался.";
         return false;
     }
-    const uintptr_t loadLibraryRva = localLoadLibrary -
-        reinterpret_cast<uintptr_t>(localKernel);
-    const auto remoteLoadLibrary = reinterpret_cast<LPTHREAD_START_ROUTINE>(
-        remoteKernel + loadLibraryRva);
-    ScopedHandle thread(CreateRemoteThread(process, nullptr, 0,
-        remoteLoadLibrary, remotePath, 0, nullptr));
-    if (!thread.valid()) {
-        error = L"Не удалось создать поток загрузки DLL.";
-        return false;
-    }
-    if (WaitForSingleObject(thread, 15000) != WAIT_OBJECT_0) {
-        error = L"Загрузка DLL не завершилась за 15 секунд.";
-        return false;
-    }
-    DWORD result = 0;
-    if (!GetExitCodeThread(thread, &result) || result == 0) {
-        error = L"Deadlock отклонил загрузку DLL.";
-        return false;
-    }
-    // Do not report success merely because LoadLibrary returned. The DLL
-    // publishes this event only after offsets and hooks are initialized.
+
+    // Ждём готовности DLL (по событию)
     const ULONGLONG readyDeadline = GetTickCount64() + 20000;
     while (GetTickCount64() < readyDeadline && !IsPayloadReady(processId))
         Sleep(25);
@@ -426,6 +885,7 @@ bool LoadPayload(DWORD processId, const std::filesystem::path& dllPath,
         error = L"DLL загружена, но не завершила инициализацию.";
         return false;
     }
+
     error = L"Axiom успешно запущен.";
     return true;
 }
@@ -436,30 +896,57 @@ void SetStatus(const wchar_t* text, COLORREF color) {
     if (g_launchButton) InvalidateRect(GetParent(g_launchButton), nullptr, FALSE);
 }
 
+void PostLaunchProgress(HWND window, const wchar_t* text,
+                        COLORREF color = RGB(250, 194, 78)) {
+    auto* status = new std::wstring(text ? text : L"");
+    if (!PostMessageW(window, kLaunchProgress,
+                      static_cast<WPARAM>(color),
+                      reinterpret_cast<LPARAM>(status)))
+        delete status;
+}
+
 void BeginLaunch(HWND window) {
     if (g_launching) return;
     const int length = GetWindowTextLengthW(g_keyEdit);
-    std::wstring key(static_cast<size_t>((std::max)(length, 0)), L'\0');
+    std::wstring key(static_cast<size_t>((std::max)(length, 0)) + 1, L'\0');
     if (length > 0) GetWindowTextW(g_keyEdit, key.data(), length + 1);
-    if (!ValidateLocalLicense(key)) {
-        SetStatus(L"Неверный лицензионный ключ", RGB(244, 91, 105));
+    key.resize(static_cast<size_t>((std::max)(length, 0)));
+#ifndef AXIOM_OFFLINE_TEST_MODE
+    if (key.empty()) {
+        SetStatus(L"Введите лицензионный ключ", RGB(244, 91, 105));
         return;
     }
+#endif
 
     g_launching = true;
     EnableWindow(g_launchButton, FALSE);
     SetWindowTextW(g_launchButton, L"Запуск...");
-    SetStatus(L"Ожидание Deadlock...", RGB(250, 194, 78));
-    const HINSTANCE instance = reinterpret_cast<HINSTANCE>(
-        GetWindowLongPtrW(window, GWLP_HINSTANCE));
-    std::thread([window, instance] {
+#ifdef AXIOM_OFFLINE_TEST_MODE
+    SetStatus(L"Подготовка DLL и ожидание Deadlock...", RGB(250, 194, 78));
+#else
+    SetStatus(L"Проверка лицензии...", RGB(250, 194, 78));
+#endif
+    std::thread([window, key = std::move(key)] {
         std::wstring message;
         std::filesystem::path payload;
-        const DWORD processId = WaitForDeadlock(message);
-        bool success = processId != 0;
+        bool success = AxiomAuth::AuthenticateAndAcquireModule(
+            key, payload, message);
+        DWORD processId = 0;
         if (success) {
-            success = ExtractEmbeddedDll(instance, payload, message);
-            if (success) success = LoadPayload(processId, payload, message);
+            processId = FindProcessId(kTargetProcess);
+            if (!processId)
+                PostLaunchProgress(window, L"Запуск Deadlock...");
+            else if (!IsGameRuntimeReady(processId))
+                PostLaunchProgress(window, L"Ожидание загрузки Deadlock...");
+            processId = WaitForDeadlock(message);
+        }
+        success = success && processId != 0;
+        if (success) {
+            PostLaunchProgress(window, L"Инициализация Axiom...");
+            success = LoadPayload(processId, payload, message);
+        }
+        if (!payload.empty() && !DeleteFileW(payload.c_str())) {
+            MoveFileExW(payload.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
         }
         auto* result = new std::pair<bool, std::wstring>(success,
                                                          std::move(message));
@@ -597,10 +1084,10 @@ void PaintLauncher(HWND window) {
                            Gdiplus::RectF(20, 16, 70, 70));
     }
 
-    Gdiplus::FontFamily brandFamily(L"Segoe UI Variable Display");
+    Gdiplus::FontFamily brandFamily(L"Segoe UI");
     Gdiplus::Font brandFont(&brandFamily, 29.0f, Gdiplus::FontStyleBold,
                             Gdiplus::UnitPixel);
-    Gdiplus::FontFamily textFamily(L"Segoe UI Variable Text");
+    Gdiplus::FontFamily textFamily(L"Segoe UI");
     Gdiplus::Font brandCaption(&textFamily, 13.0f,
                                Gdiplus::FontStyleBold,
                                Gdiplus::UnitPixel);
@@ -669,7 +1156,7 @@ void DrawLaunchButton(const DRAWITEMSTRUCT& item) {
     wchar_t text[64]{};
     GetWindowTextW(item.hwndItem, text, static_cast<int>(std::size(text)));
     graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
-    Gdiplus::FontFamily family(L"Segoe UI Variable Text");
+    Gdiplus::FontFamily family(L"Segoe UI");
     Gdiplus::Font font(&family, 14.5f, Gdiplus::FontStyleBold,
                        Gdiplus::UnitPixel);
     Gdiplus::SolidBrush textBrush(disabled
@@ -718,10 +1205,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
         case WM_CREATE: {
             g_bodyFont = CreateFontW(-16, 0, 0, 0, FW_MEDIUM, FALSE, FALSE,
                 FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI Variable Text");
+                CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
             g_backgroundBrush = CreateSolidBrush(RGB(10, 13, 19));
             g_editBrush = CreateSolidBrush(RGB(20, 24, 33));
-            g_keyEdit = CreateWindowExW(0, L"EDIT", kDefaultLocalKey,
+            const std::wstring savedLicense = AxiomAuth::LoadSavedLicense();
+            g_keyEdit = CreateWindowExW(0, L"EDIT", savedLicense.c_str(),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE |
                     ES_AUTOHSCROLL,
                 28, 131 + kChromeHeight - kContentLift, 404, 36, window,
@@ -840,6 +1328,12 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
             SetWindowTextW(g_launchButton, L"Запустить Axiom");
             SetStatus(result->second.c_str(), result->first
                 ? RGB(86, 214, 142) : RGB(244, 91, 105));
+            return 0;
+        }
+        case kLaunchProgress: {
+            std::unique_ptr<std::wstring> status(
+                reinterpret_cast<std::wstring*>(lParam));
+            SetStatus(status->c_str(), static_cast<COLORREF>(wParam));
             return 0;
         }
         case WM_DESTROY:

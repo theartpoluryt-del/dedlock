@@ -1856,7 +1856,7 @@ void CaptureLocalMovementCommand(CUserCmd* command) {
 bool ProcessLocalMovementRecorderReplay(CUserCmd* command, uintptr_t input) {
     LoadLocalMovementRecording();
     if (!command || !command->cmd.has_base()) return false;
-    const bool recordDown = localMovementRecordKey > 0 &&
+    const bool recordDown = !AreCustomBindsSuppressed() && localMovementRecordKey > 0 &&
         (GetAsyncKeyState(localMovementRecordKey) & 0x8000) != 0;
     const bool recordPressed = recordDown && !localRecordKeyWasDown;
     localRecordKeyWasDown = recordDown;
@@ -1887,7 +1887,7 @@ bool ProcessLocalMovementRecorderReplay(CUserCmd* command, uintptr_t input) {
         return false;
     }
 
-    const bool replayDown = movementReplayKey > 0 &&
+    const bool replayDown = !AreCustomBindsSuppressed() && movementReplayKey > 0 &&
         (GetAsyncKeyState(movementReplayKey) & 0x8000) != 0;
     const bool replayPressed = replayDown && !localReplayKeyWasDown;
     localReplayKeyWasDown = replayDown;
@@ -2339,6 +2339,31 @@ void UpdateMovementProbe(const std::vector<PlayerData>& players) {
         return;
     }
 
+    // This recorder exists specifically for the Lockify replay pawn named
+    // bot2. Previously the fallback selected any Haze in a regular match and
+    // synchronously appended a wide CSV row every 16 ms, causing severe
+    // frame-time spikes while playing Haze. Never arm capture without the
+    // intended replay bot.
+    bool hasReplayBot = false;
+    for (const PlayerData& player : players) {
+        if (player.entity && EqualsAsciiInsensitive(player.playerName, "bot2")) {
+            hasReplayBot = true;
+            break;
+        }
+    }
+    if (!hasReplayBot) {
+        if (wasEnabled) FlushPacketSnapshots(true);
+        packetTrackedBot2.store(0, std::memory_order_release);
+        packetTrackedBot2Handle.store(0xFFFFFFFFu,
+                                      std::memory_order_release);
+        wasEnabled = false;
+        startedAt = 0;
+        lastSampleAt = 0;
+        trackedEntity = 0;
+        previousPositionAt = 0;
+        return;
+    }
+
     const ULONGLONG now = GetTickCount64();
     if (!wasEnabled) {
         // Import the completed trace from the preceding session before this
@@ -2764,7 +2789,7 @@ bool ProcessMovementReplayUserCmd(CUserCmd* command, uintptr_t input) {
         ? Distance3D(currentLocalPosition, replayStart)
         : FLT_MAX;
 
-    const bool keyDown = movementReplayEnabled && movementReplayKey > 0 &&
+    const bool keyDown = !AreCustomBindsSuppressed() && movementReplayEnabled && movementReplayKey > 0 &&
         (GetAsyncKeyState(movementReplayKey) & 0x8000) != 0;
     const bool pressed = keyDown && !replayKeyWasDown;
     replayKeyWasDown = keyDown;

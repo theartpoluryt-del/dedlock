@@ -22,6 +22,7 @@ constexpr bool kCameraRelativeMovement = false;
 constexpr bool kSilentCommandMovementCorrection = true;
 constexpr bool kSilentMovementYawIsolation = false;
 constexpr bool kSilentMoveDataYawIsolation = false;
+constexpr bool kRuntimeDiagnostics = false;
 
 uintptr_t FindLocalPawnFromController() {
     if (!clientBase) return 0;
@@ -89,6 +90,96 @@ uintptr_t FindClientPattern(const char* pattern, uintptr_t startAddress = 0) {
     return 0;
 }
 
+uintptr_t FindUniqueModulePattern(HMODULE module, const char* pattern) {
+    if (!module || !pattern) return 0;
+    MODULEINFO info{};
+    if (!GetModuleInformation(GetCurrentProcess(), module, &info,
+                              sizeof(info))) return 0;
+    std::vector<int> bytes;
+    std::stringstream stream(pattern);
+    std::string token;
+    while (stream >> token)
+        bytes.push_back(token == "?" ? -1
+                                      : std::strtoul(token.c_str(), nullptr, 16));
+    if (bytes.empty() || bytes.size() > info.SizeOfImage) return 0;
+
+    const auto base = reinterpret_cast<uintptr_t>(module);
+    const auto* image = reinterpret_cast<const uint8_t*>(base);
+    uintptr_t matchAddress = 0;
+    unsigned matches = 0;
+    for (size_t i = 0; i + bytes.size() <= info.SizeOfImage; ++i) {
+        bool match = true;
+        for (size_t j = 0; j < bytes.size(); ++j) {
+            if (bytes[j] >= 0 &&
+                image[i + j] != static_cast<uint8_t>(bytes[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (!match) continue;
+        matchAddress = base + i;
+        if (++matches > 1) return 0;
+    }
+    return matches == 1 ? matchAddress : 0;
+}
+
+using ClientOutputFn = void(__fastcall*)(void*, void*, void*, void*);
+ClientOutputFn originalClientOutput = nullptr;
+void* clientOutputTarget = nullptr;
+
+void __fastcall hkClientOutput(void* a1, void* a2, void* a3, void* a4) {
+    static thread_local bool insideCallback = false;
+    if (!insideCallback &&
+        InterlockedCompareExchange(&unloadRequested, 0, 0) == 0) {
+        insideCallback = true;
+        PublishVisualFrameSnapshot();
+        insideCallback = false;
+    }
+    if (originalClientOutput)
+        originalClientOutput(a1, a2, a3, a4);
+}
+
+bool InstallVisualFrameHookInternal() {
+    if (clientOutputTarget) return true;
+    HMODULE engine = GetModuleHandleA("engine2.dll");
+    constexpr const char* ClientOutputPattern =
+        "48 89 5C 24 ? 55 56 57 41 54 41 56 48 83 EC ? 48 8D 05";
+    clientOutputTarget = reinterpret_cast<void*>(
+        FindUniqueModulePattern(engine, ClientOutputPattern));
+    if (!clientOutputTarget) return false;
+
+    const MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
+        clientOutputTarget = nullptr;
+        return false;
+    }
+    const MH_STATUS created = MH_CreateHook(
+        clientOutputTarget, reinterpret_cast<void*>(&hkClientOutput),
+        reinterpret_cast<void**>(&originalClientOutput));
+    if (created != MH_OK && created != MH_ERROR_ALREADY_CREATED) {
+        clientOutputTarget = nullptr;
+        originalClientOutput = nullptr;
+        return false;
+    }
+    const MH_STATUS enabled = MH_EnableHook(clientOutputTarget);
+    if (enabled != MH_OK && enabled != MH_ERROR_ENABLED) {
+        MH_RemoveHook(clientOutputTarget);
+        clientOutputTarget = nullptr;
+        originalClientOutput = nullptr;
+        return false;
+    }
+    return true;
+}
+
+void RemoveVisualFrameHookInternal() {
+    if (clientOutputTarget) {
+        MH_DisableHook(clientOutputTarget);
+        MH_RemoveHook(clientOutputTarget);
+    }
+    clientOutputTarget = nullptr;
+    originalClientOutput = nullptr;
+}
+
 void __fastcall HookEntityAdded(uintptr_t system, uintptr_t instance, uint32_t handle) {
     if (originalEntityAdded) originalEntityAdded(system, instance, handle);
     QueueOrbEntityAdded(handle);
@@ -109,6 +200,7 @@ std::atomic<unsigned long long> silentAppliedCalls{0};
 std::atomic<unsigned long long> createMoveCalls{0};
 std::atomic<unsigned long long> userCmdResolvedCalls{0};
 std::atomic<bool> bunnyBlockAirJump{false};
+std::atomic<bool> bunnyJumpOneShot{false};
 std::atomic<bool> bunnyDashJumpOneShot{false};
 std::atomic<bool> bunnyFinishDashJumpInput{false};
 std::atomic<ULONGLONG> bunnyDashGuardUntil{0};
@@ -831,6 +923,7 @@ BOOL WINAPI hkSetCursorPos(int x, int y) {
 
 BOOL WINAPI hkClipCursor(const RECT* rect) {
     // The game also restores its centre-sized cursor clip on activation.
+    NotifyGameCursorCapture(rect != nullptr);
     if (menuOpen && rect) return TRUE;
     return originalClipCursor ? originalClipCursor(rect) : FALSE;
 }
@@ -920,6 +1013,13 @@ UINT WINAPI hkGetRawInputData(HRAWINPUT handle, UINT command, LPVOID data, PUINT
     const UINT result = originalGetRawInputData
         ? originalGetRawInputData(handle, command, data, size, headerSize)
         : static_cast<UINT>(-1);
+    if (command == RID_INPUT && data && result != static_cast<UINT>(-1) &&
+        result >= sizeof(RAWINPUTHEADER)) {
+        const auto* input = static_cast<const RAWINPUT*>(data);
+        if (input->header.dwType == RIM_TYPEKEYBOARD)
+            UpdateGameTextInputKey(input->data.keyboard.VKey,
+                (input->data.keyboard.Flags & RI_KEY_BREAK) == 0);
+    }
     if (menuOpen && command == RID_INPUT && data &&
         result != static_cast<UINT>(-1) && result >= sizeof(RAWINPUTHEADER)) {
         auto* input = static_cast<RAWINPUT*>(data);
@@ -974,6 +1074,17 @@ UINT WINAPI hkGetRawInputBuffer(PRAWINPUT data, PUINT size, UINT headerSize) {
     const UINT result = originalGetRawInputBuffer
         ? originalGetRawInputBuffer(data, size, headerSize)
         : static_cast<UINT>(-1);
+    if (data && result != static_cast<UINT>(-1)) {
+        const RAWINPUT* input = data;
+        for (UINT index = 0; index < result; ++index) {
+            if (input->header.dwType == RIM_TYPEKEYBOARD)
+                UpdateGameTextInputKey(input->data.keyboard.VKey,
+                    (input->data.keyboard.Flags & RI_KEY_BREAK) == 0);
+            const UINT alignedSize = (input->header.dwSize + 7u) & ~7u;
+            input = reinterpret_cast<const RAWINPUT*>(
+                reinterpret_cast<const uint8_t*>(input) + alignedSize);
+        }
+    }
     if (menuOpen && data && result != static_cast<UINT>(-1)) {
         RAWINPUT* input = data;
         for (UINT index = 0; index < result; ++index) {
@@ -1190,6 +1301,13 @@ bool UserCmdHasAnyMask(const CUserCmd* command, std::uint64_t mask) {
 
 bool GetPendingSilentInputAngle(Vector3& angles) {
     const bool physicalAttack = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    if (autoLastHitOrbs) {
+        std::lock_guard<std::mutex> lock(orbSilentMutex);
+        if (pendingOrbReady && (pendingOrbAttack || physicalAttack)) {
+            angles = pendingOrbAngles;
+            return true;
+        }
+    }
     if ((farmSilentMode || farmMixedMode) && physicalAttack) {
         std::lock_guard<std::mutex> lock(creepSilentMutex);
         if (pendingCreepReady) {
@@ -1201,13 +1319,6 @@ bool GetPendingSilentInputAngle(Vector3& angles) {
         std::lock_guard<std::mutex> lock(humanSilentMutex);
         if (pendingHumanReady) {
             angles = pendingHumanAngles;
-            return true;
-        }
-    }
-    if (autoLastHitOrbs) {
-        std::lock_guard<std::mutex> lock(orbSilentMutex);
-        if (pendingOrbReady && pendingOrbAttack) {
-            angles = pendingOrbAngles;
             return true;
         }
     }
@@ -1239,17 +1350,6 @@ void ApplyPendingUserCmdAngles(uintptr_t userCmd) {
             0x0000001000000000ull;  // Ability 4 (Vindicta)
         const bool heroAbilityCommand =
             UserCmdHasAnyMask(command, HeroAbilityAimMask);
-        // Creep Aim owns primary-fire commands whenever it has a live target.
-        // Resolve this before the shared hero/script queue so a stale script
-        // angle can never redirect a creep shot.
-        if ((farmNormalActive || farmSilentMode || farmMixedMode) &&
-            commandHasAttack) {
-            std::lock_guard<std::mutex> lock(creepSilentMutex);
-            if (pendingCreepReady) {
-                angles = pendingCreepAngles;
-                ready = true;
-            }
-        }
         {
             std::lock_guard<std::mutex> lock(silentAnglesMutex);
             if (!ready && pendingSilentAnglesReady &&
@@ -1273,6 +1373,18 @@ void ApplyPendingUserCmdAngles(uintptr_t userCmd) {
                 ready = true;
             }
         }
+        // A live orb temporarily owns primary fire, including a shot the
+        // player was already holding before the orb appeared.
+        if (!ready && autoLastHitOrbs) {
+            std::lock_guard<std::mutex> lock(orbSilentMutex);
+            if (pendingOrbReady && (pendingOrbAttack || commandHasAttack)) {
+                angles = pendingOrbAngles;
+                attack = pendingOrbAttack;
+                if (!pendingOrbHoldAttack)
+                    pendingOrbAttack = false;
+                ready = true;
+            }
+        }
         // While Creep Aim has a live target it owns primary fire in every
         // mode. Player, orb and cached hero angles must not overwrite it.
         if (!ready && (farmNormalActive || farmSilentMode || farmMixedMode) &&
@@ -1287,17 +1399,6 @@ void ApplyPendingUserCmdAngles(uintptr_t userCmd) {
             std::lock_guard<std::mutex> lock(humanSilentMutex);
             if (pendingHumanReady) {
                 angles = pendingHumanAngles;
-                ready = true;
-            }
-        }
-        if (!ready && autoLastHitOrbs) {
-            std::lock_guard<std::mutex> lock(orbSilentMutex);
-            if (pendingOrbReady && (pendingOrbAttack || commandHasAttack)) {
-                angles = pendingOrbAngles;
-                attack = pendingOrbAttack;
-                // Attack is a pulse, but the angle must remain valid for all
-                // commands until AutoLastHitOrbs drops or changes the target.
-                pendingOrbAttack = false;
                 ready = true;
             }
         }
@@ -1372,7 +1473,7 @@ void ApplyPendingUserCmdAngles(uintptr_t userCmd) {
 
     static ULONGLONG lastCorrelationLog = 0;
     const ULONGLONG correlationNow = GetTickCount64();
-    if (correlationNow - lastCorrelationLog >= 100) {
+    if (kRuntimeDiagnostics && correlationNow - lastCorrelationLog >= 100) {
         lastCorrelationLog = correlationNow;
         static std::mutex correlationLogMutex;
         std::lock_guard<std::mutex> lock(correlationLogMutex);
@@ -1484,7 +1585,7 @@ void CorrectMovementBeforeLocalApply(uintptr_t input, uintptr_t userCmd) {
 
     static ULONGLONG lastMovementApplyLog = 0;
     const ULONGLONG now = GetTickCount64();
-    if (now - lastMovementApplyLog >= 100) {
+    if (kRuntimeDiagnostics && now - lastMovementApplyLog >= 100) {
         lastMovementApplyLog = now;
         static std::mutex movementApplyLogMutex;
         std::lock_guard<std::mutex> lock(movementApplyLogMutex);
@@ -1600,6 +1701,7 @@ bool EnsureApplyInputCommandHook(uintptr_t input) {
 }
 
 void LogPawnUserCmd(const char* phase, uintptr_t pawn, uintptr_t userCmd) {
+    if constexpr (!kRuntimeDiagnostics) return;
     if (!userCmd) return;
     const auto* command = reinterpret_cast<const CUserCmd*>(userCmd);
     float forward = 0.0f;
@@ -1629,7 +1731,7 @@ void LogPawnUserCmd(const char* phase, uintptr_t pawn, uintptr_t userCmd) {
 void __fastcall hkPawnProcessUserCmd(uintptr_t pawn, uintptr_t userCmd) {
     static ULONGLONG lastLog = 0;
     const ULONGLONG now = GetTickCount64();
-    const bool shouldLog = now - lastLog >= 100;
+    const bool shouldLog = kRuntimeDiagnostics && now - lastLog >= 100;
     if (shouldLog) {
         lastLog = now;
         LogPawnUserCmd("before", pawn, userCmd);
@@ -2127,7 +2229,7 @@ void ApplyAutoActiveReload(uintptr_t userCmd) {
     if (!inReloadOffset || !canActiveReloadOffset ||
         !lastReloadStartOffset || !nextPrimaryAttackOffset ||
         !attackDelayPauseOffset) {
-        if (now >= nextDiagnosticAt) {
+        if (kRuntimeDiagnostics && now >= nextDiagnosticAt) {
             nextDiagnosticAt = now + 500;
             std::ofstream log(
                 Dll6Paths::DataFileA("active_reload_runtime.log"),
@@ -2238,7 +2340,7 @@ void ApplyAutoActiveReload(uintptr_t userCmd) {
         firedThisReload = true;
         triggerTime = 0.0f;
     }
-    if (now >= nextDiagnosticAt || tapReload) {
+    if (kRuntimeDiagnostics && (now >= nextDiagnosticAt || tapReload)) {
         nextDiagnosticAt = now + 250;
         std::ofstream log(
             Dll6Paths::DataFileA("active_reload_runtime.log"),
@@ -2287,15 +2389,20 @@ void ApplyBunnyHop(uintptr_t userCmd) {
     static bool previousSpaceDown = false;
     static bool landingArmed = false;
     static bool manualAirborneInput = false;
+    static bool airborneReleaseSeen = false;
     static ULONGLONG airborneSince = 0;
     static ULONGLONG airbornePhaseSince = 0;
+    static unsigned groundStableFrames = 0;
+    static ULONGLONG lastSyntheticJumpAt = 0;
     static ULONGLONG spaceReleasedAt = 0;
     static ULONGLONG lastDashPressedAt = 0;
     static bool previousDashDown = false;
     static uintptr_t trackedPawn = 0;
+    static ULONGLONG physicalSpacePressedAt = 0;
 
     if (!bunnyHop || !currentLocalPawn || !userCmd) {
         bunnyBlockAirJump.store(false, std::memory_order_release);
+        bunnyJumpOneShot.store(false, std::memory_order_release);
         bunnyDashJumpOneShot.store(false, std::memory_order_release);
         bunnyFinishDashJumpInput.store(false, std::memory_order_release);
         bunnyDashGuardUntil.store(0, std::memory_order_release);
@@ -2303,11 +2410,15 @@ void ApplyBunnyHop(uintptr_t userCmd) {
         previousSpaceDown = false;
         landingArmed = false;
         manualAirborneInput = false;
+        airborneReleaseSeen = false;
         airborneSince = 0;
         airbornePhaseSince = 0;
+        groundStableFrames = 0;
+        lastSyntheticJumpAt = 0;
         spaceReleasedAt = 0;
         lastDashPressedAt = 0;
         previousDashDown = false;
+        physicalSpacePressedAt = 0;
         bunnyDashGuardUntil.store(0, std::memory_order_release);
         trackedPawn = 0;
         return;
@@ -2319,11 +2430,15 @@ void ApplyBunnyHop(uintptr_t userCmd) {
         previousSpaceDown = false;
         landingArmed = false;
         manualAirborneInput = false;
+        airborneReleaseSeen = false;
         airborneSince = 0;
         airbornePhaseSince = 0;
+        groundStableFrames = 0;
+        lastSyntheticJumpAt = 0;
         spaceReleasedAt = 0;
         lastDashPressedAt = 0;
         previousDashDown = false;
+        physicalSpacePressedAt = 0;
     }
 
     const ULONGLONG now = GetTickCount64();
@@ -2350,7 +2465,8 @@ void ApplyBunnyHop(uintptr_t userCmd) {
     constexpr uint64_t standardJumpMask = 0x0000000000000002ull;
     constexpr uint64_t filteredJumpMask =
         mantleJumpMask | standardJumpMask;
-    const bool spaceDown = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+    const bool spaceDown = !AreCustomBindsSuppressed() &&
+        (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
     const uint32_t groundHandle = groundEntityOffset
         ? Read<uint32_t>(currentLocalPawn + groundEntityOffset)
         : 0xFFFFFFFFu;
@@ -2367,101 +2483,49 @@ void ApplyBunnyHop(uintptr_t userCmd) {
         ? (handleOnGround && flagsOnGround)
         : (handleOnGround || flagsOnGround);
 
-    if (onGround) airbornePhaseSince = 0;
-    else if (!airbornePhaseSince) airbornePhaseSince = now;
-
     const bool physicalPress = spaceDown && !previousSpaceDown;
-    const bool dashDown =
-        (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
-    if (dashDown && !previousDashDown) lastDashPressedAt = now;
-    previousDashDown = dashDown;
-    const bool dashJumpPress = physicalPress && lastDashPressedAt &&
-        now - lastDashPressedAt <= 650;
-    if (dashJumpPress)
-        bunnyDashJumpOneShot.store(true, std::memory_order_release);
-    if (dashJumpPress)
-        bunnyDashGuardUntil.store(now + 1500, std::memory_order_release);
-    const bool physicalRelease = !spaceDown && previousSpaceDown;
-    if (physicalRelease || (!spaceDown && !spaceReleasedAt))
-        spaceReleasedAt = now;
-    if (!spaceDown) {
-        landingArmed = false;
-        manualAirborneInput = false;
-        airborneSince = 0;
-        bunnyDashGuardUntil.store(0, std::memory_order_release);
-    } else if (physicalPress && !onGround) {
-        // Treat this as an intentional double jump only after a distinct key-up
-        // interval and a stable airborne phase. Tiny sampled release gaps while
-        // holding/tapping for BunnyHop must not spend the second jump.
-        const bool deliberateAirPress = airbornePhaseSince &&
-            now - airbornePhaseSince >= 120 && spaceReleasedAt &&
-            now - spaceReleasedAt >= 80;
-        manualAirborneInput = deliberateAirPress;
-    } else if (!onGround) {
-        if (!airborneSince) airborneSince = now;
-        // A real jump remains airborne for much longer than this.  Arming only
-        // after a stable airborne interval rejects the one-frame ground bounce
-        // seen immediately after take-off.
-        if (now - airborneSince >= 100) landingArmed = true;
-    }
-
-    if (onGround) manualAirborneInput = false;
-    const bool initialPress = physicalPress && onGround;
-    const bool landingTap = spaceDown && onGround && !previousOnGround &&
-                            landingArmed;
-    if (landingTap) {
-        landingArmed = false;
-        airborneSince = 0;
-    }
-    previousOnGround = onGround;
+    if (physicalPress) physicalSpacePressedAt = now;
+    if (!spaceDown) physicalSpacePressedAt = 0;
     previousSpaceDown = spaceDown;
-    bunnyBlockAirJump.store(!onGround && !manualAirborneInput,
-                            std::memory_order_release);
+    previousOnGround = onGround;
 
-    if (now >= nextDiagnosticAt) {
-        nextDiagnosticAt = now + 250;
-        std::ofstream log(Dll6Paths::DataFileA("bunnyhop_runtime.log"),
-                          std::ios::app);
-        if (log)
-            log << "pawn=0x" << std::hex << currentLocalPawn
-                << " ground_off=0x" << groundEntityOffset
-                << " flags_off=0x" << flagsOffset
-                << " ground=0x" << groundHandle
-                << " flags=0x" << flags << std::dec
-                << " space=" << spaceDown
-                << " on_ground=" << onGround
-                << " tap=" << landingTap
-                << " native1=0x" << std::hex
-                << command->buttonStates.buttonState1 << std::dec << '\n';
-    }
-    if (!spaceDown) return;
-    if (manualAirborneInput) return;
+    bunnyBlockAirJump.store(false, std::memory_order_release);
+    bunnyDashGuardUntil.store(0, std::memory_order_release);
+
+    // A fresh physical Space press belongs entirely to the game. BunnyHop
+    // starts filtering only after that press has been held long enough for the
+    // native ground/air-jump transition to finish. This prevents the feature
+    // from turning the first manual press into two movement impulses.
+    constexpr ULONGLONG kFreshPhysicalPressWindowMs = 180;
+    const bool freshPhysicalPress = spaceDown && physicalSpacePressedAt &&
+        now - physicalSpacePressedAt < kFreshPhysicalPressWindowMs;
+    if (onGround || freshPhysicalPress) return;
 
     const uint64_t keepMask = ~filteredJumpMask;
-    const bool issueJump = initialPress || landingTap;
     command->buttonStates.buttonState1 =
-        (command->buttonStates.buttonState1 & keepMask) |
-        (issueJump ? mantleJumpMask : 0u);
+        command->buttonStates.buttonState1 & keepMask;
     command->buttonStates.buttonState2 =
-        (command->buttonStates.buttonState2 & keepMask) |
-        (issueJump ? mantleJumpMask : 0u);
-    // Physical Space never sets buttonState3 (the scroll/impulse channel).
-    // Mirroring the jump there can submit a second jump action in the same
-    // command, so always remove it from that channel.
+        command->buttonStates.buttonState2 & keepMask;
     command->buttonStates.buttonState3 =
         command->buttonStates.buttonState3 & keepMask;
     if (auto* base = command->cmd.mutable_base()) {
         if (auto* buttons = base->mutable_buttons_pb()) {
             buttons->set_buttonstate1(
-                (buttons->buttonstate1() & keepMask) |
-                (issueJump ? mantleJumpMask : 0u));
+                buttons->buttonstate1() & keepMask);
             buttons->set_buttonstate2(
-                (buttons->buttonstate2() & keepMask) |
-                (issueJump ? mantleJumpMask : 0u));
+                buttons->buttonstate2() & keepMask);
             buttons->set_buttonstate3(
                 buttons->buttonstate3() & keepMask);
+        }
+        const int subtickCount = base->subtick_moves_size();
+        if (subtickCount > 0 && subtickCount <= 64) {
+            for (int i = 0; i < subtickCount; ++i) {
+                auto* step = base->mutable_subtick_moves(i);
+                if (step && step->has_button() &&
+                    (step->button() & filteredJumpMask) != 0) {
+                    step->set_button(step->button() & keepMask);
+                }
+            }
         }
     }
 }
@@ -2479,7 +2543,10 @@ void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3
     }
     if (kSilentMovementYawIsolation)
         EnsurePawnProcessUserCmdHook(currentLocalPawn);
-    if (kSilentMoveDataYawIsolation || movementReplayEnabled || bunnyHop)
+    // BunnyHop is applied to the finalized user command. Do not install the
+    // ProcessMovement hook for it: prediction can call that hook more than
+    // once for the same command and consume Jump twice.
+    if (kSilentMoveDataYawIsolation || movementReplayEnabled)
         EnsureProcessMovementHook(currentLocalPawn);
     // CreateMove and the following local input stage can both append weapon
     // recoil. Bracket the stock call so the state is clear before a shot is
@@ -2513,7 +2580,7 @@ void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3
     }
     if (kSilentMovementYawIsolation)
         EnsurePawnProcessUserCmdHook(currentLocalPawn);
-    if (kSilentMoveDataYawIsolation || movementReplayEnabled || bunnyHop)
+    if (kSilentMoveDataYawIsolation || movementReplayEnabled)
         EnsureProcessMovementHook(currentLocalPawn);
     const auto callCount = ++createMoveCalls;
     const uintptr_t userCmd = GetCurrentUserCmd();
@@ -2578,7 +2645,8 @@ void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3
         (GetAsyncKeyState('A') & 0x8000) != 0 ||
         (GetAsyncKeyState('S') & 0x8000) != 0 ||
         (GetAsyncKeyState('D') & 0x8000) != 0;
-    if (movementKeyDown && movementNow - lastMovementLog >= 100) {
+    if (kRuntimeDiagnostics && movementKeyDown &&
+        movementNow - lastMovementLog >= 100) {
         lastMovementLog = movementNow;
         float commandForward = 0.0f;
         float commandLeft = 0.0f;
@@ -2614,7 +2682,8 @@ void __fastcall hkCreateMove(uintptr_t input, uint32_t splitScreenIndex, char a3
     }
 #ifndef DLL6_MOVEMENT_ONLY
     static bool freeCamKeyLastDown = false;
-    const bool freeCamKeyDown = IsGameFocused() && !menuOpen && freeCamKey > 0 &&
+    const bool freeCamKeyDown = IsGameFocused() &&
+        !AreCustomBindsSuppressed() && freeCamKey > 0 &&
         ((GetAsyncKeyState(freeCamKey) & 0x8000) != 0);
     if (freeCamKeyDown && !freeCamKeyLastDown && freeCam)
         freeCamActive = !freeCamActive;
@@ -2715,29 +2784,12 @@ uintptr_t __fastcall hkProcessMovement(uintptr_t movementServices,
     constexpr uintptr_t QueuedButtonDownOffset = 0x70;
     constexpr uintptr_t QueuedButtonChangeOffset = 0x78;
     constexpr uintptr_t ButtonDoublePressedOffset = 0x80;
-    std::array<uint64_t, 3> savedBunnyButtons{};
-    const bool dashJumpOneShot = movementServices && bunnyHop &&
-        bunnyDashJumpOneShot.exchange(false, std::memory_order_acq_rel);
-    const ULONGLONG dashGuardUntil =
-        bunnyDashGuardUntil.load(std::memory_order_acquire);
-    const bool dashGuardActive = dashGuardUntil &&
-        GetTickCount64() < dashGuardUntil;
-    const bool patchBunnyButtons = movementServices && bunnyHop &&
-        (bunnyBlockAirJump.load(std::memory_order_acquire) ||
-         dashGuardActive);
+    const bool jumpOneShot = false;
+    const bool dashJumpOneShot = false;
+    const bool patchBunnyButtons = false;
     if (patchBunnyButtons) {
-        for (size_t i = 0; i < savedBunnyButtons.size(); ++i) {
-            const uintptr_t offset = MovementButtonsOffset + i * sizeof(uint64_t);
-            savedBunnyButtons[i] = Read<uint64_t>(movementServices + offset);
-            Write<uint64_t>(movementServices + offset,
-                            savedBunnyButtons[i] & ~MovementJumpMask);
-        }
-        Write<uint64_t>(movementServices + QueuedButtonDownOffset,
-            Read<uint64_t>(movementServices + QueuedButtonDownOffset) &
-            ~MovementJumpMask);
-        Write<uint64_t>(movementServices + QueuedButtonChangeOffset,
-            Read<uint64_t>(movementServices + QueuedButtonChangeOffset) &
-            ~MovementJumpMask);
+        // Keep held/down/change states intact so native jumps and zipline
+        // grabs continue to work. Only discard the duplicate-edge channel.
         Write<uint64_t>(movementServices + ButtonDoublePressedOffset,
             Read<uint64_t>(movementServices + ButtonDoublePressedOffset) &
             ~MovementJumpMask);
@@ -2748,23 +2800,12 @@ uintptr_t __fastcall hkProcessMovement(uintptr_t movementServices,
         ? originalProcessMovement(movementServices, moveData) : 0;
 #ifndef DLL6_MOVEMENT_ONLY
     if (patchBunnyButtons) {
-        // Restore only the ordinary held/changed/scroll snapshots. Queued and
-        // double-pressed jump bits are intentionally kept cleared so they
-        // cannot fire on a later prediction pass.
-        for (size_t i = 0; i < savedBunnyButtons.size(); ++i)
-            Write<uint64_t>(movementServices + MovementButtonsOffset +
-                            i * sizeof(uint64_t), savedBunnyButtons[i]);
-        Write<uint64_t>(movementServices + QueuedButtonDownOffset,
-            Read<uint64_t>(movementServices + QueuedButtonDownOffset) &
-            ~MovementJumpMask);
-        Write<uint64_t>(movementServices + QueuedButtonChangeOffset,
-            Read<uint64_t>(movementServices + QueuedButtonChangeOffset) &
-            ~MovementJumpMask);
+        // Prediction can republish double-pressed during the stock call.
         Write<uint64_t>(movementServices + ButtonDoublePressedOffset,
             Read<uint64_t>(movementServices + ButtonDoublePressedOffset) &
             ~MovementJumpMask);
     }
-    if (dashJumpOneShot) {
+    if (dashJumpOneShot || jumpOneShot) {
         // Let this ProcessMovement call consume Space as a dash-jump, then
         // discard only the queued follow-up that would become an air jump on
         // the next prediction pass.
@@ -2802,7 +2843,7 @@ uintptr_t __fastcall hkProcessMovement(uintptr_t movementServices,
 
     static ULONGLONG lastLog = 0;
     const ULONGLONG now = GetTickCount64();
-    if (moveData && now - lastLog >= 100) {
+    if (kRuntimeDiagnostics && moveData && now - lastLog >= 100) {
         lastLog = now;
         static std::mutex logMutex;
         std::lock_guard<std::mutex> lock(logMutex);
@@ -2878,14 +2919,16 @@ bool EnsureProcessMovementHook(uintptr_t pawn) {
         return false;
     }
     processMovementTarget = targetAddress;
-    std::ofstream log(
-        Dll6Paths::DataFileA("process_movement_runtime.log"),
-        std::ios::app);
-    if (log) {
-        log << "installed schemaOffset=0x" << std::hex
-            << movementServicesOffset << " service=0x" << movementServices
-            << " target=0x" << target << " rva=0x"
-            << (target - clientBase) << std::dec << '\n';
+    if (kRuntimeDiagnostics) {
+        std::ofstream log(
+            Dll6Paths::DataFileA("process_movement_runtime.log"),
+            std::ios::app);
+        if (log) {
+            log << "installed schemaOffset=0x" << std::hex
+                << movementServicesOffset << " service=0x" << movementServices
+                << " target=0x" << target << " rva=0x"
+                << (target - clientBase) << std::dec << '\n';
+        }
     }
     return true;
 }
@@ -3427,6 +3470,14 @@ void ApplyCurrentCameraAim(const Vector3& worldTarget) {
     ApplyCurrentCameraAimInternal(worldTarget);
 }
 
+bool InstallVisualFrameHook() {
+    return InstallVisualFrameHookInternal();
+}
+
+void RemoveVisualFrameHook() {
+    RemoveVisualFrameHookInternal();
+}
+
 void ApplyHeroScriptCameraAim(const Vector3& worldTarget,
                               float pitchSmooth, float yawSmooth) {
     ApplyHeroScriptCameraAimInternal(worldTarget, pitchSmooth, yawSmooth);
@@ -3583,6 +3634,8 @@ void MaintainDrifterDarknessSuppression() {
     // post-process controller may be repopulated later by modifier dispatch,
     // so clear the same three buckets once more immediately before Present.
     PurgeDrifterDarknessBuckets();
+
+    if (!kRuntimeDiagnostics) return;
 
     static ULONGLONG lastLogAt = 0;
     if (now - lastLogAt < 2000) return;
@@ -3932,7 +3985,7 @@ void SetupHooks() {
     }
 
     void** pVTable = *(void***)pSwapChain;
-    if (!pVTable || !pVTable[8]) {
+    if (!pVTable || !pVTable[8] || !pVTable[13]) {
         pSwapChain->Release();
         pTempDevice->Release();
         pTempContext->Release();
@@ -3940,22 +3993,27 @@ void SetupHooks() {
         return;
     }
     oPresent = (PresentFn)pVTable[8];
+    oResizeBuffers = reinterpret_cast<ResizeBuffersFn>(pVTable[13]);
     presentVTable = pVTable;
 
-    // Хукаем VMT
+    // Hook Present and ResizeBuffers together. A backbuffer can be recreated
+    // while a map loads, so keeping an RTV or D2D surface from the old one is
+    // unsafe.
     DWORD oldProtect;
-    if (!VirtualProtect(&pVTable[8], sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+    if (!VirtualProtect(&pVTable[8], 6 * sizeof(void*), PAGE_READWRITE, &oldProtect)) {
         pSwapChain->Release();
         pTempDevice->Release();
         pTempContext->Release();
         oPresent = nullptr;
+        oResizeBuffers = nullptr;
         presentVTable = nullptr;
         DestroyWindow(tempWindow);
         return;
     }
     pVTable[8] = hkPresent;
+    pVTable[13] = hkResizeBuffers;
     DWORD unusedProtect;
-    VirtualProtect(&pVTable[8], sizeof(void*), oldProtect, &unusedProtect);
+    VirtualProtect(&pVTable[8], 6 * sizeof(void*), oldProtect, &unusedProtect);
 
     pSwapChain->Release();
     pTempDevice->Release();
@@ -4058,7 +4116,7 @@ DWORD WINAPI InitializeThread(LPVOID) {
         std::ofstream marker(
             Dll6Paths::DataFileA("Dll6_runtime.marker"),
             std::ios::trunc);
-        if (marker) marker << "protobuf-silent-no-flick-build-2026-07-25-0012\nclientBase=0x"
+        if (marker) marker << "axiom-server-module-1.0.47\nclientBase=0x"
                            << std::hex << clientBase << "\n";
     }
     printf("[+] client.dll: 0x%p\n", reinterpret_cast<void*>(clientBase));
@@ -4088,9 +4146,6 @@ DWORD WINAPI InitializeThread(LPVOID) {
         // CGlowProperty worker is intentionally disabled because it competes
         // with the outline renderer and creates a jittering second layer.
     }
-#ifndef DLL6_MOVEMENT_ONLY
-    InstallModelGlowHook();
-#endif
     // Keep the serializer untouched. Silent is applied in CreateMove, where
     // the current command and movement values are available together.
     printf("[!] CUserCmd_to_network silent hook disabled\n");
@@ -4118,6 +4173,8 @@ DWORD WINAPI InitializeThread(LPVOID) {
     }
     printf("[+] CreateMove hook: %s\n", InstallCreateMoveHook(userCmdFunctions) ? "installed" : "not installed");
     printf("[+] Input lock hooks: %s\n", InstallInputLockHooks() ? "installed" : "not installed");
+    printf("[+] Client output visual hook: %s\n",
+           InstallVisualFrameHook() ? "installed" : "not installed; Present fallback");
     printf("[+] Free camera origin patch: signature ready\n");
 #ifndef DLL6_MOVEMENT_ONLY
     printf("[+] Sound event hook: %s\n", InstallSoundEventHook() ? "installed" : "not installed");

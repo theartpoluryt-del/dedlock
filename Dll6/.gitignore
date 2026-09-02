@@ -1,0 +1,35 @@
+# Visual Studio intermediate output and crash/debug artifacts.
+.vs/
+**/*.obj
+**/*.pdb
+**/*.idb
+**/*.ipdb
+**/*.iobj
+**/*.tlog/
+**/*.log
+**/*.marker
+**/*.csv
+**/*.tmp
+**/__pycache__/
+**/node_modules/
+
+# Runtime diagnostics are created under LOCALAPPDATA, but ignore them if a
+# local test redirects the data directory into the repository.
+runtime_offsets.log
+usercmd_patterns.log
+speed_measurement.txt
+
+# Explicit staging folder used for locked-output build verification.
+x64/Audit/
+backups/
+
+# License server secrets and state. Never commit the signing key or database.
+license-server/data/
+license-server/__pycache__/
+license-server/*.pyc
+
+# Supabase CLI and administrator-local state.
+supabase/.temp/
+supabase/.branches/
+supabase/.env
+supabase/.env.local

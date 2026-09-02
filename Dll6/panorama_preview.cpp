@@ -59,6 +59,8 @@ std::atomic<float> requestedLeft{0.0f};
 std::atomic<float> requestedTop{0.0f};
 std::atomic<float> requestedRight{0.0f};
 std::atomic<float> requestedBottom{0.0f};
+std::atomic<UINT> requestedViewportWidth{0};
+std::atomic<UINT> requestedViewportHeight{0};
 std::atomic<bool> requestedVisible{false};
 std::atomic<uint64_t> requestedGeneration{0};
 std::atomic<uint64_t> appliedGeneration{0};
@@ -105,6 +107,7 @@ UINT resolveHeight = 0;
 DXGI_FORMAT resolveFormat = DXGI_FORMAT_UNKNOWN;
 float previousLeft = -1.0f, previousTop = -1.0f;
 float previousRight = -1.0f, previousBottom = -1.0f;
+UINT previousViewportWidth = 0, previousViewportHeight = 0;
 std::atomic<int> settleFrames{0};
 uint64_t capturedGeneration = 0;
 std::atomic<uint64_t> captureSerial{0};
@@ -813,17 +816,21 @@ bool SpawnPanel(uintptr_t engine, uintptr_t contextPanel) {
 
 bool SetPanelTransform(uintptr_t engine, uintptr_t contextPanel,
                        float left, float top, float right, float bottom,
+                       UINT viewportWidth, UINT viewportHeight,
                        bool visible) {
-    const float x = std::floor(left);
-    const float y = std::floor(top);
-    const float width = (std::max)(1.0f, std::floor(right) - x);
-    const float height = (std::max)(1.0f, std::floor(bottom) - y);
+    if (!viewportWidth || !viewportHeight) return false;
+    const float x = std::clamp(left / viewportWidth * 100.0f, 0.0f, 100.0f);
+    const float y = std::clamp(top / viewportHeight * 100.0f, 0.0f, 100.0f);
+    const float width = std::clamp(
+        (right - left) / viewportWidth * 100.0f, 0.01f, 100.0f);
+    const float height = std::clamp(
+        (bottom - top) / viewportHeight * 100.0f, 0.01f, 100.0f);
     char script[1400]{};
     std::snprintf(script, sizeof(script), R"JS(
 (function(){var r=$.GetContextPanel();while(r.GetParent())r=r.GetParent();
 var p=r.FindChildTraverse('Dll6_esp_preview');
-if(p){p.style.width='%0.0fpx';p.style.height='%0.0fpx';
-p.style.transform='translate3d(%0.0fpx,%0.0fpx,0px)';
+if(p){p.style.width='%0.6f%%';p.style.height='%0.6f%%';
+p.style.position='%0.6f%% %0.6f%% 0px';p.style.transform='none';
 p.style.opacity='1.0';p.style.visibility='%s';
     var h=r.FindChildTraverse('Dll6_esp_scene');
     if(h)h.style.visibility='%s';}})();
@@ -894,20 +901,26 @@ void ProcessPendingUiWork(uintptr_t engine, uintptr_t contextPanel) {
     const float top = requestedTop.load(std::memory_order_relaxed);
     const float right = requestedRight.load(std::memory_order_relaxed);
     const float bottom = requestedBottom.load(std::memory_order_relaxed);
+    const UINT viewportWidth = requestedViewportWidth.load(
+        std::memory_order_relaxed);
+    const UINT viewportHeight = requestedViewportHeight.load(
+        std::memory_order_relaxed);
 
     if (generation != appliedGeneration.load(std::memory_order_acquire)) {
         if (visible) {
             if (!SpawnPanel(engine, contextPanel))
                 return;
             if (!SetPanelTransform(engine, contextPanel,
-                                   left, top, right, bottom, true)) {
+                                   left, top, right, bottom,
+                                   viewportWidth, viewportHeight, true)) {
                 Log("PREVIEW_FAIL_PANEL_TRANSFORM");
                 return;
             }
             settleFrames.store(4, std::memory_order_release);
         } else if (panelSpawned.load(std::memory_order_acquire)) {
             SetPanelTransform(engine, contextPanel,
-                              left, top, right, bottom, false);
+                              left, top, right, bottom,
+                              viewportWidth, viewportHeight, false);
         }
         panelVisible.store(visible && panelSpawned.load(std::memory_order_acquire),
                            std::memory_order_release);
@@ -1533,6 +1546,20 @@ void UpdatePanoramaPreview(IDXGISwapChain* swapChain,
                            float left, float top, float right, float bottom,
                            bool visible) {
     if (!swapChain || !context || !InitializePanoramaPreview()) return;
+    DXGI_SWAP_CHAIN_DESC viewportDesc{};
+    UINT viewportWidth = 0;
+    UINT viewportHeight = 0;
+    if (SUCCEEDED(swapChain->GetDesc(&viewportDesc))) {
+        viewportWidth = viewportDesc.BufferDesc.Width;
+        viewportHeight = viewportDesc.BufferDesc.Height;
+    }
+    if ((!viewportWidth || !viewportHeight) && gameWindow) {
+        RECT client{};
+        if (GetClientRect(gameWindow, &client)) {
+            viewportWidth = static_cast<UINT>((std::max)(0L, client.right));
+            viewportHeight = static_cast<UINT>((std::max)(0L, client.bottom));
+        }
+    }
     if (captureReleasePending.exchange(false, std::memory_order_acq_rel)) {
         captureTexture.Reset();
         resolveTexture.Reset();
@@ -1547,14 +1574,20 @@ void UpdatePanoramaPreview(IDXGISwapChain* swapChain,
     }
     const bool changed = left != previousLeft || top != previousTop ||
         right != previousRight || bottom != previousBottom ||
+        viewportWidth != previousViewportWidth ||
+        viewportHeight != previousViewportHeight ||
         visible != requestedVisible.load(std::memory_order_acquire);
     if (changed) {
         previousLeft = left; previousTop = top;
         previousRight = right; previousBottom = bottom;
+        previousViewportWidth = viewportWidth;
+        previousViewportHeight = viewportHeight;
         requestedLeft.store(left, std::memory_order_relaxed);
         requestedTop.store(top, std::memory_order_relaxed);
         requestedRight.store(right, std::memory_order_relaxed);
         requestedBottom.store(bottom, std::memory_order_relaxed);
+        requestedViewportWidth.store(viewportWidth, std::memory_order_relaxed);
+        requestedViewportHeight.store(viewportHeight, std::memory_order_relaxed);
         requestedVisible.store(visible, std::memory_order_relaxed);
         const uint64_t generation = requestedGeneration.fetch_add(
             1, std::memory_order_release) + 1;
@@ -2040,6 +2073,8 @@ var p=r.FindChildTraverse('Dll6_esp_preview');if(p)p.DeleteAsync(0);})();
     requestedTop.store(0.0f, std::memory_order_relaxed);
     requestedRight.store(0.0f, std::memory_order_relaxed);
     requestedBottom.store(0.0f, std::memory_order_relaxed);
+    requestedViewportWidth.store(0, std::memory_order_relaxed);
+    requestedViewportHeight.store(0, std::memory_order_relaxed);
     requestedGeneration.store(0, std::memory_order_release);
     appliedGeneration.store(0, std::memory_order_release);
     requestedHeroId.store(1, std::memory_order_release);
@@ -2084,6 +2119,7 @@ var p=r.FindChildTraverse('Dll6_esp_preview');if(p)p.DeleteAsync(0);})();
     creepPreviewModel = 0;
     creepPreviewModelReady = false;
     previousLeft = previousTop = previousRight = previousBottom = -1.0f;
+    previousViewportWidth = previousViewportHeight = 0;
     settleFrames.store(0, std::memory_order_release);
     capturedGeneration = 0;
     captureSerial.store(0, std::memory_order_release);

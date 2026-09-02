@@ -13,6 +13,26 @@ using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(
 static OMSetRenderTargetsFn originalOMSetRenderTargets = nullptr;
 static void* omSetRenderTargetsTarget = nullptr;
 static IDXGISwapChain* overlaySwapChain = nullptr;
+static std::atomic_bool overlayResizeInProgress{false};
+
+void ReleaseSwapChainBackbufferResources() {
+    if (pContext) pContext->OMSetRenderTargets(0, nullptr, nullptr);
+    if (pRenderTargetView) {
+        pRenderTargetView->Release();
+        pRenderTargetView = nullptr;
+    }
+    // D2D retains a surface acquired from the back buffer. It must be
+    // released before ResizeBuffers or DXGI will reject the resize.
+    ShutdownD2DMenu();
+    ReleaseAimResources();
+    if (depthStaging) {
+        depthStaging->Release();
+        depthStaging = nullptr;
+    }
+    depthSnapshotReady = false;
+    depthWidth = depthHeight = 0;
+    depthFormat = DXGI_FORMAT_UNKNOWN;
+}
 
 void STDMETHODCALLTYPE hkOMSetRenderTargets(
     ID3D11DeviceContext* context, UINT numViews,
@@ -23,6 +43,8 @@ void STDMETHODCALLTYPE hkOMSetRenderTargets(
         originalOMSetRenderTargets(
             context, numViews, renderTargetViews, depthStencilView);
     }
+    if (!depthStencilView)
+        SignalEarlyFrameFence(context);
 }
 
 bool InstallDepthCaptureHook() {
@@ -61,13 +83,44 @@ void RestorePresentHook() {
     if (!presentVTable || !oPresent) return;
 
     DWORD oldProtect;
-    if (VirtualProtect(&presentVTable[8], sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+    constexpr size_t firstSlot = 8;
+    constexpr size_t lastSlot = 13;
+    if (VirtualProtect(&presentVTable[firstSlot],
+                       (lastSlot - firstSlot + 1) * sizeof(void*),
+                       PAGE_READWRITE, &oldProtect)) {
         presentVTable[8] = reinterpret_cast<void*>(oPresent);
+        if (oResizeBuffers)
+            presentVTable[13] = reinterpret_cast<void*>(oResizeBuffers);
         DWORD unusedProtect;
-        VirtualProtect(&presentVTable[8], sizeof(void*), oldProtect, &unusedProtect);
+        VirtualProtect(&presentVTable[firstSlot],
+                       (lastSlot - firstSlot + 1) * sizeof(void*),
+                       oldProtect, &unusedProtect);
     }
 
     presentVTable = nullptr;
+    oResizeBuffers = nullptr;
+}
+
+HRESULT __stdcall hkResizeBuffers(
+    IDXGISwapChain* swapChain, UINT bufferCount, UINT width, UINT height,
+    DXGI_FORMAT format, UINT flags) {
+    if (!oResizeBuffers)
+        return DXGI_ERROR_INVALID_CALL;
+    const bool isOverlaySwapChain = !overlaySwapChain ||
+        swapChain == overlaySwapChain;
+    if (!isOverlaySwapChain)
+        return oResizeBuffers(swapChain, bufferCount, width, height,
+                              format, flags);
+
+    overlayResizeInProgress.store(true, std::memory_order_release);
+    if (imguiInitialized) ImGui_ImplDX11_InvalidateDeviceObjects();
+    ReleaseSwapChainBackbufferResources();
+    const HRESULT result = oResizeBuffers(swapChain, bufferCount, width,
+                                          height, format, flags);
+    if (SUCCEEDED(result) && imguiInitialized)
+        ImGui_ImplDX11_CreateDeviceObjects();
+    overlayResizeInProgress.store(false, std::memory_order_release);
+    return result;
 }
 
 void ShutdownOverlay() {
@@ -130,6 +183,7 @@ void ShutdownOverlay() {
     ResetHeroScripts();
 #endif
     RemoveUserCmdHook();
+    RemoveVisualFrameHook();
     RemoveDrifterDarknessHooks();
     RemoveInputLockHooks();
     RemoveSoundEventHook();
@@ -212,6 +266,11 @@ DWORD WINAPI UnloadThread(LPVOID) {
     }
     HMODULE self = moduleHandle;
     moduleHandle = nullptr;
+    if (manualMapInfoHandle) {
+        CloseHandle(manualMapInfoHandle);
+        manualMapInfoHandle = nullptr;
+    }
+    if (manualMappedModule) ExitThread(0);
     if (self) FreeLibraryAndExitThread(self, 0);
     return 0;
 }
@@ -222,6 +281,8 @@ void RequestUnload() {
 
 HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
     if (!pSwapChain || !oPresent) return E_FAIL;
+    if (overlayResizeInProgress.load(std::memory_order_acquire))
+        return oPresent(pSwapChain, SyncInterval, Flags);
 
     // The DXGI Present implementation is shared by every swap chain created
     // by the process. Process only the swap chain that initialized the game
@@ -261,8 +322,8 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     }
 
     // Persist changes even if the game or mapper terminates without running
-    // the normal DLL shutdown path. This is deliberately infrequent so it
-    // cannot affect frame time or continuously write to disk.
+    // the normal DLL shutdown path. SaveConfig compares the serialized state
+    // with the last saved contents, so unchanged settings never touch disk.
     static ULONGLONG lastConfigSaveAt = 0;
 #ifndef DLL6_MOVEMENT_ONLY
     const ULONGLONG configSaveNow = GetTickCount64();
@@ -293,10 +354,6 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         }
         overlaySwapChain = pSwapChain;
         gameWindow = desc.OutputWindow;
-#ifndef DLL6_MOVEMENT_ONLY
-        InstallDepthCaptureHook();
-#endif
-
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
@@ -344,10 +401,6 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         SetMenuOpen(false);
 #else
         SetMenuOpen(menuOpen);
-#endif
-        // The model hook is installed during initialization, but the DX11
-        // draw hooks can only be attached after the immediate context exists.
-#ifndef DLL6_MOVEMENT_ONLY
         InstallModelGlowHook();
 #endif
     }
@@ -368,27 +421,38 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
+    const ImVec2 projectionSize = ImGui::GetIO().DisplaySize;
+    overlayProjectionWidth.store(projectionSize.x, std::memory_order_release);
+    overlayProjectionHeight.store(projectionSize.y, std::memory_order_release);
 
-    // Copy and map the game depth buffer before sampling camera/entity state.
-    // Besides visibility data, the blocking D3D11_MAP_READ is the frame fence
-    // that made the c3d7f8ff build perfectly stable: it prevents ESP from
-    // combining a completed backbuffer with transforms from the next update.
-    // This must run on every primary-swap-chain Present, including 144 Hz.
+    LARGE_INTEGER profileFrequency{}, profileStarted{}, profilePlayers{};
+    LARGE_INTEGER profileEsp{}, profileFinished{};
+    QueryPerformanceFrequency(&profileFrequency);
+    QueryPerformanceCounter(&profileStarted);
+
     static ULONGLONG lastAuxiliaryUpdate = 0;
-    std::vector<PlayerData> visualSnapshot;
+    std::unique_lock<std::mutex> visualStateLock(visualFrameStateMutex);
+    const auto visualFrame = AcquireVisualFrameSnapshot();
+    RequestVisualFrameSnapshot();
+    std::vector<PlayerData> fallbackVisualSnapshot;
+    const std::vector<PlayerData>* visualSnapshotPtr = nullptr;
     const ULONGLONG now = GetTickCount64();
-#ifndef DLL6_MOVEMENT_ONLY
-    CaptureDepthSnapshot();
-    ArmGameDepthCapture();
-#endif
-    // Rebuild the visual snapshot on every Present so ESP positions are
-    // refreshed once per rendered frame, including 144 Hz displays.
-    // Never retain a previous visual frame. At 144 Hz, the old 150 ms grace
-    // period could redraw the same moving position for more than 20 Presents.
-    visualSnapshot = GetPlayers();
+    if (visualFrame) {
+        currentViewMatrix = visualFrame->viewMatrix;
+        currentViewMatrixReady = true;
+        visualSnapshotPtr = &visualFrame->players;
+    } else {
+        // Initialization and signature-failure fallback. The normal render
+        // path never scans entities or waits for the GPU from Present.
+        fallbackVisualSnapshot = GetPlayers();
+        visualSnapshotPtr = &fallbackVisualSnapshot;
+    }
+    const auto& visualSnapshot = *visualSnapshotPtr;
+    QueryPerformanceCounter(&profilePlayers);
 #ifdef DLL6_MOVEMENT_ONLY
     DrawMovementReplayOverlay();
 #else
+    UpdateModelChamsVisibility(visualSnapshot);
     UpdateAimTargetLock(visualSnapshot);
     UpdateHeroScriptTargets(visualSnapshot);
     UpdateMovementBotInputText(visualSnapshot);
@@ -403,6 +467,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         lastAuxiliaryUpdate = now;
     }
     RenderESP(visualSnapshot);
+    QueryPerformanceCounter(&profileEsp);
     DrawHeroScriptsOverlay();
     // Target acquisition and visibility tracing are bounded above. Camera
     // interpolation remains per-frame; the gameplay camera hook consumes it.
@@ -447,6 +512,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         RenderD2DMenu(sessionPlayerCount);
 #endif
 
+    visualStateLock.unlock();
     ImGui::EndFrame();
     ImGui::Render();
 
@@ -459,10 +525,63 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     }
     #endif
 
+    QueryPerformanceCounter(&profileFinished);
+    if (profileFrequency.QuadPart > 0) {
+        static double accumulatedPlayersMs = 0.0;
+        static double accumulatedEspMs = 0.0;
+        static double accumulatedTotalMs = 0.0;
+        static double maximumTotalMs = 0.0;
+        static uint32_t profileFrames = 0;
+        const auto milliseconds = [&](LONGLONG ticks) {
+            return static_cast<double>(ticks) * 1000.0 /
+                   static_cast<double>(profileFrequency.QuadPart);
+        };
+        const double playersMs = milliseconds(
+            profilePlayers.QuadPart - profileStarted.QuadPart);
+        const double espMs = milliseconds(
+            profileEsp.QuadPart - profilePlayers.QuadPart);
+        const double totalMs = milliseconds(
+            profileFinished.QuadPart - profileStarted.QuadPart);
+        accumulatedPlayersMs += playersMs;
+        accumulatedEspMs += espMs;
+        accumulatedTotalMs += totalMs;
+        maximumTotalMs = (std::max)(maximumTotalMs, totalMs);
+        if (++profileFrames >= 240) {
+            std::ofstream profile(
+                Dll6Paths::DataFileA("render_profile.log"),
+                std::ios::trunc);
+            if (profile) {
+                profile << "frames=" << profileFrames
+                        << " players_avg_ms="
+                        << accumulatedPlayersMs / profileFrames
+                        << " pre_and_esp_avg_ms="
+                        << accumulatedEspMs / profileFrames
+                        << " hook_total_avg_ms="
+                        << accumulatedTotalMs / profileFrames
+                        << " hook_total_max_ms=" << maximumTotalMs << '\n';
+            }
+            accumulatedPlayersMs = accumulatedEspMs = 0.0;
+            accumulatedTotalMs = maximumTotalMs = 0.0;
+            profileFrames = 0;
+        }
+    }
+
     return oPresent(pSwapChain, SyncInterval, Flags);
 }
 
 LRESULT __stdcall hkWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == WM_KILLFOCUS ||
+        (uMsg == WM_ACTIVATEAPP && wParam == FALSE) ||
+        (uMsg == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE)) {
+        ResetGameTextInputState();
+    }
+    if (!menuOpen && (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN ||
+                      uMsg == WM_KEYUP || uMsg == WM_SYSKEYUP))
+        UpdateGameTextInputKey(static_cast<int>(wParam),
+            uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN);
+    if (uMsg == WM_IME_STARTCOMPOSITION)
+        SetGameImeInputActive();
+
     if (uMsg == PanoramaPreviewUiMessage) {
         ProcessPanoramaPreviewUiThread();
         return 0;
@@ -496,6 +615,7 @@ LRESULT __stdcall hkWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 #ifndef DLL6_MOVEMENT_ONLY
     if (uMsg == WM_KEYUP &&
         (wParam == VK_INSERT || wParam == VK_PRIOR)) {
+        ResetGameTextInputState();
         SetMenuOpen(!menuOpen);
         return 0;
     }

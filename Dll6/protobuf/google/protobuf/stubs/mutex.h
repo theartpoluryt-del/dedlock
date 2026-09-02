@@ -32,6 +32,22 @@
 
 #include <mutex>
 
+#if defined(GOOGLE_PROTOBUF_NO_THREADLOCAL) && defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#ifdef GetMessage
+#undef GetMessage
+#endif
+#ifdef GetCurrentTime
+#undef GetCurrentTime
+#endif
+#ifdef CompareString
+#undef CompareString
+#endif
+#endif
+
 #ifdef GOOGLE_PROTOBUF_SUPPORT_WINDOWS_XP
 
 #include <windows.h>
@@ -173,6 +189,27 @@ class PROTOBUF_EXPORT MutexLockMaybe {
 template<typename T>
 class ThreadLocalStorage {
  public:
+#if defined(_WIN32)
+  ThreadLocalStorage() : key_(FlsAlloc(&ThreadLocalStorage::Delete)) {}
+  ~ThreadLocalStorage() {
+    if (key_ != FLS_OUT_OF_INDEXES) FlsFree(key_);
+  }
+  T* Get() {
+    T* result = key_ == FLS_OUT_OF_INDEXES
+                    ? nullptr
+                    : static_cast<T*>(FlsGetValue(key_));
+    if (result == nullptr) {
+      result = new T();
+      if (key_ != FLS_OUT_OF_INDEXES) FlsSetValue(key_, result);
+    }
+    return result;
+  }
+ private:
+  static VOID CALLBACK Delete(PVOID value) {
+    delete static_cast<T*>(value);
+  }
+  DWORD key_;
+#else
   ThreadLocalStorage() {
     pthread_key_create(&key_, &ThreadLocalStorage::Delete);
   }
@@ -192,6 +229,7 @@ class ThreadLocalStorage {
     delete static_cast<T*>(value);
   }
   pthread_key_t key_;
+#endif
 
   GOOGLE_DISALLOW_EVIL_CONSTRUCTORS(ThreadLocalStorage);
 };

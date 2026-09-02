@@ -1,0 +1,4 @@
+project_id = "vljgmubfztmxsyiwrity"
+
+[functions.axiom-license]
+verify_jwt = false

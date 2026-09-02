@@ -33,6 +33,14 @@ constexpr float kDesignHeight = 840.0f;
 constexpr float kMainWindowWidth = 996.0f;
 constexpr float kContentPanelBottom = 840.0f;
 
+struct ColorPickerHsvState {
+    float hue = 0.0f;
+    float saturation = 0.0f;
+    float value = 0.0f;
+    float rgb[3]{};
+    bool valid = false;
+};
+
 struct Renderer {
     ComPtr<ID2D1Factory> factory;
     ComPtr<IDWriteFactory> writeFactory;
@@ -116,6 +124,12 @@ struct Renderer {
     bool settingsOpen = false;
     float* colorPopup = nullptr;
     D2D1_RECT_F colorPopupAnchor{};
+    // 1/2 belong to the active feature color popup, 3/4 to the theme
+    // palette. Once a drag starts it keeps ownership until LMB is released,
+    // even when the pointer leaves the palette rectangle.
+    int activePaletteDrag = 0;
+    float* activePaletteOwner = nullptr;
+    std::unordered_map<const float*, ColorPickerHsvState> colorPickerStates;
     D2D1_RECT_F comboPopupRect{};
     float leftColumnScroll = 0.0f;
     float rightColumnScroll = 0.0f;
@@ -225,6 +239,41 @@ void RGBtoHSV(float r, float g, float b, float& h, float& s, float& v) {
     else h = (r - g) / delta + 4.0f;
     h /= 6.0f;
     if (h < 0.0f) h += 1.0f;
+}
+
+// RGB cannot represent a hue when saturation or brightness is zero. Preserve
+// the last HSV triplet for every color field, otherwise dragging to an edge
+// makes RGBtoHSV return hue=0 on the next frame and the marker jumps left.
+void GetPickerHSV(float* color, float& hue, float& saturation, float& value) {
+    auto& state = g.colorPickerStates[color];
+    const bool externallyChanged = !state.valid ||
+        std::fabs(color[0] - state.rgb[0]) > 0.0005f ||
+        std::fabs(color[1] - state.rgb[1]) > 0.0005f ||
+        std::fabs(color[2] - state.rgb[2]) > 0.0005f;
+    if (externallyChanged) {
+        RGBtoHSV(color[0], color[1], color[2],
+                 state.hue, state.saturation, state.value);
+        state.rgb[0] = color[0];
+        state.rgb[1] = color[1];
+        state.rgb[2] = color[2];
+        state.valid = true;
+    }
+    hue = state.hue;
+    saturation = state.saturation;
+    value = state.value;
+}
+
+void SetPickerHSV(float* color, float hue, float saturation, float value) {
+    auto& state = g.colorPickerStates[color];
+    state.hue = std::clamp(hue, 0.0f, 1.0f);
+    state.saturation = std::clamp(saturation, 0.0f, 1.0f);
+    state.value = std::clamp(value, 0.0f, 1.0f);
+    HSVtoRGB(state.hue, state.saturation, state.value,
+             color[0], color[1], color[2]);
+    state.rgb[0] = color[0];
+    state.rgb[1] = color[1];
+    state.rgb[2] = color[2];
+    state.valid = true;
 }
 
 D2D1_RECT_F Rect(float left, float top, float right, float bottom) {
@@ -488,7 +537,11 @@ void DrawToggle(const Layout& l, float x, float y, float width,
     float& animation = toggleIt->second;
     animation += ((*value ? 1.0f : 0.0f) - animation) * 0.18f;
 
-    Text(label, Rect(x + 10, y + 8, x + width - 110, y + 34), g.regular.Get(),
+    // Reserve exactly the space occupied by the controls on the right.  The
+    // old fixed 110 px inset needlessly clipped long labels (notably several
+    // Misc entries) even when there was no colour swatch.
+    const float labelRightInset = colorValue ? 104.0f : 62.0f;
+    Text(label, Rect(x + 10, y + 8, x + width - labelRightInset, y + 34), g.regular.Get(),
          interactive ? White() : Muted());
 
     const float colorOffset = colorValue ? 34.0f : 0.0f;
@@ -732,7 +785,12 @@ void DrawScriptHeroSelector(const Layout& l, float x, float y, float width) {
     for (int index = 0; index < 5; ++index) {
         const int row = index / 3;
         const int column = index % 3;
-        const float left = x + column * (itemWidth + gap);
+        // Five heroes form a 3 + 2 grid. Centre the shorter second row so the
+        // selector has the same visual weight on both sides.
+        const float rowOffset = row == 1
+            ? (width - (itemWidth * 2.0f + gap)) * 0.5f
+            : 0.0f;
+        const float left = x + rowOffset + column * (itemWidth + gap);
         const float top = y + row * (cardHeight + gap);
         const D2D1_RECT_F card = Rect(left, top, left + itemWidth, top + cardHeight);
         const bool selected = g.scriptHero == index;
@@ -1298,8 +1356,7 @@ void DrawPopup(const Layout& l) {
          g.regular.Get(), Muted());
 
     float hue{}, saturation{}, value{};
-    RGBtoHSV(g.colorPopup[0], g.colorPopup[1], g.colorPopup[2],
-             hue, saturation, value);
+    GetPickerHSV(g.colorPopup, hue, saturation, value);
     const D2D1_RECT_F palette = Rect(
         r.left + 12, r.top + 34, r.left + 212, r.top + 234);
     const D2D1_RECT_F saturationBar = Rect(
@@ -1359,8 +1416,26 @@ void DrawPopup(const Layout& l) {
          D2D1::Point2F(saturationBar.right + 3, saturationY),
          White(), 2.0f);
 
+    if (!l.down && g.activePaletteDrag >= 1 &&
+        g.activePaletteDrag <= 2) {
+        g.activePaletteDrag = 0;
+        g.activePaletteOwner = nullptr;
+    }
+    if (g.activePaletteOwner != g.colorPopup) {
+        g.activePaletteDrag = 0;
+        g.activePaletteOwner = nullptr;
+    }
+    if (l.clicked && Contains(palette, l.mouse)) {
+        g.activePaletteDrag = 1;
+        g.activePaletteOwner = g.colorPopup;
+    } else if (l.clicked && Contains(saturationBar, l.mouse)) {
+        g.activePaletteDrag = 2;
+        g.activePaletteOwner = g.colorPopup;
+    }
+
     bool changed = false;
-    if (l.down && Contains(palette, l.mouse)) {
+    if (l.down && g.activePaletteDrag == 1 &&
+        g.activePaletteOwner == g.colorPopup) {
         hue = std::clamp(
             (l.mouse.x - palette.left) /
                 (palette.right - palette.left),
@@ -1370,7 +1445,8 @@ void DrawPopup(const Layout& l) {
                 (palette.bottom - palette.top),
             0.0f, 1.0f);
         changed = true;
-    } else if (l.down && Contains(saturationBar, l.mouse)) {
+    } else if (l.down && g.activePaletteDrag == 2 &&
+               g.activePaletteOwner == g.colorPopup) {
         saturation = std::clamp(
             1.0f - (l.mouse.y - saturationBar.top) /
                 (saturationBar.bottom - saturationBar.top),
@@ -1378,8 +1454,7 @@ void DrawPopup(const Layout& l) {
         changed = true;
     }
     if (changed) {
-        HSVtoRGB(hue, saturation, value,
-                 g.colorPopup[0], g.colorPopup[1], g.colorPopup[2]);
+        SetPickerHSV(g.colorPopup, hue, saturation, value);
     }
 
     wchar_t hex[16]{};
@@ -1805,11 +1880,24 @@ bool StoreFrozenPanoramaFrame(int heroId) {
     if (!g.target || !g.preview3dBitmap ||
         g.frozenPreviewBitmaps.find(heroId) != g.frozenPreviewBitmaps.end())
         return false;
-    // Hold the exact D2D surface that was just drawn by Panorama. This is
-    // safer than copying the bitmap while the game owns its shared DXGI
-    // surface; when Panorama recreates its capture texture, this reference
-    // keeps the previous hero frame alive as the fallback.
-    g.frozenPreviewBitmaps.emplace(heroId, g.preview3dBitmap);
+    // A ComPtr copy only retains the shared Panorama surface; it does not
+    // freeze its pixels. When that surface returns to the initial Infernus
+    // scene, every hero fallback would therefore become Infernus. Copy the
+    // pixels into an independent D2D bitmap owned by this hero instead.
+    const D2D1_SIZE_U pixelSize = g.preview3dBitmap->GetPixelSize();
+    if (!pixelSize.width || !pixelSize.height) return false;
+    float dpiX = 96.0f, dpiY = 96.0f;
+    g.preview3dBitmap->GetDpi(&dpiX, &dpiY);
+    const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
+        g.preview3dBitmap->GetPixelFormat(), dpiX, dpiY);
+    ComPtr<ID2D1Bitmap> frozen;
+    if (FAILED(g.target->CreateBitmap(pixelSize, nullptr, 0, properties,
+                                      frozen.GetAddressOf())) ||
+        FAILED(frozen->CopyFromBitmap(nullptr, g.preview3dBitmap.Get(),
+                                      nullptr))) {
+        return false;
+    }
+    g.frozenPreviewBitmaps.emplace(heroId, std::move(frozen));
     return true;
 }
 
@@ -2269,8 +2357,9 @@ void DrawProfileSaveModal(const Layout& l) {
                             input.right - 10, input.bottom),
          g.regular.Get(), White());
 
-    const D2D1_RECT_F cancel = Rect(345, 397, 483, 431);
-    const D2D1_RECT_F save = Rect(493, 397, 651, 431);
+    // Two equal 148 px actions, centred under the 306 px input with a 10 px gap.
+    const D2D1_RECT_F cancel = Rect(345, 397, 493, 431);
+    const D2D1_RECT_F save = Rect(503, 397, 651, 431);
     FillRounded(cancel, 6, Color(1, 1, 1, 0.045f));
     StrokeRounded(cancel, 6, Border());
     Text(L"Cancel", cancel, g.centered.Get(), Muted());
@@ -2296,7 +2385,7 @@ struct SearchEntry {
 };
 
 static constexpr SearchEntry kSearchEntries[]{
-    {L"Aim assist", L"Player aim", 1, 0, 0, 0},
+    {L"Aimbot", L"Player aim", 1, 0, 0, 0},
     {L"Visibility check", L"Player aim", 1, 0, 0, 0},
     {L"Aim mode", L"Player aim", 1, 0, 0, 0},
     {L"Activation", L"Player aim", 1, 0, 0, 0},
@@ -2323,10 +2412,11 @@ static constexpr SearchEntry kSearchEntries[]{
     {L"Skeleton", L"Enemy visuals", 0, 0, 0, 0},
     {L"Health", L"Enemy visuals", 0, 0, 0, 0},
     {L"Glow", L"Enemy visuals", 0, 0, 0, 0},
-    {L"Invisible Chams", L"Enemy visuals", 0, 0, 0, 0},
+    {L"Chams", L"Enemy visuals", 0, 0, 0, 0},
     {L"Boxes", L"Ally visuals", 0, 0, 1, 0},
     {L"Skeleton", L"Ally visuals", 0, 0, 1, 0},
     {L"Glow", L"Ally visuals", 0, 0, 1, 0},
+    {L"Chams", L"Ally visuals", 0, 0, 1, 0},
     {L"Creep visuals", L"Creep visuals", 0, 0, 2, 0},
     {L"World modulation", L"World", 0, 0, 3, 0},
     {L"Disable skybox", L"World", 0, 0, 3, 0},
@@ -2335,6 +2425,7 @@ static constexpr SearchEntry kSearchEntries[]{
     {L"Haze Sleep Dagger", L"Scripts", 3, 0, 0, 1},
     {L"Shiv Serrated Knives", L"Scripts", 3, 0, 0, 2},
     {L"Bebop ability 3", L"Scripts", 3, 0, 0, 3},
+    {L"Bebop ability 2", L"Scripts", 3, 0, 0, 3},
     {L"Drifter ability 2", L"Scripts", 3, 0, 0, 4},
     {L"Auto parry", L"Misc", 2, 0, 0, 0},
     {L"Spectator list", L"Misc", 2, 0, 0, 0},
@@ -2383,44 +2474,46 @@ void DrawSearchPanel(const Layout& l) {
     if (!g.searchOpen) return;
     FillRect(Rect(0, 0, kMainWindowWidth, kDesignHeight),
              Color(0, 0, 0, 0.54f));
-    const D2D1_RECT_F panel = Rect(472, 78, 966, 544);
+    // Centre search over the content area (298..996), rather than pinning it
+    // against the right border of the window.
+    const D2D1_RECT_F panel = Rect(400, 78, 894, 544);
     GlowRounded(panel, 10, Color(0, 0, 0, 0.78f), 7, 2.2f);
     FillRounded(panel, 10, ThemeSurface(0.012f, 0.042f, 1.0f));
     StrokeRounded(panel, 10, Border(), 1.0f);
-    Text(L"Search settings", Rect(496, 94, 900, 126),
+    Text(L"Search settings", Rect(424, 94, 828, 126),
          g.semibold.Get(), White());
-    const D2D1_RECT_F close = Rect(918, 91, 950, 123);
+    const D2D1_RECT_F close = Rect(846, 91, 878, 123);
     if (Contains(close, l.mouse)) FillRounded(close, 5, Color(1, 1, 1, 0.055f));
-    Line(D2D1::Point2F(928, 101), D2D1::Point2F(940, 113), Muted(), 1.6f);
-    Line(D2D1::Point2F(940, 101), D2D1::Point2F(928, 113), Muted(), 1.6f);
+    Line(D2D1::Point2F(856, 101), D2D1::Point2F(868, 113), Muted(), 1.6f);
+    Line(D2D1::Point2F(868, 101), D2D1::Point2F(856, 113), Muted(), 1.6f);
 
-    const D2D1_RECT_F input = Rect(496, 136, 942, 178);
+    const D2D1_RECT_F input = Rect(424, 136, 870, 178);
     FillRounded(input, 6, Color(0.045f, 0.048f, 0.060f, 1.0f));
     StrokeRounded(input, 6, Red(0.66f), 1.0f);
     SetBrush(Muted());
-    g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(515, 156), 6, 6),
+    g.target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(443, 156), 6, 6),
                               g.brush.Get(), 1.5f);
-    Line(D2D1::Point2F(519, 160), D2D1::Point2F(525, 166), Muted(), 1.5f);
+    Line(D2D1::Point2F(447, 160), D2D1::Point2F(453, 166), Muted(), 1.5f);
     std::wstring shown = g.searchQuery;
     if ((GetTickCount64() / 500) % 2 == 0) shown += L"|";
     if (g.searchQuery.empty() && (GetTickCount64() / 500) % 2 != 0)
         shown = L"Type a function name...";
-    Text(shown.c_str(), Rect(536, input.top, input.right - 12, input.bottom),
+    Text(shown.c_str(), Rect(464, input.top, input.right - 12, input.bottom),
          g.regular.Get(), g.searchQuery.empty() ? Muted() : White());
 
     const auto matches = SearchMatches();
     if (g.searchQuery.empty()) {
         Text(L"Start typing to find any menu function",
-             Rect(496, 205, 942, 244), g.centered.Get(), Muted());
+             Rect(424, 205, 870, 244), g.centered.Get(), Muted());
     } else if (matches.empty()) {
         Text(L"No matching functions",
-             Rect(496, 205, 942, 244), g.centered.Get(), Muted());
+             Rect(424, 205, 870, 244), g.centered.Get(), Muted());
     } else {
         constexpr float rowHeight = 39.0f;
         for (size_t index = 0; index < matches.size(); ++index) {
             const SearchEntry& entry = *matches[index];
-            const D2D1_RECT_F row = Rect(496, 194 + index * rowHeight,
-                                         942, 229 + index * rowHeight);
+            const D2D1_RECT_F row = Rect(424, 194 + index * rowHeight,
+                                         870, 229 + index * rowHeight);
             if (Contains(row, l.mouse)) FillRounded(row, 5, Red(0.12f));
             Text(entry.label, Rect(row.left + 12, row.top, row.right - 150, row.bottom),
                  g.regular.Get(), White());
@@ -2688,14 +2781,7 @@ void RenderD2DMenu(std::size_t playerCount) {
             // creation. It remains valid if Panorama destroys its surface.
             const auto bitmap = g.frozenPreviewBitmaps.find(previewHeroId);
             const auto frame = g.frozenPreviewFrames.find(previewHeroId);
-            if (g.preview3dBitmap &&
-                g.lastDisplayedPreviewHeroId == previewHeroId) {
-                // The source surface is retained by this bitmap. It is the
-                // immediate fallback even if the per-hero D2D copy has not
-                // finished yet.
-                g.preview3dFrame = g.lastDisplayedPreviewFrame;
-                g.preview3dActive = true;
-            } else if (bitmap != g.frozenPreviewBitmaps.end() &&
+            if (bitmap != g.frozenPreviewBitmaps.end() &&
                 frame != g.frozenPreviewFrames.end()) {
                 g.preview3dBitmap = bitmap->second;
                 g.preview3dTexture.Reset();
@@ -2963,7 +3049,10 @@ void RenderD2DMenu(std::size_t playerCount) {
     section(L"MISCELLANEOUS", 546);
     nav(L"Misc", 570, 6, g.tab == 2, [&] { g.tab = 2; });
 
-    const float contentX = 349.0f + g.pageShift;
+    // Titles align to the same left edge as the controls on every page.
+    // Visual editor pages use their slightly wider dedicated surface.
+    const bool titleUsesVisualGrid = g.tab == 0 && g.visualTeam < 2;
+    const float contentX = (titleUsesVisualGrid ? 350.0f : 330.0f) + g.pageShift;
     const wchar_t* pageTitle = g.tab == 0 ? (g.visualTeam == 0 ? L"Enemy" :
                                              g.visualTeam == 1 ? L"Ally" :
                                              g.visualTeam == 2 ? L"Creep" : L"World") :
@@ -2991,16 +3080,16 @@ void RenderD2DMenu(std::size_t playerCount) {
     // The page title in the header already identifies the active tab.  Do not
     // repeat it as an "Overlay" card title or draw a redundant divider here.
     if (!visualEditor && g.tab != 0)
-        Line(D2D1::Point2F(655, cardTop),
-             D2D1::Point2F(655, contentPanelBottom - 28), Border());
+        Line(D2D1::Point2F(648, cardTop),
+             D2D1::Point2F(648, contentPanelBottom - 28), Border());
 
     const float leftX = visualEditor ? 350.0f : 330.0f;
-    const float rightX = visualEditor ? 660.0f : 675.0f;
+    const float rightX = visualEditor ? 660.0f : 666.0f;
     const float leftColumnWidth = visualEditor ? 288.0f : 300.0f;
     // Leave a deliberate, consistent breathing margin at the right edge of
     // every page. The left columns keep their existing geometry; right-hand
     // content stops before the page border instead of touching it.
-    const float rightColumnWidth = visualEditor ? 276.0f : 270.0f;
+    const float rightColumnWidth = visualEditor ? 276.0f : 300.0f;
     const float leftColorWidth = leftColumnWidth;
     const float rightColorWidth = rightColumnWidth;
     const float columnWidth = leftColumnWidth;
@@ -3094,10 +3183,6 @@ void RenderD2DMenu(std::size_t playerCount) {
         bool* teamGlowEnabled = g.visualTeam == 0 ? &enemyGlowEnabled : &allyGlowEnabled;
         float* teamChamsColor = g.visualTeam == 0 ? enemyChamsColor : allyChamsColor;
         bool* teamChamsEnabled = g.visualTeam == 0 ? &enemyChamsEnabled : &allyChamsEnabled;
-        float* teamInvisibleChamsColor = g.visualTeam == 0
-            ? enemyInvisibleChamsColor : allyInvisibleChamsColor;
-        bool* teamInvisibleChamsEnabled = g.visualTeam == 0
-            ? &enemyInvisibleChamsEnabled : &allyInvisibleChamsEnabled;
         float* teamMaxDistance = g.visualTeam == 0 ? &enemyEspMaxDistance :
                                  g.visualTeam == 1 ? &allyEspMaxDistance : &creepEspMaxDistance;
         float* teamBoxThickness = &boxThickness;
@@ -3213,18 +3298,15 @@ void RenderD2DMenu(std::size_t playerCount) {
                 DrawToggle(l, leftX, firstY + 310 + radarOffset, fullWidth,
                            L"Model glow", L"", teamGlowEnabled, teamGlowColor);
                 DrawToggle(l, leftX, firstY + 364 + radarOffset, fullWidth,
-                           L"Visible Chams", L"Visible model material",
+                           L"Chams", L"Model material",
                            teamChamsEnabled, teamChamsColor);
-                DrawToggle(l, leftX, firstY + 414 + radarOffset, fullWidth,
-                           L"Invisible Chams", L"Model through walls",
-                           teamInvisibleChamsEnabled, teamInvisibleChamsColor);
                 const wchar_t* glowModes[] = {L"HP-based fill", L"Normal fill"};
                 int* teamGlowMode = g.visualTeam == 0 ? &enemyGlowMode : &allyGlowMode;
-                DrawCombo(l, 401, leftX, firstY + 470 + radarOffset, fullWidth, L"Glow mode",
+                DrawCombo(l, 401, leftX, firstY + 414 + radarOffset, fullWidth, L"Glow mode",
                           teamGlowMode, glowModes, 2);
-                DrawSlider(l, leftX, firstY + 530 + radarOffset, fullWidth, L"Box thickness",
+                DrawSlider(l, leftX, firstY + 474 + radarOffset, fullWidth, L"Box thickness",
                            teamBoxThickness, 0.5f, 4.0f, L"%.2f px");
-                DrawSlider(l, leftX, firstY + 590 + radarOffset, fullWidth, L"Corner length",
+                DrawSlider(l, leftX, firstY + 534 + radarOffset, fullWidth, L"Corner length",
                            teamCornerLength, 0.10f, 0.35f, L"%.2f");
             } else {
                 // Split Creep controls into two fixed columns. The former
@@ -3246,21 +3328,21 @@ void RenderD2DMenu(std::size_t playerCount) {
                            L"Orb max distance", &orbEspMaxDistance,
                            10.0f, 500.0f, L"%.0f m");
 
-                DrawSectionHeading(rightX, firstY + 18, rightColumnWidth, L"Visible Chams");
+                DrawSectionHeading(rightX, firstY + 18, rightColumnWidth, L"Chams");
                 DrawToggle(l, rightX, firstY + 58, rightColumnWidth,
-                           L"Enemy", L"Apply visible chams to enemy creeps",
+                           L"Enemy", L"Apply chams to enemy creeps",
                            &enemyTrooperChams, enemyTrooperChamsColor);
                 DrawToggle(l, rightX, firstY + 112, rightColumnWidth,
-                           L"Ally", L"Apply visible chams to allied creeps",
+                           L"Ally", L"Apply chams to allied creeps",
                            &allyTrooperChams, allyTrooperChamsColor);
                 DrawToggle(l, rightX, firstY + 166, rightColumnWidth,
-                           L"Neutral", L"Apply visible chams to neutral creeps",
+                           L"Neutral", L"Apply chams to neutral creeps",
                            &neutralChams, neutralChamsColor);
             }
         }
     } else if (g.tab == 1) {
         if (g.aimSubtab == 0) {
-        DrawToggle(l, leftX, firstY, columnWidth, L"Aim assist",
+        DrawToggle(l, leftX, firstY, columnWidth, L"Aimbot",
                    L"Enable player targeting", &aimAssist);
         if (aimAssist) {
         // Keep the key capture in the left column.  The old inline placement
@@ -3471,13 +3553,19 @@ void RenderD2DMenu(std::size_t playerCount) {
         DrawToggle(l, rightX, firstY + 112, rightColumnWidth,
                    L"Show FOV", L"Draw the active script radius", &heroScriptsShowFov);
         const bool hazeTab = g.scriptHero == 1;
+        const bool bebopTab = g.scriptHero == 3;
         if (hazeTab) {
             DrawToggle(l, rightX, firstY + 166, rightColumnWidth,
                        L"Prediction dot",
                        L"Show the point where Sleep Dagger is aimed",
                        &hazePredictionDot);
+        } else if (bebopTab) {
+            DrawToggle(l, rightX, firstY + 166, rightColumnWidth,
+                       L"Auto Ability 2",
+                       L"Cast automatically when an enemy is in range",
+                       &bebopAbility2AutoEnabled);
         }
-        const float controlsOffset = hazeTab ? 54.0f : 0.0f;
+        const float controlsOffset = (hazeTab || bebopTab) ? 54.0f : 0.0f;
         DrawSlider(l, rightX, firstY + 180 + controlsOffset, rightColumnWidth,
                    L"Target FOV", fov, 10.0f, 500.0f, L"%.0f px");
         DrawSlider(l, rightX, firstY + 258 + controlsOffset, rightColumnWidth,
@@ -3687,8 +3775,7 @@ void DrawMenuSettingsPanel(const Layout& l) {
     Text(L"Theme palette", Rect(640, 116, 790, 140), g.regular.Get(), Muted());
 
     float hue{}, saturation{}, value{};
-    RGBtoHSV(menuAccentColor[0], menuAccentColor[1], menuAccentColor[2],
-             hue, saturation, value);
+    GetPickerHSV(menuAccentColor, hue, saturation, value);
     const D2D1_RECT_F palette = Rect(640, 146, 840, 346);
     const D2D1_RECT_F saturationBar = Rect(854, 146, 878, 346);
     constexpr int paletteSteps = 64;
@@ -3727,18 +3814,32 @@ void DrawMenuSettingsPanel(const Layout& l) {
                               (saturationBar.bottom - saturationBar.top);
     Line(D2D1::Point2F(saturationBar.left - 3, saturationY),
          D2D1::Point2F(saturationBar.right + 3, saturationY), White(), 2.0f);
+    if (!l.down && g.activePaletteDrag >= 3 &&
+        g.activePaletteDrag <= 4) {
+        g.activePaletteDrag = 0;
+        g.activePaletteOwner = nullptr;
+    }
+    if (l.clicked && Contains(palette, l.mouse)) {
+        g.activePaletteDrag = 3;
+        g.activePaletteOwner = menuAccentColor;
+    } else if (l.clicked && Contains(saturationBar, l.mouse)) {
+        g.activePaletteDrag = 4;
+        g.activePaletteOwner = menuAccentColor;
+    }
+
     bool changed = false;
-    if (l.down && Contains(palette, l.mouse)) {
+    if (l.down && g.activePaletteDrag == 3 &&
+        g.activePaletteOwner == menuAccentColor) {
         hue = std::clamp((l.mouse.x - palette.left) / (palette.right - palette.left), 0.0f, 1.0f);
         value = std::clamp(1.0f - (l.mouse.y - palette.top) / (palette.bottom - palette.top), 0.0f, 1.0f);
         changed = true;
-    } else if (l.down && Contains(saturationBar, l.mouse)) {
+    } else if (l.down && g.activePaletteDrag == 4 &&
+               g.activePaletteOwner == menuAccentColor) {
         saturation = std::clamp(1.0f - (l.mouse.y - saturationBar.top) /
                                 (saturationBar.bottom - saturationBar.top), 0.0f, 1.0f);
         changed = true;
     }
-    if (changed) HSVtoRGB(hue, saturation, value,
-                          menuAccentColor[0], menuAccentColor[1], menuAccentColor[2]);
+    if (changed) SetPickerHSV(menuAccentColor, hue, saturation, value);
     wchar_t hex[16]{};
     std::swprintf(hex, 16, L"#%02X%02X%02X",
                   static_cast<int>(menuAccentColor[0] * 255.0f),

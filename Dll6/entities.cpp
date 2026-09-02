@@ -6,6 +6,7 @@
 #include <atomic>
 
 namespace {
+constexpr bool kEntityRuntimeDiagnostics = false;
 std::unordered_map<uintptr_t, int> registeredGlowMode;
 
 std::string NormalizeEntityName(const std::string& name) {
@@ -29,6 +30,7 @@ void LogNativeGlow(const char* message) {
 // captures show those fields have the same values for both flying and stale
 // entries.  The scene node's dormant bit is the actual visual-state signal.
 struct OrbSceneState {
+    ULONGLONG firstObservedAt = 0;
     ULONGLONG lastObservedAt = 0;
     ULONGLONG lastDormantSampleAt = 0;
     uint8_t consecutiveDormantSamples = 0;
@@ -53,13 +55,17 @@ bool ShouldPublishXpOrb(uint32_t handle, uintptr_t entity, ULONGLONG now) {
     }
 
     OrbSceneState& state = states[handle];
+    if (state.firstObservedAt == 0) state.firstObservedAt = now;
     state.lastObservedAt = now;
     const uintptr_t sceneNode = Read<uintptr_t>(entity + Offsets::GameSceneNode);
-    // A scene node can briefly be absent while a newly spawned orb is being
-    // initialized.  That is not evidence that it has disappeared.
+    // A fresh orb can briefly precede its scene node, but retained CItemXP
+    // identities often keep a valid entity pointer after that node is gone.
+    // Never publish the latter indefinitely through the position fallback.
     if (!sceneNode) {
         state.consecutiveDormantSamples = 0;
-        return true;
+        constexpr ULONGLONG SceneNodeCreationGraceMs = 200;
+        return !state.hasBeenVisiblyActive &&
+               now - state.firstObservedAt < SceneNodeCreationGraceMs;
     }
 
     if (Read<uint8_t>(sceneNode + Offsets::SceneNodeDormant) == 0) {
@@ -343,7 +349,10 @@ bool GetEntityScreenBounds(uintptr_t entity, const Vector3& origin, const Matrix
     if (!projected || !std::isfinite(left) || !std::isfinite(top) ||
         !std::isfinite(right) || !std::isfinite(bottom)) return false;
     const float height = bottom - top;
-    const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
+    const ImVec2 displaySize{
+        overlayProjectionWidth.load(std::memory_order_acquire),
+        overlayProjectionHeight.load(std::memory_order_acquire)};
+    if (displaySize.x <= 0.0f || displaySize.y <= 0.0f) return false;
     const float width = right - left;
     const float maxCoordinate = (std::max)(displaySize.x, displaySize.y) * 4.0f;
     if (height < 4.0f || width < 2.0f ||
@@ -442,9 +451,7 @@ void ApplyHeroGlow(uintptr_t entity) {
     const uint8_t entityTeam = Read<uint8_t>(entity + Offsets::Team);
     const bool ally = localTeam >= 2 && localTeam <= 3 && entityTeam == localTeam;
     const int teamGlowMode = ally ? allyGlowMode : enemyGlowMode;
-    const bool teamInvisibleChamsEnabled = ally
-        ? allyInvisibleChamsEnabled : enemyInvisibleChamsEnabled;
-    const int rendererMode = teamInvisibleChamsEnabled ? 2 : teamGlowMode;
+    const int rendererMode = teamGlowMode;
 
     // The client can reset m_iGlowType after a network update even though the
     // property object remains alive. Re-register whenever the complete-model
@@ -465,9 +472,7 @@ void ApplyHeroGlow(uintptr_t entity) {
         if (shouldNotify) registeredGlowMode[entity] = rendererMode;
     }
 
-    const float* glowColor = teamInvisibleChamsEnabled
-        ? (ally ? allyInvisibleChamsColor : enemyInvisibleChamsColor)
-        : (ally ? teammateGlowColor : enemyGlowColor);
+    const float* glowColor = ally ? teammateGlowColor : enemyGlowColor;
     const int health = Read<int>(entity + Offsets::Health);
     const int maxHealth = Read<int>(entity + Offsets::MaxHealth);
     const float healthAlpha = maxHealth > 0
@@ -1816,18 +1821,11 @@ bool IsSoulDesignerName(const std::string& name) {
 }
 
 bool IsExpiredXpOrb(uintptr_t entity) {
-    if (!entity) return true;
-    const float attackableTime = Read<float>(entity + 0x0A0C);
-    const float endAttackableTime = Read<float>(entity + 0x0A10);
-    const float gameTime = GetClientGameTime();
-    if (!std::isfinite(attackableTime) || attackableTime <= 0.0f ||
-        !std::isfinite(endAttackableTime) || endAttackableTime <= 0.0f ||
-        !std::isfinite(gameTime) || gameTime <= 0.0f) return false;
-    const float lifetime = endAttackableTime - attackableTime;
-    if (lifetime < 0.05f || lifetime > 30.0f ||
-        attackableTime > gameTime + 120.0f ||
-        endAttackableTime > gameTime + 120.0f) return false;
-    return gameTime >= endAttackableTime;
+    // The two former hard-coded time offsets are no longer stable and can
+    // contain plausible values belonging to unrelated fields. Treating them
+    // as an expiry interval rejects every live CItemXP on affected builds.
+    // Lifetime is validated by identity/handle ownership and scene activity.
+    return entity == 0;
 }
 
 bool IsXpOrbAlive(uintptr_t entity, uint32_t handle) {
@@ -1935,8 +1933,10 @@ void RefreshFarmTargets() {
         else NotifyOrbEntityRemoved(event.handle);
     }
 
-    // The table scan remains the authoritative, stable discovery path.
-    if (now - lastRefresh < 16ull) return;
+    // CItemXP remains alive long enough to be sampled at 20 Hz. A full
+    // identity-table walk every render frame wastes a CPU core and lowers
+    // game FPS without improving orb aim, whose hitbox activates later.
+    if (now - lastRefresh < 100ull) return;
     lastRefresh = now;
 
     std::vector<FarmTarget> found;
@@ -1960,10 +1960,14 @@ void RefreshFarmTargets() {
     const uintptr_t root = Read<uintptr_t>(clientBase + Offsets::GameEntitySystem);
     const uintptr_t tableOffset = Offsets::EntityChunks;
     std::unordered_set<uintptr_t> seen;
+    seen.reserve(1024);
+    found.reserve(128);
+    foundOrbs.reserve(64);
+    foundWorldTargets.reserve(64);
     if (root) {
-        // HighestEntityIndex is a volatile cache; during spawns it can lag
-        // behind a newly allocated handle.  Scan every allocated table chunk
-        // instead, otherwise a short-lived orb can be missed completely.
+        // HighestEntityIndex is not authoritative for CItemXP in the current
+        // client. Walk every allocated chunk; null chunks are skipped before
+        // any slot work, so high-index live orbs remain discoverable.
         const uint32_t highestChunk =
             Offsets::HandleIndexMask >> Offsets::HandleChunkShift;
         for (uint32_t chunkIndex = 0; chunkIndex <= highestChunk; ++chunkIndex) {
@@ -2013,18 +2017,12 @@ void RefreshFarmTargets() {
                         className.find("GuidedArrow") != std::string::npos ||
                         className.find("Projectile") != std::string::npos ||
                         className.find("Ability") != std::string::npos;
-                    // Some soul-orbs use a generic client class and are
-                    // identifiable only by their designer name. Read that
-                    // name for every non-NPC object as well as known class
-                    // candidates, so those orbs are not skipped at spawn.
-                    const bool nonNpcObject =
-                        className.find("NPC") == std::string::npos;
                     // A number of world pickups use a generic entity class.
                     // In that case only the designer name identifies a rune or
                     // powerup, so do not discard the entity before reading it.
                     const std::string designerName =
-                         (possibleOrbClass || possibleWorldClass || worldEntityScanActive ||
-                         nonNpcObject)
+                         (possibleOrbClass || possibleWorldClass ||
+                          worldEntityScanActive)
                         ? ReadIdentityDesignerName(identity) : std::string{};
                     if (possibleWorldClass || !designerName.empty()) {
                         std::string markerName = className + " " + designerName;
@@ -2179,7 +2177,8 @@ void RefreshFarmTargets() {
         worldEspTargets = std::move(foundWorldTargets);
     }
     static ULONGLONG lastCreepScanLog = 0;
-    if ((drawCreepEsp || creepEspEnabled || allyCreepEspEnabled || neutralCreepEspEnabled || farmActive) &&
+    if (kEntityRuntimeDiagnostics &&
+        (drawCreepEsp || creepEspEnabled || allyCreepEspEnabled || neutralCreepEspEnabled || farmActive) &&
         now - lastCreepScanLog >= 1000) {
         lastCreepScanLog = now;
         std::ofstream log(Dll6Paths::DataFileA("creep_scan.log"),
@@ -2199,10 +2198,7 @@ DWORD WINAPI FarmTargetWorker(LPVOID) {
     while (!stopHeroDiscoveryEvent ||
            WaitForSingleObject(stopHeroDiscoveryEvent, 0) != WAIT_OBJECT_0) {
         RefreshFarmTargets();
-        // Orb lifetimes can be shorter than a 50 ms polling gap. Keep the
-        // worker aligned with the render cadence so each allocated handle is
-        // observed before it disappears.
-        Sleep(16);
+        Sleep(50);
     }
     return 0;
 }
@@ -2238,14 +2234,7 @@ DWORD WINAPI GlowApplyWorker(LPVOID) {
                 pawn != currentLocalPawn &&
                 (localTeam == 0 || localTeam == 2 || localTeam == 3)) {
                 const bool ally = localTeam >= 2 && localTeam <= 3 && team == localTeam;
-                // Model glow is a presentation layer of the corresponding
-                // hero ESP channel. It must never survive when that channel
-                // is disabled, even if the standalone master glow switch is
-                // still enabled.
-                const bool teamEspEnabled = ally ? allyEspEnabled : enemyEspEnabled;
                 const bool teamGlowEnabled = ally ? allyGlowEnabled : enemyGlowEnabled;
-                const bool teamInvisibleChamsEnabled = ally
-                    ? allyInvisibleChamsEnabled : enemyInvisibleChamsEnabled;
                 const float maxDistance = ally ? allyEspMaxDistance : enemyEspMaxDistance;
                 bool withinDistance = true;
                 if (currentLocalPositionReady) {
@@ -2258,9 +2247,7 @@ DWORD WINAPI GlowApplyWorker(LPVOID) {
                         withinDistance = std::isfinite(distance) && distance <= maxDistance;
                     }
                 }
-                if (teamEspEnabled && withinDistance &&
-                    ((glowEnabled && teamGlowEnabled) ||
-                     teamInvisibleChamsEnabled)) {
+                if (withinDistance && glowEnabled && teamGlowEnabled) {
                     ApplyHeroGlow(pawn);
                 } else {
                     Write<bool>(pawn + Offsets::Glow + Offsets::GlowEligible, false);
