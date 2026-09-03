@@ -24,6 +24,12 @@ import {
   normalizeLocale,
   Section,
 } from "./ui.ts";
+import {
+  parseAdminIds,
+  SupportContent,
+  supportContent,
+  ticketIdFromCallback,
+} from "./support.ts";
 
 type TelegramUser = {
   id: number;
@@ -33,9 +39,13 @@ type TelegramUser = {
 };
 
 type TelegramMessage = {
-  chat: { id: number };
+  message_id: number;
+  chat: { id: number; type?: string };
   from?: TelegramUser;
   text?: string;
+  caption?: string;
+  photo?: Array<{ file_id: string; file_size?: number }>;
+  document?: { file_id: string; file_name?: string; mime_type?: string };
   successful_payment?: {
     currency: string;
     total_amount: number;
@@ -97,6 +107,7 @@ const jsonHeaders = { "content-type": "application/json; charset=utf-8" };
 const defaultDownloadUrl =
   "https://github.com/theartpoluryt-del/dedlock/raw/refs/heads/main/Dll6/x64/Release/AxiomLauncher.exe";
 let telegramWebhookConfiguration: Promise<void> | null = null;
+let supportWebhookConfiguration: Promise<void> | null = null;
 
 function requiredSecret(name: string): string {
   const value = (Deno.env.get(name) ?? "").trim();
@@ -117,14 +128,13 @@ function tr(locale: Locale, ru: string, en: string): string {
   return locale === "en" ? en : ru;
 }
 
-function telegramApi(
+function botApi(
+  token: string,
   method: string,
   body: Record<string, unknown>,
 ): Promise<Response> {
   return fetch(
-    `https://api.telegram.org/bot${
-      requiredSecret("TELEGRAM_BOT_TOKEN")
-    }/${method}`,
+    `https://api.telegram.org/bot${token}/${method}`,
     {
       method: "POST",
       headers: jsonHeaders,
@@ -133,14 +143,29 @@ function telegramApi(
   );
 }
 
-async function telegramCall(
+async function botCall(
+  token: string,
   method: string,
   body: Record<string, unknown>,
 ): Promise<unknown> {
-  const response = await telegramApi(method, body);
+  const response = await botApi(token, method, body);
   const payload = await response.json();
   if (!response.ok || !payload.ok) throw new Error(`Telegram ${method} failed`);
   return payload.result;
+}
+
+function telegramCall(
+  method: string,
+  body: Record<string, unknown>,
+): Promise<unknown> {
+  return botCall(requiredSecret("TELEGRAM_BOT_TOKEN"), method, body);
+}
+
+function supportTelegramCall(
+  method: string,
+  body: Record<string, unknown>,
+): Promise<unknown> {
+  return botCall(requiredSecret("SUPPORT_BOT_TOKEN"), method, body);
 }
 
 function ensureTelegramWebhook(): Promise<void> {
@@ -167,6 +192,45 @@ function ensureTelegramWebhook(): Promise<void> {
     });
   }
   return telegramWebhookConfiguration;
+}
+
+function supportConfigured(): boolean {
+  return Boolean(
+    (Deno.env.get("SUPPORT_BOT_TOKEN") ?? "").trim() &&
+      (Deno.env.get("SUPPORT_WEBHOOK_SECRET") ?? "").trim(),
+  );
+}
+
+function supportAdminIds(): number[] {
+  return parseAdminIds(
+    Deno.env.get("SUPPORT_ADMIN_IDS"),
+    requiredSecret("TELEGRAM_ADMIN_CHAT_ID"),
+  );
+}
+
+function ensureSupportWebhook(): Promise<void> {
+  if (!supportConfigured()) return Promise.resolve();
+  if (!supportWebhookConfiguration) {
+    const baseUrl = requiredSecret("SUPABASE_URL").replace(/\/$/, "");
+    supportWebhookConfiguration = Promise.all([
+      supportTelegramCall("setWebhook", {
+        url: `${baseUrl}/functions/v1/axiom-bot/support-telegram`,
+        secret_token: requiredSecret("SUPPORT_WEBHOOK_SECRET"),
+        allowed_updates: ["message", "callback_query"],
+      }),
+      supportTelegramCall("setMyCommands", {
+        commands: [
+          { command: "tickets", description: "📬 Открытые тикеты" },
+          { command: "close", description: "✅ Закрыть активный тикет" },
+          { command: "cancel", description: "⏸ Выйти из диалога" },
+        ],
+      }),
+    ]).then(() => undefined).catch((error) => {
+      supportWebhookConfiguration = null;
+      throw error;
+    });
+  }
+  return supportWebhookConfiguration;
 }
 
 function formatMoney(
@@ -444,23 +508,550 @@ async function showGuide(chatId: number, locale: Locale): Promise<void> {
   );
 }
 
-async function showSupport(chatId: number, locale: Locale): Promise<void> {
-  const fallback = `tg://user?id=${requiredSecret("TELEGRAM_ADMIN_CHAT_ID")}`;
-  const url = configuredUrl("AXIOM_SUPPORT_URL", fallback);
+type SupportTicket = {
+  id: string;
+  ticket_number: number;
+  user_id: string;
+  status: "waiting_admin" | "waiting_user" | "closed";
+};
+
+async function sendSupportMessage(
+  chatId: number,
+  text: string,
+  extra: Record<string, unknown> = {},
+): Promise<void> {
+  await supportTelegramCall("sendMessage", {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    ...extra,
+  });
+}
+
+function ticketKeyboard(ticketId: string): Record<string, unknown> {
+  return {
+    reply_markup: {
+      inline_keyboard: [[
+        { text: "💬 Открыть диалог", callback_data: `ticket:open:${ticketId}` },
+        { text: "✅ Закрыть", callback_data: `ticket:close:${ticketId}` },
+      ]],
+    },
+  };
+}
+
+async function ticketAndUser(
+  supabase: SupabaseClient,
+  ticketId: string,
+): Promise<{ ticket: SupportTicket; user: Record<string, unknown> }> {
+  const { data: ticket, error: ticketError } = await supabase
+    .from("axiom_support_tickets")
+    .select("id,ticket_number,user_id,status").eq("id", ticketId).single();
+  if (ticketError) throw ticketError;
+  const { data: user, error: userError } = await supabase.from("axiom_users")
+    .select("telegram_user_id,username,first_name,last_name,language_code")
+    .eq("id", ticket.user_id).single();
+  if (userError) throw userError;
+  return { ticket: ticket as SupportTicket, user };
+}
+
+function supportUserLabel(user: Record<string, unknown>): string {
+  const username = user.username
+    ? `@${escapeHtml(user.username)}`
+    : "без username";
+  const name = [user.first_name, user.last_name].filter(Boolean).map(escapeHtml)
+    .join(" ");
+  return `${name || "Без имени"} (${username})\nTelegram ID: <code>${
+    escapeHtml(user.telegram_user_id)
+  }</code>`;
+}
+
+async function notifyTicketCreated(
+  supabase: SupabaseClient,
+  ticketId: string,
+): Promise<void> {
+  if (!supportConfigured()) return;
+  const { ticket, user } = await ticketAndUser(supabase, ticketId);
+  await Promise.all(
+    supportAdminIds().map((adminId) =>
+      sendSupportMessage(
+        adminId,
+        `<b>🎫 Новый тикет #${ticket.ticket_number}</b>\n\n${
+          supportUserLabel(user)
+        }\n\nОжидаем первое сообщение пользователя.`,
+        ticketKeyboard(ticket.id),
+      ).catch((error) =>
+        console.error("Support ticket notification failed", error)
+      )
+    ),
+  );
+}
+
+async function openSupportTicket(
+  supabase: SupabaseClient,
+  telegramUserId: number,
+): Promise<{ id: string; ticket_number: number; created: boolean }> {
+  const { data, error } = await supabase.rpc("axiom_support_open_ticket", {
+    p_telegram_user_id: telegramUserId,
+  });
+  if (error) throw error;
+  return data;
+}
+
+async function activeUserTicket(
+  supabase: SupabaseClient,
+  telegramUserId: number,
+): Promise<SupportTicket | null> {
+  const { data: user, error: userError } = await supabase.from("axiom_users")
+    .select("id").eq("telegram_user_id", telegramUserId).single();
+  if (userError) throw userError;
+  const { data: session, error: sessionError } = await supabase
+    .from("axiom_support_user_sessions").select("active_ticket_id")
+    .eq("user_id", user.id).maybeSingle();
+  if (sessionError) throw sessionError;
+  if (!session) return null;
+  const { data: ticket, error: ticketError } = await supabase
+    .from("axiom_support_tickets").select("id,ticket_number,user_id,status")
+    .eq("id", session.active_ticket_id).neq("status", "closed").maybeSingle();
+  if (ticketError) throw ticketError;
+  return ticket as SupportTicket | null;
+}
+
+async function storeSupportMessage(
+  supabase: SupabaseClient,
+  ticketId: string,
+  senderRole: "user" | "admin",
+  sourceBot: "axiom" | "support",
+  message: TelegramMessage,
+  content: SupportContent,
+): Promise<string | null> {
+  const { data, error } = await supabase.from("axiom_support_messages").upsert({
+    ticket_id: ticketId,
+    sender_role: senderRole,
+    sender_telegram_user_id: message.from!.id,
+    body: content.body,
+    content_type: content.type,
+    source_bot: sourceBot,
+    source_chat_id: message.chat.id,
+    source_message_id: message.message_id,
+    source_file_id: content.fileId,
+    file_name: content.fileName,
+    mime_type: content.mimeType,
+  }, {
+    onConflict: "source_bot,source_chat_id,source_message_id",
+    ignoreDuplicates: true,
+  }).select("id").maybeSingle();
+  if (error) throw error;
+  if (!data) return null;
+  const nextStatus = senderRole === "user" ? "waiting_admin" : "waiting_user";
+  const { error: updateError } = await supabase.from("axiom_support_tickets")
+    .update({
+      status: nextStatus,
+      last_message_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }).eq("id", ticketId).neq("status", "closed");
+  if (updateError) throw updateError;
+  return data.id;
+}
+
+async function relaySupportMedia(
+  sourceToken: string,
+  targetToken: string,
+  targetChatId: number,
+  content: SupportContent,
+): Promise<void> {
+  if (!content.fileId || content.type === "text") return;
+  const file = await botCall(sourceToken, "getFile", {
+    file_id: content.fileId,
+  }) as {
+    file_path: string;
+  };
+  const downloaded = await fetch(
+    `https://api.telegram.org/file/bot${sourceToken}/${file.file_path}`,
+  );
+  if (!downloaded.ok) throw new Error("Telegram attachment download failed");
+  const form = new FormData();
+  form.set("chat_id", String(targetChatId));
+  if (content.body) form.set("caption", content.body.slice(0, 1024));
+  const field = content.type === "photo" ? "photo" : "document";
+  form.set(
+    field,
+    new File([await downloaded.blob()], content.fileName ?? "attachment", {
+      type: content.mimeType ?? "application/octet-stream",
+    }),
+  );
+  const response = await fetch(
+    `https://api.telegram.org/bot${targetToken}/send${
+      content.type === "photo" ? "Photo" : "Document"
+    }`,
+    { method: "POST", body: form },
+  );
+  if (!response.ok) throw new Error("Telegram attachment upload failed");
+}
+
+async function markSupportDelivery(
+  supabase: SupabaseClient,
+  messageId: string,
+  error?: unknown,
+): Promise<void> {
+  const { error: updateError } = await supabase.from("axiom_support_messages")
+    .update(
+      error
+        ? {
+          delivery_status: "failed",
+          delivery_error: String(error instanceof Error ? error.message : error)
+            .slice(0, 500),
+        }
+        : {
+          delivery_status: "delivered",
+          delivered_at: new Date().toISOString(),
+        },
+    )
+    .eq("id", messageId);
+  if (updateError) {
+    console.error("Support delivery status update failed", updateError);
+  }
+}
+
+async function showSupport(
+  supabase: SupabaseClient,
+  user: TelegramUser,
+  chatId: number,
+  locale: Locale,
+): Promise<void> {
+  if (!supportConfigured()) {
+    return await sendUserMessage(
+      chatId,
+      tr(
+        locale,
+        "🛠 Поддержка временно настраивается. Пожалуйста, попробуйте немного позже.",
+        "🛠 Support is being configured. Please try again a little later.",
+      ),
+      locale,
+      "support",
+    );
+  }
+  const ticket = await openSupportTicket(supabase, user.id);
+  if (ticket.created) await notifyTicketCreated(supabase, ticket.id);
   await sendUserMessage(
     chatId,
     tr(
       locale,
-      "<b>🛟 Поддержка</b>\n\nОпишите проблему, приложите скриншот и укажите номер заказа или последние 5 символов ключа. Никому не отправляйте ключ целиком.",
-      "<b>🛟 Support</b>\n\nDescribe the issue, attach a screenshot, and include your order number or the last 5 characters of the key. Never send the full key.",
+      `<b>🛟 Поддержка · тикет #${ticket.ticket_number}</b>\n\nТеперь отправьте сюда сообщение, скриншот или файл. Все следующие обычные сообщения будут передаваться оператору, пока вы не завершите диалог.\n\nУкажите номер заказа или последние 5 символов ключа. Не отправляйте ключ целиком.`,
+      `<b>🛟 Support · ticket #${ticket.ticket_number}</b>\n\nSend a message, screenshot, or file here. Your following regular messages will be delivered to an operator until you end the conversation.\n\nInclude your order number or the last 5 characters of the key. Do not send the full key.`,
     ),
     locale,
     "support",
     [[{
-      text: tr(locale, "🛟 Написать в поддержку", "🛟 Contact support"),
-      url,
+      text: tr(locale, "✅ Завершить обращение", "✅ End conversation"),
+      callback_data: "support:close",
     }]],
   );
+}
+
+async function handleUserSupportMessage(
+  supabase: SupabaseClient,
+  user: TelegramUser,
+  message: TelegramMessage,
+  locale: Locale,
+): Promise<boolean> {
+  const ticket = await activeUserTicket(supabase, user.id);
+  if (!ticket) return false;
+  const content = supportContent(message);
+  if (!content) return false;
+  const storedId = await storeSupportMessage(
+    supabase,
+    ticket.id,
+    "user",
+    "axiom",
+    message,
+    content,
+  );
+  if (!storedId) return true;
+
+  const { user: storedUser } = await ticketAndUser(supabase, ticket.id);
+  const body = content.body ? `\n\n${escapeHtml(content.body)}` : "";
+  try {
+    await Promise.all(
+      supportAdminIds().map(async (adminId) => {
+        await sendSupportMessage(
+          adminId,
+          `<b>📩 Тикет #${ticket.ticket_number}</b>\n${
+            supportUserLabel(storedUser)
+          }${body}`,
+          ticketKeyboard(ticket.id),
+        );
+        await relaySupportMedia(
+          requiredSecret("TELEGRAM_BOT_TOKEN"),
+          requiredSecret("SUPPORT_BOT_TOKEN"),
+          adminId,
+          content,
+        );
+      }),
+    );
+    await markSupportDelivery(supabase, storedId);
+    await sendUserMessage(
+      message.chat.id,
+      tr(
+        locale,
+        `✅ Сообщение доставлено оператору по тикету #${ticket.ticket_number}. Можете продолжать писать сюда.`,
+        `✅ Your message was delivered for ticket #${ticket.ticket_number}. You can keep writing here.`,
+      ),
+      locale,
+      "support",
+      [[{
+        text: tr(locale, "✅ Завершить обращение", "✅ End conversation"),
+        callback_data: "support:close",
+      }]],
+    );
+  } catch (error) {
+    await markSupportDelivery(supabase, storedId, error);
+    await sendUserMessage(
+      message.chat.id,
+      tr(
+        locale,
+        "⚠️ Не удалось доставить сообщение оператору. Оно сохранено в тикете; попробуйте ещё раз позже.",
+        "⚠️ The message could not be delivered to the operator. It is saved in the ticket; try again later.",
+      ),
+      locale,
+      "support",
+    );
+  }
+  return true;
+}
+
+async function closeUserSupportTicket(
+  supabase: SupabaseClient,
+  user: TelegramUser,
+  chatId: number,
+  locale: Locale,
+): Promise<void> {
+  const ticket = await activeUserTicket(supabase, user.id);
+  if (!ticket) {
+    return await sendUserMessage(
+      chatId,
+      tr(
+        locale,
+        "У вас нет активного обращения.",
+        "You have no active ticket.",
+      ),
+      locale,
+      "support",
+    );
+  }
+  const { error } = await supabase.rpc("axiom_support_close_ticket", {
+    p_ticket_id: ticket.id,
+    p_closed_by_telegram_user_id: user.id,
+  });
+  if (error) throw error;
+  if (supportConfigured()) {
+    await Promise.all(
+      supportAdminIds().map((adminId) =>
+        sendSupportMessage(
+          adminId,
+          `<b>✅ Тикет #${ticket.ticket_number} закрыт пользователем</b>`,
+        ).catch((notifyError) =>
+          console.error("Support close notification failed", notifyError)
+        )
+      ),
+    );
+  }
+  await sendUserMessage(
+    chatId,
+    tr(
+      locale,
+      `✅ Обращение #${ticket.ticket_number} закрыто. Чтобы создать новое, снова нажмите «Поддержка».`,
+      `✅ Ticket #${ticket.ticket_number} is closed. Select “Support” again to create a new one.`,
+    ),
+    locale,
+    "support",
+  );
+}
+
+async function openAdminTicket(
+  supabase: SupabaseClient,
+  adminId: number,
+  ticketId: string,
+): Promise<void> {
+  const { ticket, user } = await ticketAndUser(supabase, ticketId);
+  if (ticket.status === "closed") {
+    return await sendSupportMessage(
+      adminId,
+      `Тикет #${ticket.ticket_number} уже закрыт.`,
+    );
+  }
+  const { error } = await supabase.from("axiom_support_admin_sessions").upsert({
+    admin_telegram_user_id: adminId,
+    active_ticket_id: ticket.id,
+    updated_at: new Date().toISOString(),
+  });
+  if (error) throw error;
+  const { data: history, error: historyError } = await supabase
+    .from("axiom_support_messages").select(
+      "sender_role,body,content_type,created_at",
+    )
+    .eq("ticket_id", ticket.id).order("created_at", { ascending: false }).limit(
+      12,
+    );
+  if (historyError) throw historyError;
+  const lines = [...(history ?? [])].reverse().map((item) => {
+    const author = item.sender_role === "admin" ? "Вы" : "Пользователь";
+    const content = item.body ||
+      (item.content_type === "photo" ? "[фото]" : "[файл]");
+    return `<b>${author}:</b> ${escapeHtml(content)}`;
+  });
+  await sendSupportMessage(
+    adminId,
+    `<b>💬 Диалог по тикету #${ticket.ticket_number}</b>\n${
+      supportUserLabel(user)
+    }\n\n${
+      lines.length ? lines.join("\n") : "История пока пуста."
+    }\n\n<b>Теперь просто отправляйте сообщения в этот бот — они уйдут пользователю.</b>`,
+    ticketKeyboard(ticket.id),
+  );
+}
+
+async function activeAdminTicket(
+  supabase: SupabaseClient,
+  adminId: number,
+): Promise<SupportTicket | null> {
+  const { data: session, error } = await supabase
+    .from("axiom_support_admin_sessions").select("active_ticket_id")
+    .eq("admin_telegram_user_id", adminId).maybeSingle();
+  if (error) throw error;
+  if (!session) return null;
+  const { data: ticket, error: ticketError } = await supabase
+    .from("axiom_support_tickets").select("id,ticket_number,user_id,status")
+    .eq("id", session.active_ticket_id).neq("status", "closed").maybeSingle();
+  if (ticketError) throw ticketError;
+  return ticket as SupportTicket | null;
+}
+
+async function listAdminTickets(
+  supabase: SupabaseClient,
+  adminId: number,
+): Promise<void> {
+  const { data, error } = await supabase.from("axiom_support_tickets")
+    .select("id,ticket_number,user_id,status").neq("status", "closed")
+    .order("last_message_at", { ascending: false, nullsFirst: false }).limit(
+      20,
+    );
+  if (error) throw error;
+  if (!data?.length) {
+    return await sendSupportMessage(adminId, "📭 Открытых тикетов нет.");
+  }
+  for (const item of data as SupportTicket[]) {
+    const { user } = await ticketAndUser(supabase, item.id);
+    const status = item.status === "waiting_admin"
+      ? "🔴 ждёт ответа"
+      : "🟢 ждём пользователя";
+    await sendSupportMessage(
+      adminId,
+      `<b>🎫 Тикет #${item.ticket_number}</b> · ${status}\n${
+        supportUserLabel(user)
+      }`,
+      ticketKeyboard(item.id),
+    );
+  }
+}
+
+async function closeAdminTicket(
+  supabase: SupabaseClient,
+  adminId: number,
+  ticketId: string,
+): Promise<void> {
+  const { ticket, user } = await ticketAndUser(supabase, ticketId);
+  const { error } = await supabase.rpc("axiom_support_close_ticket", {
+    p_ticket_id: ticket.id,
+    p_closed_by_telegram_user_id: adminId,
+  });
+  if (error) throw error;
+  const locale = normalizeLocale(String(user.language_code ?? "ru"));
+  await sendUserMessage(
+    Number(user.telegram_user_id),
+    tr(
+      locale,
+      `✅ Оператор закрыл обращение #${ticket.ticket_number}. Если вопрос остался, создайте новый тикет через /support.`,
+      `✅ The operator closed ticket #${ticket.ticket_number}. If you still need help, create a new ticket with /support.`,
+    ),
+    locale,
+    "support",
+  ).catch((notifyError) =>
+    console.error("Could not notify ticket user", notifyError)
+  );
+  await sendSupportMessage(
+    adminId,
+    `✅ Тикет #${ticket.ticket_number} закрыт.`,
+  );
+}
+
+async function handleAdminReply(
+  supabase: SupabaseClient,
+  adminId: number,
+  message: TelegramMessage,
+): Promise<void> {
+  const ticket = await activeAdminTicket(supabase, adminId);
+  if (!ticket) {
+    return await sendSupportMessage(
+      adminId,
+      "Сначала откройте тикет кнопкой «💬 Открыть диалог» или командой /tickets.",
+    );
+  }
+  const content = supportContent(message);
+  if (!content) return;
+  const storedId = await storeSupportMessage(
+    supabase,
+    ticket.id,
+    "admin",
+    "support",
+    message,
+    content,
+  );
+  if (!storedId) return;
+  const { user } = await ticketAndUser(supabase, ticket.id);
+  const userChatId = Number(user.telegram_user_id);
+  const locale = normalizeLocale(String(user.language_code ?? "ru"));
+  try {
+    await sendUserMessage(
+      userChatId,
+      `${
+        tr(
+          locale,
+          `<b>🛟 Ответ поддержки · тикет #${ticket.ticket_number}</b>`,
+          `<b>🛟 Support reply · ticket #${ticket.ticket_number}</b>`,
+        )
+      }\n\n${
+        content.body
+          ? escapeHtml(content.body)
+          : tr(locale, "📎 Вложение ниже", "📎 Attachment below")
+      }`,
+      locale,
+      "support",
+      [[{
+        text: tr(locale, "✅ Завершить обращение", "✅ End conversation"),
+        callback_data: "support:close",
+      }]],
+    );
+    await relaySupportMedia(
+      requiredSecret("SUPPORT_BOT_TOKEN"),
+      requiredSecret("TELEGRAM_BOT_TOKEN"),
+      userChatId,
+      content,
+    );
+    await markSupportDelivery(supabase, storedId);
+    await sendSupportMessage(
+      adminId,
+      `✅ Ответ доставлен пользователю по тикету #${ticket.ticket_number}.`,
+      ticketKeyboard(ticket.id),
+    );
+  } catch (error) {
+    await markSupportDelivery(supabase, storedId, error);
+    await sendSupportMessage(
+      adminId,
+      `⚠️ Не удалось доставить ответ по тикету #${ticket.ticket_number}. Возможно, пользователь заблокировал Axiom-бота.`,
+      ticketKeyboard(ticket.id),
+    );
+  }
 }
 
 async function showTrialWarning(chatId: number, locale: Locale): Promise<void> {
@@ -943,6 +1534,68 @@ async function handleSuccessfulTelegramPayment(
   if (fulfillment.accepted) await notifyPurchase(supabase, fulfillment);
 }
 
+async function handleSupportTelegram(
+  request: Request,
+  supabase: SupabaseClient,
+): Promise<Response> {
+  if (!supportConfigured()) {
+    return new Response("not configured", { status: 503 });
+  }
+  if (
+    request.headers.get("x-telegram-bot-api-secret-token") !==
+      requiredSecret("SUPPORT_WEBHOOK_SECRET")
+  ) {
+    return new Response("unauthorized", { status: 401 });
+  }
+  await ensureSupportWebhook();
+  const update = await request.json() as TelegramUpdate;
+  const callback = update.callback_query;
+  const message = update.message;
+  const user = callback?.from ?? message?.from;
+  const chatId = callback?.message?.chat.id ?? message?.chat.id;
+  if (!user || !chatId) return new Response("ok");
+  if (!supportAdminIds().includes(user.id) || chatId !== user.id) {
+    await sendSupportMessage(chatId, "⛔ Доступ запрещён.").catch(() =>
+      undefined
+    );
+    return new Response("ok");
+  }
+  if (callback) {
+    await supportTelegramCall("answerCallbackQuery", {
+      callback_query_id: callback.id,
+    });
+    const openId = ticketIdFromCallback(callback.data, "open");
+    const closeId = ticketIdFromCallback(callback.data, "close");
+    if (openId) await openAdminTicket(supabase, user.id, openId);
+    else if (closeId) await closeAdminTicket(supabase, user.id, closeId);
+    return new Response("ok");
+  }
+  if (!message) return new Response("ok");
+  const command = message.text?.trim().split(/\s+/, 1)[0]?.toLowerCase();
+  if (command === "/tickets" || command === "/start") {
+    if (command === "/start") {
+      await sendSupportMessage(
+        chatId,
+        "<b>🛟 Axiom Support Desk</b>\n\nЗдесь приходят обращения пользователей. Откройте тикет кнопкой и затем пишите ответы обычными сообщениями.",
+      );
+    }
+    await listAdminTickets(supabase, user.id);
+  } else if (command === "/cancel") {
+    const { error } = await supabase.from("axiom_support_admin_sessions")
+      .delete().eq("admin_telegram_user_id", user.id);
+    if (error) throw error;
+    await sendSupportMessage(
+      chatId,
+      "⏸ Диалог снят с выбора. Тикет остался открытым.",
+    );
+  } else if (command === "/close") {
+    const ticket = await activeAdminTicket(supabase, user.id);
+    if (ticket) await closeAdminTicket(supabase, user.id, ticket.id);
+    else await sendSupportMessage(chatId, "Сначала откройте тикет.");
+  } else await handleAdminReply(supabase, user.id, message);
+  return new Response("ok");
+}
+
 async function handleTelegram(
   request: Request,
   supabase: SupabaseClient,
@@ -978,7 +1631,14 @@ async function handleTelegram(
   const callbackAction = callback?.data;
   const command = commandFromText(message?.text);
 
-  if (callbackAction?.startsWith("lang:")) {
+  if (
+    message && !callback && !command &&
+    await handleUserSupportMessage(supabase, user, message, locale)
+  ) return new Response("ok");
+
+  if (callbackAction === "support:close") {
+    await closeUserSupportTicket(supabase, user, chatId, locale);
+  } else if (callbackAction?.startsWith("lang:")) {
     locale = normalizeLocale(callbackAction.slice(5));
     await setLocale(supabase, user.id, locale);
     await sendUserMessage(
@@ -1021,8 +1681,9 @@ async function handleTelegram(
     } else if (action === "trial") {
       await showTrialWarning(chatId, locale);
     } else if (action === "guide") await showGuide(chatId, locale);
-    else if (action === "support") await showSupport(chatId, locale);
-    else await showMenu(chatId, locale);
+    else if (action === "support") {
+      await showSupport(supabase, user, chatId, locale);
+    } else await showMenu(chatId, locale);
   }
   return new Response("ok");
 }
@@ -1031,11 +1692,12 @@ Deno.serve(async (request) => {
   try {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname.endsWith("/health")) {
-      await ensureTelegramWebhook();
+      await Promise.all([ensureTelegramWebhook(), ensureSupportWebhook()]);
       return Response.json({
         ok: true,
         payment_provider: Deno.env.get("PAYMENT_PROVIDER") ?? "disabled",
         telegram_webhook_configured: true,
+        support_bot_configured: supportConfigured(),
         locales: ["ru", "en"],
       });
     }
@@ -1048,6 +1710,9 @@ Deno.serve(async (request) => {
       { auth: { persistSession: false, autoRefreshToken: false } },
     );
     const provider = configuredPaymentProvider();
+    if (url.pathname.endsWith("/support-telegram")) {
+      return await handleSupportTelegram(request, supabase);
+    }
     if (url.pathname.endsWith("/telegram")) {
       return await handleTelegram(request, supabase, provider);
     }

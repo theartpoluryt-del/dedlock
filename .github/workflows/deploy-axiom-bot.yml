@@ -23,6 +23,9 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
       TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+      SUPPORT_BOT_TOKEN: ${{ secrets.SUPPORT_BOT_TOKEN }}
+      SUPPORT_WEBHOOK_SECRET: ${{ secrets.SUPPORT_WEBHOOK_SECRET }}
+      SUPPORT_ADMIN_IDS: ${{ secrets.SUPPORT_ADMIN_IDS }}
       BOT_KEY_ENCRYPTION_KEY: ${{ secrets.BOT_KEY_ENCRYPTION_KEY }}
       LICENSE_PEPPER: ${{ secrets.LICENSE_PEPPER }}
       ACTIVATION_CODE_PEPPER: ${{ secrets.ACTIVATION_CODE_PEPPER }}
@@ -37,7 +40,7 @@ jobs:
       - name: Validate required secrets
         shell: bash
         run: |
-          for name in SUPABASE_ACCESS_TOKEN SUPABASE_DB_PASSWORD TELEGRAM_BOT_TOKEN TELEGRAM_ADMIN_CHAT_ID TELEGRAM_WEBHOOK_SECRET BOT_KEY_ENCRYPTION_KEY LICENSE_PEPPER ACTIVATION_CODE_PEPPER; do
+          for name in SUPABASE_ACCESS_TOKEN SUPABASE_DB_PASSWORD TELEGRAM_BOT_TOKEN TELEGRAM_ADMIN_CHAT_ID TELEGRAM_WEBHOOK_SECRET SUPPORT_BOT_TOKEN SUPPORT_WEBHOOK_SECRET SUPPORT_ADMIN_IDS BOT_KEY_ENCRYPTION_KEY LICENSE_PEPPER ACTIVATION_CODE_PEPPER; do
             if [ -z "${!name}" ]; then
               echo "Missing GitHub Actions secret: ${name}" >&2
               exit 1
@@ -56,6 +59,9 @@ jobs:
             TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" \
             TELEGRAM_ADMIN_CHAT_ID="$TELEGRAM_ADMIN_CHAT_ID" \
             TELEGRAM_WEBHOOK_SECRET="$TELEGRAM_WEBHOOK_SECRET" \
+            SUPPORT_BOT_TOKEN="$SUPPORT_BOT_TOKEN" \
+            SUPPORT_WEBHOOK_SECRET="$SUPPORT_WEBHOOK_SECRET" \
+            SUPPORT_ADMIN_IDS="$SUPPORT_ADMIN_IDS" \
             BOT_KEY_ENCRYPTION_KEY="$BOT_KEY_ENCRYPTION_KEY" \
             LICENSE_PEPPER="$LICENSE_PEPPER" \
             ACTIVATION_CODE_PEPPER="$ACTIVATION_CODE_PEPPER" \
@@ -78,6 +84,26 @@ jobs:
             -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
             -H "Content-Type: application/json" \
             --data "$payload"
+
+          support_webhook_url="https://${PROJECT_REF}.supabase.co/functions/v1/axiom-bot/support-telegram"
+          support_payload="$(jq -nc \
+            --arg url "$support_webhook_url" \
+            --arg secret "$SUPPORT_WEBHOOK_SECRET" \
+            '{url:$url,secret_token:$secret,allowed_updates:["message","callback_query"],drop_pending_updates:true}')"
+          curl --fail-with-body --silent --show-error \
+            -X POST "https://api.telegram.org/bot${SUPPORT_BOT_TOKEN}/setWebhook" \
+            -H "Content-Type: application/json" \
+            --data "$support_payload"
+
+          support_commands='[
+            {"command":"tickets","description":"📬 Открытые тикеты"},
+            {"command":"close","description":"✅ Закрыть активный тикет"},
+            {"command":"cancel","description":"⏸ Выйти из диалога"}
+          ]'
+          curl --fail-with-body --silent --show-error \
+            -X POST "https://api.telegram.org/bot${SUPPORT_BOT_TOKEN}/setMyCommands" \
+            -H "Content-Type: application/json" \
+            --data "$(jq -nc --argjson commands "$support_commands" '{commands:$commands}')"
 
       - name: Register localized Telegram commands
         shell: bash

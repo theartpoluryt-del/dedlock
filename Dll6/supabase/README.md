@@ -98,14 +98,15 @@ Security properties:
    random `ACTIVATION_CODE_PEPPER`; changing it invalidates unsold FunPay codes:
 
    ```powershell
-   npx supabase secrets set TELEGRAM_BOT_TOKEN=... TELEGRAM_ADMIN_CHAT_ID=... TELEGRAM_WEBHOOK_SECRET=... BOT_KEY_ENCRYPTION_KEY=... LICENSE_PEPPER=... ACTIVATION_CODE_PEPPER=... DISPLAY_TIME_ZONE=Asia/Yekaterinburg PAYMENT_PROVIDER=disabled
+   npx supabase secrets set TELEGRAM_BOT_TOKEN=... TELEGRAM_ADMIN_CHAT_ID=... TELEGRAM_WEBHOOK_SECRET=... SUPPORT_BOT_TOKEN=... SUPPORT_WEBHOOK_SECRET=... SUPPORT_ADMIN_IDS=... BOT_KEY_ENCRYPTION_KEY=... LICENSE_PEPPER=... ACTIVATION_CODE_PEPPER=... DISPLAY_TIME_ZONE=Asia/Yekaterinburg PAYMENT_PROVIDER=disabled
    npx supabase functions deploy axiom-bot --no-verify-jwt
    ```
 
-6. Register the Telegram webhook (replace values locally):
+6. Register webhooks for both Telegram bots (replace values locally):
 
    ```powershell
    curl.exe -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook" -H "Content-Type: application/json" -d '{"url":"https://vljgmubfztmxsyiwrity.supabase.co/functions/v1/axiom-bot/telegram","secret_token":"<TELEGRAM_WEBHOOK_SECRET>","allowed_updates":["message","callback_query","pre_checkout_query"],"drop_pending_updates":true}'
+   curl.exe -X POST "https://api.telegram.org/bot<SUPPORT_TOKEN>/setWebhook" -H "Content-Type: application/json" -d '{"url":"https://vljgmubfztmxsyiwrity.supabase.co/functions/v1/axiom-bot/support-telegram","secret_token":"<SUPPORT_WEBHOOK_SECRET>","allowed_updates":["message","callback_query"],"drop_pending_updates":true}'
    ```
 
 7. Check `https://vljgmubfztmxsyiwrity.supabase.co/functions/v1/axiom-bot/health`,
@@ -115,14 +116,27 @@ The bot supports Russian and English and stores the selected language on the
 server. Its Telegram command menu contains `/download`, `/buy`, `/language`,
 `/keys`, `/activate`, `/trial`, `/guide`, and `/support`. Every user response includes an
 inline keyboard tailored to the current section and a route back to the main
-menu. `AXIOM_DOWNLOAD_URL` and `AXIOM_SUPPORT_URL` are optional server-side
-configuration values; the defaults use the tracked launcher executable and the
-Telegram owner account respectively.
+menu. `AXIOM_DOWNLOAD_URL` is an optional server-side configuration value.
+
+### Support desk
+
+`/support` opens one active ticket for the user. Regular text, photos, and
+documents sent while the ticket is active are stored as an idempotent event in
+Supabase and relayed to a separate operator bot. The operator allowlist comes
+from `SUPPORT_ADMIN_IDS`; other accounts and group chats are rejected. Use
+`/tickets`, select **Open dialog**, and then reply with ordinary messages. The
+operator bot sends replies back through the public Axiom bot. `/close` closes
+the selected ticket and `/cancel` only leaves the current operator dialog.
+
+Ticket and message history remains in `axiom_support_tickets` and
+`axiom_support_messages`. Files are streamed through Telegram and are not kept
+as public objects. Delivery failures are recorded without exposing bot tokens.
 
 Alternatively, add the following GitHub Actions repository secrets and run
 the manual **Deploy Axiom Telegram bot** workflow: `SUPABASE_ACCESS_TOKEN`,
 `SUPABASE_DB_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_CHAT_ID`,
-`TELEGRAM_WEBHOOK_SECRET`, `BOT_KEY_ENCRYPTION_KEY`, `LICENSE_PEPPER`, and
+`TELEGRAM_WEBHOOK_SECRET`, `SUPPORT_BOT_TOKEN`, `SUPPORT_WEBHOOK_SECRET`,
+`SUPPORT_ADMIN_IDS`, `BOT_KEY_ENCRYPTION_KEY`, `LICENSE_PEPPER`, and
 `ACTIVATION_CODE_PEPPER`.
 The workflow applies migrations, sets Edge secrets, deploys the function,
 registers the Telegram webhook, and checks the health endpoint. It is manual
@@ -153,9 +167,11 @@ Or set a validated exact offer URL through the DPAPI-backed admin tool:
 .\tools\admin.ps1 set-plan-purchase-url --plan three_days --url "https://funpay.com/lots/offer?id=12345678"
 ```
 
-Generate stock only on a trusted administrator machine. The output file contains
-bearer credentials: upload it to the matching FunPay lot, verify the stock count,
-then store it encrypted or delete it. `.private/` is ignored by Git.
+Generate stock only on a trusted administrator machine. Each physical output
+line is one FunPay product containing the styled activation guide and its unique
+code; literal `\\n` sequences become line breaks in the buyer chat. The file
+contains bearer credentials: upload it to the matching FunPay lot, verify the
+stock count, then store it encrypted or delete it. `.private/` is ignored by Git.
 
 ```powershell
 python tools/admin.py generate-activation-codes --plan three_days --count 50 --output .private/funpay-three-days.txt

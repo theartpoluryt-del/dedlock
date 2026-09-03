@@ -22,6 +22,11 @@ from pathlib import Path
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 ACTIVATION_PATTERN = re.compile(r"^[A-HJ-NP-Z2-9]{16}$")
 LEGACY_ACTIVATION_PATTERN = re.compile(r"^AXF-(?:[A-HJ-NP-Z2-9]{5}-){3}[A-HJ-NP-Z2-9]{5}$")
+FUNPAY_DELIVERY_TEMPLATE = """Спасибо за покупку!
+Код: {code}
+Активация: /activate КОД
+Лаунчер: /download
+Поддержка: /support"""
 
 
 def setting(name: str) -> str:
@@ -76,6 +81,14 @@ def generated_activation_code() -> str:
     return "".join(secrets.choice(ALPHABET) for _ in range(16))
 
 
+def funpay_delivery_item(code: str) -> str:
+    """One physical line per FunPay product; literal \\n creates chat line breaks."""
+    item = FUNPAY_DELIVERY_TEMPLATE.format(code=code).replace("\n", r"\n")
+    if len(item.encode("utf-8")) > 200:
+        raise SystemExit("FunPay automatic-delivery item exceeds 200 UTF-8 bytes")
+    return item
+
+
 def activation_digest(value: str) -> str:
     normalized = value.strip().upper()
     if not (ACTIVATION_PATTERN.fullmatch(normalized) or
@@ -101,7 +114,7 @@ def generate_activation_codes(args: argparse.Namespace) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     descriptor = os.open(output, flags, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-        stream.write("\n".join(codes) + "\n")
+        stream.write("\n".join(funpay_delivery_item(code) for code in codes) + "\n")
     records = [{
         "code_hash": activation_digest(code),
         "plan_code": args.plan,
