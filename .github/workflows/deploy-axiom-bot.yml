@@ -77,5 +77,41 @@ jobs:
             -H "Content-Type: application/json" \
             --data "$payload"
 
+      - name: Register localized Telegram commands
+        shell: bash
+        run: |
+          ru_commands='[
+            {"command":"download","description":"⬇️ скачать загрузчик"},
+            {"command":"buy","description":"💲 купить подписку"},
+            {"command":"language","description":"🇺🇸 выбрать язык"},
+            {"command":"keys","description":"🔑 мои ключи"},
+            {"command":"trial","description":"🎁 бесплатный период на 3 дня"},
+            {"command":"guide","description":"📖 инструкция по запуску"},
+            {"command":"support","description":"🛟 связаться с поддержкой"}
+          ]'
+          en_commands='[
+            {"command":"download","description":"⬇️ download launcher"},
+            {"command":"buy","description":"💲 buy a subscription"},
+            {"command":"language","description":"🇷🇺 choose language"},
+            {"command":"keys","description":"🔑 my license keys"},
+            {"command":"trial","description":"🎁 free 3-day trial"},
+            {"command":"guide","description":"📖 setup and launch guide"},
+            {"command":"support","description":"🛟 contact support"}
+          ]'
+          for language in default ru en; do
+            commands="$ru_commands"
+            language_code=""
+            if [ "$language" = "en" ]; then commands="$en_commands"; fi
+            if [ "$language" != "default" ]; then language_code="$language"; fi
+            payload="$(jq -nc \
+              --argjson commands "$commands" \
+              --arg language_code "$language_code" \
+              '($language_code == "") as $is_default | if $is_default then {commands:$commands} else {commands:$commands,language_code:$language_code} end')"
+            curl --fail-with-body --silent --show-error \
+              -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setMyCommands" \
+              -H "Content-Type: application/json" \
+              --data "$payload"
+          done
+
       - name: Verify health endpoint
         run: curl --fail-with-body --silent --show-error "https://${PROJECT_REF}.supabase.co/functions/v1/axiom-bot/health"

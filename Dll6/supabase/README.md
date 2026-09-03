@@ -101,6 +101,14 @@ Security properties:
 7. Check `https://vljgmubfztmxsyiwrity.supabase.co/functions/v1/axiom-bot/health`,
    then send `/start` to the bot. Rotate a compromised secret immediately.
 
+The bot supports Russian and English and stores the selected language on the
+server. Its Telegram command menu contains `/download`, `/buy`, `/language`,
+`/keys`, `/trial`, `/guide`, and `/support`. Every user response includes an
+inline keyboard tailored to the current section and a route back to the main
+menu. `AXIOM_DOWNLOAD_URL` and `AXIOM_SUPPORT_URL` are optional server-side
+configuration values; the defaults use the tracked launcher executable and the
+Telegram owner account respectively.
+
 Alternatively, add the following GitHub Actions repository secrets and run
 the manual **Deploy Axiom Telegram bot** workflow: `SUPABASE_ACCESS_TOKEN`,
 `SUPABASE_DB_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_CHAT_ID`,
