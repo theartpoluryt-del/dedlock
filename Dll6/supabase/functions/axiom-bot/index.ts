@@ -833,9 +833,11 @@ Deno.serve(async (request) => {
   try {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname.endsWith("/health")) {
+      await ensureTelegramWebhook();
       return Response.json({
         ok: true,
         payment_provider: Deno.env.get("PAYMENT_PROVIDER") ?? "disabled",
+        telegram_webhook_configured: true,
         locales: ["ru", "en"],
       });
     }
