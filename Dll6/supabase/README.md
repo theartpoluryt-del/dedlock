@@ -101,6 +101,14 @@ Security properties:
 7. Check `https://vljgmubfztmxsyiwrity.supabase.co/functions/v1/axiom-bot/health`,
    then send `/start` to the bot. Rotate a compromised secret immediately.
 
+Alternatively, add the following GitHub Actions repository secrets and run
+the manual **Deploy Axiom Telegram bot** workflow: `SUPABASE_ACCESS_TOKEN`,
+`SUPABASE_DB_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_CHAT_ID`,
+`TELEGRAM_WEBHOOK_SECRET`, `BOT_KEY_ENCRYPTION_KEY`, and `LICENSE_PEPPER`.
+The workflow applies migrations, sets Edge secrets, deploys the function,
+registers the Telegram webhook, and checks the health endpoint. It is manual
+only, so pushing code cannot unexpectedly mutate production.
+
 ### Payments
 
 No payment provider was identifiable in the repository. Consequently the only
