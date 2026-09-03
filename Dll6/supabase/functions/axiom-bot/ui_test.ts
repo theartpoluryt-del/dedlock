@@ -49,3 +49,11 @@ Deno.test("context keyboards always include a route back to the menu", () => {
     assertEquals(callbacks.includes("nav:menu"), true);
   }
 });
+
+Deno.test("trial navigation opens the warning, not activation", () => {
+  const callbacks = navigationKeyboard("ru", "menu").flat().map((button) =>
+    button.callback_data
+  );
+  assertEquals(callbacks.includes("nav:trial"), true);
+  assertEquals(callbacks.includes("trial:confirm"), false);
+});

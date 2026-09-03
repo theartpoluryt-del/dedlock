@@ -322,6 +322,23 @@ async function showSupport(chatId: number, locale: Locale): Promise<void> {
   );
 }
 
+async function showTrialWarning(chatId: number, locale: Locale): Promise<void> {
+  await sendUserMessage(
+    chatId,
+    tr(
+      locale,
+      "<b>⚠️ Перед активацией Trial</b>\n\nПробный период действует <b>3 дня</b> с момента подтверждения и доступен только один раз для одного Telegram-аккаунта. Отсчёт начнётся сразу после нажатия кнопки ниже.\n\nСначала рекомендуем скачать и подготовить Axiom Launcher.",
+      "<b>⚠️ Before activating the Trial</b>\n\nThe trial lasts for <b>3 days</b> from confirmation and can only be claimed once per Telegram account. The countdown starts immediately after you press the button below.\n\nWe recommend downloading and preparing Axiom Launcher first.",
+    ),
+    locale,
+    "trial",
+    [[{
+      text: tr(locale, "✅ Активировать Trial", "✅ Activate Trial"),
+      callback_data: "trial:confirm",
+    }]],
+  );
+}
+
 async function issueTrial(
   supabase: SupabaseClient,
   user: TelegramUser,
@@ -615,8 +632,10 @@ async function handleTelegram(
     else if (action === "language") await showLanguage(chatId, locale);
     else if (action === "keys") {
       await showLicenses(supabase, user, chatId, locale);
-    } else if (action === "trial") {
+    } else if (action === "trial:confirm") {
       await issueTrial(supabase, user, chatId, locale);
+    } else if (action === "trial") {
+      await showTrialWarning(chatId, locale);
     } else if (action === "guide") await showGuide(chatId, locale);
     else if (action === "support") await showSupport(chatId, locale);
     else await showMenu(chatId, locale);
