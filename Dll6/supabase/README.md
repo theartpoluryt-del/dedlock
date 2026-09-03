@@ -88,14 +88,14 @@ Security properties:
 5. Set secrets without writing them to a tracked file:
 
    ```powershell
-   npx supabase secrets set TELEGRAM_BOT_TOKEN=... TELEGRAM_ADMIN_CHAT_ID=... TELEGRAM_WEBHOOK_SECRET=... BOT_KEY_ENCRYPTION_KEY=... LICENSE_PEPPER=... DISPLAY_TIME_ZONE=Asia/Yekaterinburg PAYMENT_PROVIDER=disabled
+   npx supabase secrets set TELEGRAM_BOT_TOKEN=... TELEGRAM_ADMIN_CHAT_ID=... TELEGRAM_WEBHOOK_SECRET=... BOT_KEY_ENCRYPTION_KEY=... LICENSE_PEPPER=... DISPLAY_TIME_ZONE=Asia/Yekaterinburg PAYMENT_PROVIDER=telegram_stars
    npx supabase functions deploy axiom-bot --no-verify-jwt
    ```
 
 6. Register the Telegram webhook (replace values locally):
 
    ```powershell
-   curl.exe -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook" -H "Content-Type: application/json" -d '{"url":"https://vljgmubfztmxsyiwrity.supabase.co/functions/v1/axiom-bot/telegram","secret_token":"<TELEGRAM_WEBHOOK_SECRET>","allowed_updates":["message","callback_query"],"drop_pending_updates":true}'
+   curl.exe -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook" -H "Content-Type: application/json" -d '{"url":"https://vljgmubfztmxsyiwrity.supabase.co/functions/v1/axiom-bot/telegram","secret_token":"<TELEGRAM_WEBHOOK_SECRET>","allowed_updates":["message","callback_query","pre_checkout_query"],"drop_pending_updates":true}'
    ```
 
 7. Check `https://vljgmubfztmxsyiwrity.supabase.co/functions/v1/axiom-bot/health`,
@@ -119,18 +119,32 @@ only, so pushing code cannot unexpectedly mutate production.
 
 ### Payments
 
-No payment provider was identifiable in the repository. Consequently the only
-shipped adapter is `DisabledPaymentProvider`: it deliberately creates no fake
-checkout and accepts no webhook as payment. Trials work, and paid orders remain
-`pending_payment` with an explicit message until a real adapter is implemented.
+`TelegramStarsPaymentProvider` creates native Telegram invoices in `XTR`. The
+catalog remains denominated in RUB. `axiom_create_star_order` reads the current
+`axiom_payment_settings.rub_per_star`, rounds up to a whole Star, and snapshots
+the RUB price, rate, and XTR amount on the order. The initial manually maintained
+display rate is 1.25 RUB/Star; StarFall does not publish a supported rate API, so
+the bot never scrapes another Telegram bot or stores a Telegram user session.
 
-A real adapter must implement `PaymentProvider` in `payment.ts`, verify the
-provider's signature against the raw webhook request, return its immutable event
-and payment ids, and create checkout URLs idempotently using the exact order id
-as merchant metadata/idempotency key. Add it to `configuredPaymentProvider`, set `PAYMENT_PROVIDER`, deploy,
-and point the merchant webhook to
-`/functions/v1/axiom-bot/payments/<provider>`. Never expose an admin command that
-marks an order paid; only a verified provider event may call fulfillment.
+Update the display/conversion rate without redeploying:
+
+```sql
+update public.axiom_payment_settings
+set rub_per_star = 1.2500,
+    rate_source = 'manual_starfall',
+    updated_at = now()
+where singleton;
+```
+
+The StarFall button is only a user convenience for topping up Stars. It is not a
+payment authority. The order is fulfilled only after the authenticated Telegram
+webhook delivers `successful_payment`; `pre_checkout_query` rechecks the owner,
+order status, currency, and exact amount. Telegram update ids and payment charge
+ids are stored uniquely, and fulfillment remains transactionally idempotent.
+
+`DisabledPaymentProvider` remains available as a fail-closed maintenance mode.
+Any future external adapter must verify its provider signature before returning
+immutable payment identifiers to `axiom_fulfill_paid_order`.
 
 ### Operations
 

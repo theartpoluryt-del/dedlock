@@ -7,8 +7,10 @@ import {
 } from "./license.ts";
 import {
   configuredPaymentProvider,
+  orderIdFromTelegramPayload,
   PaymentProvider,
   PaymentUnavailableError,
+  rubMinorToStars,
   VerifiedPayment,
 } from "./payment.ts";
 import {
@@ -31,6 +33,13 @@ type TelegramMessage = {
   chat: { id: number };
   from?: TelegramUser;
   text?: string;
+  successful_payment?: {
+    currency: string;
+    total_amount: number;
+    invoice_payload: string;
+    telegram_payment_charge_id: string;
+    provider_payment_charge_id?: string;
+  };
 };
 type CallbackQuery = {
   id: string;
@@ -42,6 +51,13 @@ type TelegramUpdate = {
   update_id: number;
   message?: TelegramMessage;
   callback_query?: CallbackQuery;
+  pre_checkout_query?: {
+    id: string;
+    from: TelegramUser;
+    currency: string;
+    total_amount: number;
+    invoice_payload: string;
+  };
 };
 
 type Plan = {
@@ -50,6 +66,10 @@ type Plan = {
   duration_days: number;
   amount_minor: number;
   currency: string;
+};
+
+type StarSettings = {
+  rub_per_star: number | string;
 };
 
 type Fulfillment = {
@@ -118,6 +138,12 @@ function formatMoney(
     style: "currency",
     currency,
   }).format(amountMinor / 100);
+}
+
+function formatPaymentAmount(amount: number, currency: string): string {
+  return currency === "XTR"
+    ? `${amount} ⭐`
+    : formatMoney(amount, currency, "ru");
 }
 
 function formatDate(value: unknown, locale: Locale): string {
@@ -217,6 +243,17 @@ async function loadPlans(supabase: SupabaseClient): Promise<Plan[]> {
   return data as Plan[];
 }
 
+async function loadRubPerStar(supabase: SupabaseClient): Promise<number> {
+  const { data, error } = await supabase.from("axiom_payment_settings")
+    .select("rub_per_star").eq("singleton", true).single();
+  if (error) throw error;
+  const rate = Number((data as StarSettings).rub_per_star);
+  if (!Number.isFinite(rate) || rate <= 0) {
+    throw new Error("Invalid Stars exchange rate");
+  }
+  return rate;
+}
+
 async function showMenu(chatId: number, locale: Locale): Promise<void> {
   await sendUserMessage(
     chatId,
@@ -236,10 +273,11 @@ async function showBuy(
   locale: Locale,
 ): Promise<void> {
   const plans = await loadPlans(supabase);
+  const rubPerStar = await loadRubPerStar(supabase);
   const planButtons = plans.map((plan) => [{
     text: `${planTitle(plan, locale)} — ${
       formatMoney(plan.amount_minor, plan.currency, locale)
-    }`,
+    } · ${rubMinorToStars(plan.amount_minor, rubPerStar)} ⭐`,
     callback_data: `buy:${plan.code}`,
   }]);
   await sendUserMessage(
@@ -446,12 +484,23 @@ async function createOrder(
       "buy",
     );
   }
-  const { data: order, error } = await supabase.rpc("axiom_create_order", {
-    p_telegram_user_id: user.id,
-    p_plan_code: planCode,
-    p_provider: provider.name,
-    p_telegram_update_id: updateId,
-  });
+  const isTelegramStars = provider.name === "telegram_stars";
+  const rpcName = isTelegramStars
+    ? "axiom_create_star_order"
+    : "axiom_create_order";
+  const rpcArgs = isTelegramStars
+    ? {
+      p_telegram_user_id: user.id,
+      p_plan_code: planCode,
+      p_telegram_update_id: updateId,
+    }
+    : {
+      p_telegram_user_id: user.id,
+      p_plan_code: planCode,
+      p_provider: provider.name,
+      p_telegram_update_id: updateId,
+    };
+  const { data: order, error } = await supabase.rpc(rpcName, rpcArgs);
   if (error) throw error;
   try {
     const checkout = await provider.createCheckout({
@@ -467,14 +516,43 @@ async function createOrder(
     }).eq("id", order.id).eq("status", "pending_payment");
     await sendUserMessage(
       chatId,
-      `<b>${tr(locale, "Заказ", "Order")} ${escapeHtml(order.id)}</b>\n${
-        escapeHtml(planTitle(plan, locale))
-      } — ${
-        escapeHtml(formatMoney(order.amount_minor, order.currency, locale))
-      }`,
+      isTelegramStars
+        ? `<b>💫 ${
+          tr(locale, "Оплата подписки", "Subscription payment")
+        }</b>\n\n${tr(locale, "Тариф", "Plan")}: ${
+          escapeHtml(planTitle(plan, locale))
+        }\n${tr(locale, "Цена", "Price")}: ${
+          escapeHtml(formatMoney(plan.amount_minor, plan.currency, locale))
+        } = <b>${escapeHtml(order.amount_minor)} ⭐</b>\n\n${
+          tr(
+            locale,
+            "1. Нажмите «Купить звёзды» и пополните баланс.\n2. Вернитесь сюда и нажмите «Потратить звёзды».\n3. Ключ будет выдан автоматически после подтверждения Telegram.",
+            "1. Tap “Buy Stars” and top up your balance.\n2. Return here and tap “Spend Stars”.\n3. The key will be issued automatically after Telegram confirms payment.",
+          )
+        }\n\nOrder ID: <code>${escapeHtml(order.id)}</code>`
+        : `<b>${tr(locale, "Заказ", "Order")} ${escapeHtml(order.id)}</b>\n${
+          escapeHtml(planTitle(plan, locale))
+        } — ${
+          escapeHtml(formatMoney(order.amount_minor, order.currency, locale))
+        }`,
       locale,
       "buy",
-      [[{ text: tr(locale, "💳 Оплатить", "💳 Pay"), url: checkout.url }]],
+      isTelegramStars
+        ? [
+          [{
+            text: tr(locale, "💫 Купить звёзды", "💫 Buy Stars"),
+            url: "https://t.me/starfallrobot",
+          }],
+          [{
+            text: tr(locale, "⭐ Потратить звёзды", "⭐ Spend Stars"),
+            url: checkout.url,
+          }],
+          [{
+            text: tr(locale, "🛡 Официальное пополнение", "🛡 Official top-up"),
+            url: "https://t.me/PremiumBot",
+          }],
+        ]
+        : [[{ text: tr(locale, "💳 Оплатить", "💳 Pay"), url: checkout.url }]],
     );
   } catch (error) {
     if (!(error instanceof PaymentUnavailableError)) throw error;
@@ -514,15 +592,20 @@ async function notifyPurchase(
     requiredSecret("BOT_KEY_ENCRYPTION_KEY"),
   );
   const username = user.username ? `@${escapeHtml(user.username)}` : "—";
+  const paymentAmount = formatPaymentAmount(
+    Number(order.amount_minor),
+    String(order.currency),
+  );
+  const rubPrice = order.price_rub_minor
+    ? ` (${formatMoney(Number(order.price_rub_minor), "RUB", "ru")})`
+    : "";
   if (!order.admin_notified_at) {
     await sendMessage(
       requiredSecret("TELEGRAM_ADMIN_CHAT_ID"),
       `<b>Новая покупка Axiom</b>\nTelegram: <code>${user.telegram_user_id}</code> (${username})\nТариф: ${
         escapeHtml(plan.title)
       } (${escapeHtml(order.plan_code)})\nСумма: ${
-        escapeHtml(
-          formatMoney(Number(order.amount_minor), String(order.currency), "ru"),
-        )
+        escapeHtml(`${paymentAmount}${rubPrice}`)
       }\nOrder ID: <code>${escapeHtml(order.id)}</code>\nКлюч: <code>${
         escapeHtml(key)
       }</code>\nДействует до: ${
@@ -572,6 +655,84 @@ async function fulfillPayment(
   return data as Fulfillment;
 }
 
+async function telegramOrderMatches(
+  supabase: SupabaseClient,
+  orderId: string,
+  telegramUserId: number,
+  amount: number,
+  currency: string,
+  allowFulfilled = false,
+): Promise<boolean> {
+  const { data: user, error: userError } = await supabase.from("axiom_users")
+    .select("id").eq("telegram_user_id", telegramUserId).maybeSingle();
+  if (userError || !user) return false;
+  const { data: order, error } = await supabase.from("axiom_orders")
+    .select("user_id,amount_minor,currency,provider,status").eq("id", orderId)
+    .maybeSingle();
+  if (error || !order) return false;
+  const validStatus = order.status === "pending_payment" ||
+    (allowFulfilled && order.status === "fulfilled");
+  return order.user_id === user.id && order.provider === "telegram_stars" &&
+    validStatus && order.currency === currency &&
+    Number(order.amount_minor) === amount;
+}
+
+async function handlePreCheckout(
+  supabase: SupabaseClient,
+  query: NonNullable<TelegramUpdate["pre_checkout_query"]>,
+): Promise<void> {
+  const orderId = orderIdFromTelegramPayload(query.invoice_payload);
+  const ok = orderId !== null && query.currency === "XTR" &&
+    Number.isSafeInteger(query.total_amount) && query.total_amount > 0 &&
+    await telegramOrderMatches(
+      supabase,
+      orderId,
+      query.from.id,
+      query.total_amount,
+      query.currency,
+    );
+  await telegramCall("answerPreCheckoutQuery", {
+    pre_checkout_query_id: query.id,
+    ok,
+    ...(ok ? {} : {
+      error_message:
+        "Заказ недействителен или его цена изменилась. Вернитесь в бот и создайте новый заказ.",
+    }),
+  });
+}
+
+async function handleSuccessfulTelegramPayment(
+  supabase: SupabaseClient,
+  update: TelegramUpdate,
+  message: TelegramMessage,
+): Promise<void> {
+  const payment = message.successful_payment!;
+  const user = message.from!;
+  const orderId = orderIdFromTelegramPayload(payment.invoice_payload);
+  if (
+    !orderId || payment.currency !== "XTR" ||
+    !await telegramOrderMatches(
+      supabase,
+      orderId,
+      user.id,
+      payment.total_amount,
+      payment.currency,
+      true,
+    )
+  ) {
+    throw new Error("Telegram successful_payment does not match its order");
+  }
+  const fulfillment = await fulfillPayment(supabase, {
+    provider: "telegram_stars",
+    eventId: `telegram-update:${update.update_id}`,
+    externalPaymentId: payment.telegram_payment_charge_id,
+    orderId,
+    amountMinor: payment.total_amount,
+    currency: payment.currency,
+  });
+  if (fulfillment.accepted) await notifyPurchase(supabase, fulfillment);
+}
+
 async function handleTelegram(
   request: Request,
   supabase: SupabaseClient,
@@ -582,12 +743,20 @@ async function handleTelegram(
     return new Response("unauthorized", { status: 401 });
   }
   const update = await request.json() as TelegramUpdate;
+  if (update.pre_checkout_query) {
+    await handlePreCheckout(supabase, update.pre_checkout_query);
+    return new Response("ok");
+  }
   const callback = update.callback_query;
   const message = update.message;
   const user = callback?.from ?? message?.from;
   const chatId = callback?.message?.chat.id ?? message?.chat.id;
   if (!user || !chatId) return new Response("ok");
   await upsertUser(supabase, user);
+  if (message?.successful_payment) {
+    await handleSuccessfulTelegramPayment(supabase, update, message);
+    return new Response("ok");
+  }
   if (callback) {
     await telegramCall("answerCallbackQuery", {
       callback_query_id: callback.id,

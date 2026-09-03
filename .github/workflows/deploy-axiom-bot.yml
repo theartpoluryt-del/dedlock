@@ -58,7 +58,7 @@ jobs:
             BOT_KEY_ENCRYPTION_KEY="$BOT_KEY_ENCRYPTION_KEY" \
             LICENSE_PEPPER="$LICENSE_PEPPER" \
             DISPLAY_TIME_ZONE="Asia/Yekaterinburg" \
-            PAYMENT_PROVIDER="disabled" \
+            PAYMENT_PROVIDER="telegram_stars" \
             --project-ref "$PROJECT_REF"
 
       - name: Deploy Edge Function
@@ -71,7 +71,7 @@ jobs:
           payload="$(jq -nc \
             --arg url "$webhook_url" \
             --arg secret "$TELEGRAM_WEBHOOK_SECRET" \
-            '{url:$url,secret_token:$secret,allowed_updates:["message","callback_query"],drop_pending_updates:true}')"
+            '{url:$url,secret_token:$secret,allowed_updates:["message","callback_query","pre_checkout_query"],drop_pending_updates:true}')"
           curl --fail-with-body --silent --show-error \
             -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
             -H "Content-Type: application/json" \
