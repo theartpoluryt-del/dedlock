@@ -68,6 +68,10 @@ Security properties:
   and creates the payment and license in one transaction;
 - plaintext keys are never stored directly. An AES-256-GCM envelope is retained
   only so a committed key can be redelivered after Telegram/network retries.
+- a partial unique index enforces one license per Telegram user. The first trial
+  or purchase creates the stable key; later purchases atomically extend its
+  expiration from `greatest(expires_at, now())`, so concurrent redemptions cannot
+  lose paid time. A paid user cannot claim a trial afterwards.
 
 ### Configure and deploy
 
@@ -126,7 +130,9 @@ userbot. FunPay's native auto-delivery gives the buyer a pre-generated one-time
 `AXF-...` code. `/activate CODE` exchanges it for the separate `AXM-...` launcher
 key. Redemption uses an advisory lock and one database transaction. A retry by
 the same Telegram account returns the original key; another account cannot reuse
-the code. Only an HMAC digest of each activation code is stored in Supabase.
+the code. Later codes extend that account's existing key instead of generating
+additional keys. Only an HMAC digest of each activation code is stored in
+Supabase.
 
 Create one FunPay lot for every active plan, enable automatic delivery, then put
 the exact offer links in `axiom_plans` (never guess an offer URL):

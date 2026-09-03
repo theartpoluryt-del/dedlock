@@ -87,6 +87,7 @@ type Fulfillment = {
 type ActivationFulfillment = {
   accepted: boolean;
   idempotent?: boolean;
+  created_license?: boolean;
   reason?: string;
   activation?: Record<string, unknown>;
   license?: Record<string, unknown>;
@@ -494,6 +495,18 @@ async function issueTrial(
     p_key_ciphertext: await encryptLicense(key, encryptionKey),
   });
   if (error) throw error;
+  if (data.unavailable) {
+    return await sendUserMessage(
+      chatId,
+      tr(
+        locale,
+        "Trial доступен только до получения первой подписки. У вас уже есть постоянный ключ Axiom; новые покупки будут продлевать его срок.",
+        "The trial is only available before the first subscription. You already have a permanent Axiom key; new purchases will extend it.",
+      ),
+      locale,
+      "trial",
+    );
+  }
   const deliveredKey = data.created
     ? key
     : await decryptLicense(data.key_ciphertext, encryptionKey);
@@ -606,9 +619,10 @@ async function redeemActivationCode(
   }
   const license = result.license;
   const activation = result.activation;
-  const key = result.idempotent
-    ? await decryptLicense(String(license.key_ciphertext), encryptionKey)
-    : generatedKey;
+  const key = await decryptLicense(
+    String(license.key_ciphertext),
+    encryptionKey,
+  );
   const { data: plan, error: planError } = await supabase.from("axiom_plans")
     .select("title,amount_minor,currency").eq("code", activation.plan_code)
     .single();
@@ -617,11 +631,19 @@ async function redeemActivationCode(
   await sendUserMessage(
     chatId,
     `<b>${
-      tr(locale, "✅ Подписка активирована", "✅ Subscription activated")
+      result.created_license
+        ? tr(locale, "✅ Подписка активирована", "✅ Subscription activated")
+        : tr(locale, "✅ Подписка продлена", "✅ Subscription extended")
     }</b>\n\n${tr(locale, "Ключ Axiom", "Axiom key")}: <code>${
       escapeHtml(key)
     }</code>\n${tr(locale, "Действует до", "Valid until")}: ${
       escapeHtml(formatDate(license.expires_at, locale))
+    }${
+      result.created_license ? "" : tr(
+        locale,
+        "\n\nКлюч не изменился — к нему добавлено оплаченное время.",
+        "\n\nThe key has not changed; the purchased time was added to it.",
+      )
     }`,
     locale,
     "keys",
