@@ -136,6 +136,12 @@ update public.axiom_plans set purchase_url = 'https://funpay.com/your-exact-offe
 where code = 'three_days';
 ```
 
+Or set a validated exact offer URL through the DPAPI-backed admin tool:
+
+```powershell
+.\tools\admin.ps1 set-plan-purchase-url --plan three_days --url "https://funpay.com/lots/offer?id=12345678"
+```
+
 Generate stock only on a trusted administrator machine. The output file contains
 bearer credentials: upload it to the matching FunPay lot, verify the stock count,
 then store it encrypted or delete it. `.private/` is ignored by Git.

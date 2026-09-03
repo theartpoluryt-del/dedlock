@@ -14,8 +14,11 @@ if ($Initialize) {
     $plainText = [Console]::In.ReadToEnd()
     $settings = $plainText | ConvertFrom-Json
     if ([string]::IsNullOrWhiteSpace($settings.supabase_url) -or
-        [string]::IsNullOrWhiteSpace($settings.license_pepper) -or
-        $settings.license_pepper.Length -lt 32) {
+        [string]::IsNullOrWhiteSpace($settings.service_role_key) -or
+        (-not [string]::IsNullOrWhiteSpace($settings.license_pepper) -and
+         $settings.license_pepper.Length -lt 32) -or
+        (-not [string]::IsNullOrWhiteSpace($settings.activation_code_pepper) -and
+         $settings.activation_code_pepper.Length -lt 32)) {
         throw 'Invalid Axiom Supabase administrator state.'
     }
     $bytes = [Text.Encoding]::UTF8.GetBytes($plainText)
@@ -40,7 +43,12 @@ if ([string]::IsNullOrWhiteSpace($settings.service_role_key)) {
 }
 $env:SUPABASE_URL = $settings.supabase_url
 $env:SUPABASE_SERVICE_ROLE_KEY = $settings.service_role_key
-$env:LICENSE_PEPPER = $settings.license_pepper
+if (-not [string]::IsNullOrWhiteSpace($settings.license_pepper)) {
+    $env:LICENSE_PEPPER = $settings.license_pepper
+}
+if (-not [string]::IsNullOrWhiteSpace($settings.activation_code_pepper)) {
+    $env:ACTIVATION_CODE_PEPPER = $settings.activation_code_pepper
+}
 try {
     & python (Join-Path $PSScriptRoot 'admin.py') @AdminArguments
     exit $LASTEXITCODE
@@ -48,4 +56,5 @@ try {
     Remove-Item Env:SUPABASE_URL -ErrorAction SilentlyContinue
     Remove-Item Env:SUPABASE_SERVICE_ROLE_KEY -ErrorAction SilentlyContinue
     Remove-Item Env:LICENSE_PEPPER -ErrorAction SilentlyContinue
+    Remove-Item Env:ACTIVATION_CODE_PEPPER -ErrorAction SilentlyContinue
 }

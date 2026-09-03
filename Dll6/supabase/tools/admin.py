@@ -112,6 +112,33 @@ def generate_activation_codes(args: argparse.Namespace) -> None:
     print(f"FunPay inventory file: {output}")
 
 
+def set_plan_purchase_url(args: argparse.Namespace) -> None:
+    parsed = urllib.parse.urlparse(args.url)
+    query = urllib.parse.parse_qs(parsed.query)
+    if (parsed.scheme != "https" or parsed.hostname != "funpay.com" or
+            parsed.path != "/lots/offer" or
+            not query.get("id", [""])[0].isdigit()):
+        raise SystemExit("Expected an exact https://funpay.com/lots/offer?id=... URL")
+    plan = urllib.parse.quote(args.plan, safe="")
+    result = request(
+        "PATCH",
+        f"/rest/v1/axiom_plans?code=eq.{plan}",
+        json.dumps({"purchase_url": args.url}).encode(),
+    )
+    if not result:
+        raise SystemExit("Plan was not found")
+    print(f"updated purchase URL for {args.plan}")
+
+
+def list_plans(_args: argparse.Namespace) -> None:
+    rows = request(
+        "GET",
+        "/rest/v1/axiom_plans?select=code,duration_days,amount_minor,currency,active,purchase_url"
+        "&order=sort_order",
+    )
+    print(json.dumps(rows, ensure_ascii=False, indent=2))
+
+
 def create_license(args: argparse.Namespace) -> None:
     key = normalize_key(args.key or generated_key())
     record = {
@@ -257,6 +284,12 @@ def main() -> None:
     activations.add_argument("--count", required=True, type=int)
     activations.add_argument("--output", required=True)
     activations.set_defaults(run=generate_activation_codes)
+    plan_url = commands.add_parser("set-plan-purchase-url")
+    plan_url.add_argument("--plan", required=True)
+    plan_url.add_argument("--url", required=True)
+    plan_url.set_defaults(run=set_plan_purchase_url)
+    plans = commands.add_parser("list-plans")
+    plans.set_defaults(run=list_plans)
     release = commands.add_parser("publish")
     release.add_argument("module")
     release.add_argument("--version", required=True)
