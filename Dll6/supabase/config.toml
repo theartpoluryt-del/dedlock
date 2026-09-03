@@ -2,3 +2,6 @@ project_id = "vljgmubfztmxsyiwrity"
 
 [functions.axiom-license]
 verify_jwt = false
+
+[functions.axiom-bot]
+verify_jwt = false
