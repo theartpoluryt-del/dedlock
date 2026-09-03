@@ -4,6 +4,7 @@ import {
   PaymentUnavailableError,
   rubMinorToStars,
   telegramInvoicePayload,
+  TelegramStarsPaymentProvider,
 } from "./payment.ts";
 
 function assert(condition: boolean, message: string): void {
@@ -60,5 +61,43 @@ Deno.test("Telegram invoice payload only accepts Axiom UUID orders", () => {
   assert(
     orderIdFromTelegramPayload("axiom-order:not-a-uuid") === null,
     "bad UUID accepted",
+  );
+});
+
+Deno.test("Telegram Stars adapter creates an exact XTR invoice", async () => {
+  let requestBody: Record<string, unknown> | null = null;
+  const fakeFetch =
+    (async (_input: string | URL | Request, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body));
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          result: "https://t.me/$test-invoice",
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      );
+    }) as typeof fetch;
+  const provider = new TelegramStarsPaymentProvider("test-token", fakeFetch);
+  const orderId = "f02d692a-9480-4bf1-8e23-fbddf5f0fca7";
+  const checkout = await provider.createCheckout({
+    id: orderId,
+    title: "3 дня",
+    amountMinor: 152,
+    currency: "XTR",
+    telegramUserId: 1,
+  });
+  const prices = requestBody?.prices as Array<Record<string, unknown>>;
+  assert(checkout.url === "https://t.me/$test-invoice", "invoice URL changed");
+  assert(requestBody?.currency === "XTR", "invoice currency is not XTR");
+  assert(
+    prices.length === 1 && prices[0].amount === 152,
+    "invoice amount changed",
+  );
+  assert(
+    requestBody?.payload === telegramInvoicePayload(orderId),
+    "invoice payload changed",
   );
 });
