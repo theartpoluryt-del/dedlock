@@ -89,15 +89,17 @@ Deno.test("Telegram Stars adapter creates an exact XTR invoice", async () => {
     currency: "XTR",
     telegramUserId: 1,
   });
-  const prices = requestBody?.prices as Array<Record<string, unknown>>;
+  assert(requestBody !== null, "invoice request was not sent");
+  const capturedBody = requestBody as unknown as Record<string, unknown>;
+  const prices = capturedBody.prices as Array<Record<string, unknown>>;
   assert(checkout.url === "https://t.me/$test-invoice", "invoice URL changed");
-  assert(requestBody?.currency === "XTR", "invoice currency is not XTR");
+  assert(capturedBody.currency === "XTR", "invoice currency is not XTR");
   assert(
     prices.length === 1 && prices[0].amount === 152,
     "invoice amount changed",
   );
   assert(
-    requestBody?.payload === telegramInvoicePayload(orderId),
+    capturedBody.payload === telegramInvoicePayload(orderId),
     "invoice payload changed",
   );
 });
