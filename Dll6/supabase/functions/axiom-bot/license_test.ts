@@ -27,13 +27,19 @@ Deno.test("generates and validates one-time FunPay activation codes", async () =
   const codes = new Set(Array.from({ length: 1000 }, generateActivationCode));
   assert(codes.size === 1000, "generated duplicate activation codes");
   const code = [...codes][0];
+  assert(/^[A-HJ-NP-Z2-9]{16}$/.test(code), `bad activation code: ${code}`);
   assert(
     normalizeActivationCode(` ${code.toLowerCase()} `) === code,
     "normalization failed",
   );
   assert(
-    normalizeActivationCode("AXF-00000-00000-00000-00000") === null,
+    normalizeActivationCode("0000000000000000") === null,
     "ambiguous alphabet accepted",
+  );
+  assert(
+    normalizeActivationCode("AXF-ABCDE-FGHJK-MNPQR-STUVW") ===
+      "AXF-ABCDE-FGHJK-MNPQR-STUVW",
+    "legacy activation code rejected",
   );
   const pepper = "activation-test-pepper-at-least-32-characters";
   assert(

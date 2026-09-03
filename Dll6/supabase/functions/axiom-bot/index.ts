@@ -388,8 +388,8 @@ async function showActivate(chatId: number, locale: Locale): Promise<void> {
     chatId,
     tr(
       locale,
-      "<b>🔐 Активация покупки FunPay</b>\n\nПосле оплаты скопируйте код, выданный FunPay, и отправьте его так:\n<code>/activate AXF-XXXXX-XXXXX-XXXXX-XXXXX</code>\n\nКод одноразовый. Не передавайте его другим людям.",
-      "<b>🔐 Activate a FunPay purchase</b>\n\nAfter payment, copy the code delivered by FunPay and send it like this:\n<code>/activate AXF-XXXXX-XXXXX-XXXXX-XXXXX</code>\n\nThe code is one-time. Do not share it.",
+      "<b>🔐 Активация покупки FunPay</b>\n\nПосле оплаты скопируйте код, выданный FunPay, и отправьте его так:\n<code>/activate K7M9R2W4H8NP3X6Q</code>\n\nКод одноразовый. Не передавайте его другим людям.",
+      "<b>🔐 Activate a FunPay purchase</b>\n\nAfter payment, copy the code delivered by FunPay and send it like this:\n<code>/activate K7M9R2W4H8NP3X6Q</code>\n\nThe code is one-time. Do not share it.",
     ),
     locale,
     "activate",

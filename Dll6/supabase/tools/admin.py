@@ -20,7 +20,8 @@ from pathlib import Path
 
 
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-ACTIVATION_PATTERN = re.compile(r"^AXF-(?:[A-HJ-NP-Z2-9]{5}-){3}[A-HJ-NP-Z2-9]{5}$")
+ACTIVATION_PATTERN = re.compile(r"^[A-HJ-NP-Z2-9]{16}$")
+LEGACY_ACTIVATION_PATTERN = re.compile(r"^AXF-(?:[A-HJ-NP-Z2-9]{5}-){3}[A-HJ-NP-Z2-9]{5}$")
 
 
 def setting(name: str) -> str:
@@ -72,14 +73,13 @@ def generated_key() -> str:
 
 
 def generated_activation_code() -> str:
-    return "AXF-" + "-".join(
-        "".join(secrets.choice(ALPHABET) for _ in range(5)) for _ in range(4)
-    )
+    return "".join(secrets.choice(ALPHABET) for _ in range(16))
 
 
 def activation_digest(value: str) -> str:
     normalized = value.strip().upper()
-    if not ACTIVATION_PATTERN.fullmatch(normalized):
+    if not (ACTIVATION_PATTERN.fullmatch(normalized) or
+            LEGACY_ACTIVATION_PATTERN.fullmatch(normalized)):
         raise SystemExit("Invalid FunPay activation code format")
     pepper = setting("ACTIVATION_CODE_PEPPER")
     if len(pepper) < 32:

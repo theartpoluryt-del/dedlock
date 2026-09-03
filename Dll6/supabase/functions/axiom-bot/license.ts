@@ -1,7 +1,9 @@
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const activationPattern = /^AXF-(?:[A-HJ-NP-Z2-9]{5}-){3}[A-HJ-NP-Z2-9]{5}$/;
+const activationPattern = /^[A-HJ-NP-Z2-9]{16}$/;
+const legacyActivationPattern =
+  /^AXF-(?:[A-HJ-NP-Z2-9]{5}-){3}[A-HJ-NP-Z2-9]{5}$/;
 
 function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
@@ -28,21 +30,18 @@ export function generateLicenseKey(): string {
 }
 
 export function generateActivationCode(): string {
-  const random = crypto.getRandomValues(new Uint8Array(20));
-  const groups: string[] = [];
-  for (let group = 0; group < 4; group++) {
-    let part = "";
-    for (let index = 0; index < 5; index++) {
-      part += alphabet[random[group * 5 + index] % alphabet.length];
-    }
-    groups.push(part);
-  }
-  return `AXF-${groups.join("-")}`;
+  const random = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(random, (value) => alphabet[value % alphabet.length]).join(
+    "",
+  );
 }
 
 export function normalizeActivationCode(value: string): string | null {
   const normalized = value.trim().toUpperCase();
-  return activationPattern.test(normalized) ? normalized : null;
+  return activationPattern.test(normalized) ||
+      legacyActivationPattern.test(normalized)
+    ? normalized
+    : null;
 }
 
 async function hmacDigest(value: string, pepper: string): Promise<string> {

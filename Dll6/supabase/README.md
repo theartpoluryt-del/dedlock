@@ -132,7 +132,7 @@ only, so pushing code cannot unexpectedly mutate production.
 
 The bot does not use an unofficial FunPay API, browser cookies, or a seller
 userbot. FunPay's native auto-delivery gives the buyer a pre-generated one-time
-`AXF-...` code. `/activate CODE` exchanges it for the separate `AXM-...` launcher
+simple 16-character code. `/activate CODE` exchanges it for the separate `AXM-...` launcher
 key. Redemption uses an advisory lock and one database transaction. A retry by
 the same Telegram account returns the original key; another account cannot reuse
 the code. Later codes extend that account's existing key instead of generating
