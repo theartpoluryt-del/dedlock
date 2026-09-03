@@ -83,6 +83,7 @@ type Fulfillment = {
 const jsonHeaders = { "content-type": "application/json; charset=utf-8" };
 const defaultDownloadUrl =
   "https://github.com/theartpoluryt-del/dedlock/raw/refs/heads/main/Dll6/x64/Release/AxiomLauncher.exe";
+let telegramWebhookConfiguration: Promise<void> | null = null;
 
 function requiredSecret(name: string): string {
   const value = (Deno.env.get(name) ?? "").trim();
@@ -127,6 +128,21 @@ async function telegramCall(
   const payload = await response.json();
   if (!response.ok || !payload.ok) throw new Error(`Telegram ${method} failed`);
   return payload.result;
+}
+
+function ensureTelegramWebhook(): Promise<void> {
+  if (!telegramWebhookConfiguration) {
+    const baseUrl = requiredSecret("SUPABASE_URL").replace(/\/$/, "");
+    telegramWebhookConfiguration = telegramCall("setWebhook", {
+      url: `${baseUrl}/functions/v1/axiom-bot/telegram`,
+      secret_token: requiredSecret("TELEGRAM_WEBHOOK_SECRET"),
+      allowed_updates: ["message", "callback_query", "pre_checkout_query"],
+    }).then(() => undefined).catch((error) => {
+      telegramWebhookConfiguration = null;
+      throw error;
+    });
+  }
+  return telegramWebhookConfiguration;
 }
 
 function formatMoney(
@@ -742,6 +758,7 @@ async function handleTelegram(
   if (request.headers.get("x-telegram-bot-api-secret-token") !== expected) {
     return new Response("unauthorized", { status: 401 });
   }
+  await ensureTelegramWebhook();
   const update = await request.json() as TelegramUpdate;
   if (update.pre_checkout_query) {
     await handlePreCheckout(supabase, update.pre_checkout_query);
