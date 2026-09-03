@@ -468,8 +468,8 @@ async function showTrialWarning(chatId: number, locale: Locale): Promise<void> {
     chatId,
     tr(
       locale,
-      "<b>⚠️ Перед активацией Trial</b>\n\nПробный период действует <b>3 дня</b> с момента подтверждения и доступен только один раз для одного Telegram-аккаунта. Отсчёт начнётся сразу после нажатия кнопки ниже.\n\nСначала рекомендуем скачать и подготовить Axiom Launcher.",
-      "<b>⚠️ Before activating the Trial</b>\n\nThe trial lasts for <b>3 days</b> from confirmation and can only be claimed once per Telegram account. The countdown starts immediately after you press the button below.\n\nWe recommend downloading and preparing Axiom Launcher first.",
+      "<b>⚠️ Перед активацией Trial</b>\n\nПробный период действует <b>3 дня</b> с момента подтверждения. Он доступен один раз для Telegram-аккаунта и один раз для одного ПК. При первом вводе ключа AxiomLauncher безопасно закрепит trial за хешем устройства. Повторный trial с другого аккаунта на том же ПК работать не будет.\n\nОтсчёт начнётся сразу после нажатия кнопки ниже, поэтому сначала рекомендуем скачать и подготовить Axiom Launcher.",
+      "<b>⚠️ Before activating the Trial</b>\n\nThe trial lasts for <b>3 days</b> from confirmation. It is available once per Telegram account and once per PC. When the key is first entered, AxiomLauncher securely binds the trial to a device hash. A trial from another account will not work on the same PC.\n\nThe countdown starts immediately, so we recommend downloading and preparing Axiom Launcher first.",
     ),
     locale,
     "trial",

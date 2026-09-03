@@ -72,6 +72,11 @@ Security properties:
   or purchase creates the stable key; later purchases atomically extend its
   expiration from `greatest(expires_at, now())`, so concurrent redemptions cannot
   lose paid time. A paid user cannot claim a trial afterwards.
+- trial keys are additionally claimed on first launcher verification. A
+  permanent SHA-256 device fingerprint can own only one trial, while a 30-day
+  HMAC-IP velocity limit permits up to three PCs behind a shared network. Raw
+  hardware identifiers and IP addresses never reach the database; old IP HMACs
+  are removed from trial claims after 90 days.
 
 ### Configure and deploy
 

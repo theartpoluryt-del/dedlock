@@ -456,7 +456,10 @@ Deno.serve(async (request: Request) => {
       }
       if (
         verification?.reason === "device_limit" ||
-        verification?.reason === "device_revoked"
+        verification?.reason === "device_revoked" ||
+        verification?.reason === "trial_device_used" ||
+        verification?.reason === "trial_device_locked" ||
+        verification?.reason === "trial_network_limit"
       ) {
         return reply(403, { ok: false });
       }
