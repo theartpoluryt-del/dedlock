@@ -1,8 +1,11 @@
 import {
   decryptLicense,
+  digestActivationCode,
   digestLicense,
   encryptLicense,
+  generateActivationCode,
   generateLicenseKey,
+  normalizeActivationCode,
 } from "./license.ts";
 
 function assert(condition: boolean, message: string): void {
@@ -18,6 +21,26 @@ Deno.test("generates launcher-compatible unique license keys", () => {
       `bad key: ${key}`,
     );
   }
+});
+
+Deno.test("generates and validates one-time FunPay activation codes", async () => {
+  const codes = new Set(Array.from({ length: 1000 }, generateActivationCode));
+  assert(codes.size === 1000, "generated duplicate activation codes");
+  const code = [...codes][0];
+  assert(
+    normalizeActivationCode(` ${code.toLowerCase()} `) === code,
+    "normalization failed",
+  );
+  assert(
+    normalizeActivationCode("AXF-00000-00000-00000-00000") === null,
+    "ambiguous alphabet accepted",
+  );
+  const pepper = "activation-test-pepper-at-least-32-characters";
+  assert(
+    await digestActivationCode(code, pepper) ===
+      await digestActivationCode(code.toLowerCase(), pepper),
+    "activation digest is not normalized",
+  );
 });
 
 Deno.test("HMAC digest is deterministic and normalized", async () => {

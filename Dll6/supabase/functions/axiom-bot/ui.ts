@@ -3,6 +3,7 @@ export type Section =
   | "menu"
   | "download"
   | "buy"
+  | "activate"
   | "language"
   | "keys"
   | "trial"
@@ -19,6 +20,7 @@ const labels = {
   ru: {
     download: "⬇️ Скачать",
     buy: "💲 Купить",
+    activate: "🔐 Активировать код",
     language: "🌐 Язык",
     keys: "🔑 Мои ключи",
     trial: "🎁 Trial на 3 дня",
@@ -29,6 +31,7 @@ const labels = {
   en: {
     download: "⬇️ Download",
     buy: "💲 Buy",
+    activate: "🔐 Activate code",
     language: "🌐 Language",
     keys: "🔑 My keys",
     trial: "🎁 3-day trial",
@@ -42,6 +45,7 @@ const callbacks: Record<Section, string> = {
   menu: "nav:menu",
   download: "nav:download",
   buy: "nav:buy",
+  activate: "nav:activate",
   language: "nav:language",
   keys: "nav:keys",
   trial: "nav:trial",
@@ -52,12 +56,14 @@ const callbacks: Record<Section, string> = {
 const contextSections: Record<Section, Section[][]> = {
   menu: [
     ["download", "buy"],
-    ["keys", "trial"],
+    ["activate", "keys"],
+    ["trial"],
     ["guide", "support"],
     ["language"],
   ],
   download: [["guide", "keys"], ["support", "menu"]],
-  buy: [["trial", "keys"], ["guide", "menu"]],
+  buy: [["activate", "keys"], ["trial", "menu"]],
+  activate: [["buy", "keys"], ["support", "menu"]],
   language: [["menu"]],
   keys: [["buy", "trial"], ["download", "menu"]],
   trial: [["keys", "buy"], ["download", "guide"], ["menu"]],
@@ -86,6 +92,7 @@ export function commandDefinitions(locale: Locale) {
     ? {
       download: "⬇️ скачать загрузчик",
       buy: "💲 купить подписку",
+      activate: "🔐 активировать код FunPay",
       language: "🇺🇸 выбрать язык",
       keys: "🔑 мои ключи",
       trial: "🎁 бесплатный период на 3 дня",
@@ -95,6 +102,7 @@ export function commandDefinitions(locale: Locale) {
     : {
       download: "⬇️ download launcher",
       buy: "💲 buy a subscription",
+      activate: "🔐 activate a FunPay code",
       language: "🇷🇺 choose language",
       keys: "🔑 my license keys",
       trial: "🎁 free 3-day trial",

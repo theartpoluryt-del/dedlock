@@ -17,6 +17,7 @@
 **/.env
 **/.env.local
 **/.env.production
+**/.private/
 **/work/*.dll
 **/work/*.id0
 **/work/*.id1

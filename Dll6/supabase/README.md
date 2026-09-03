@@ -85,10 +85,11 @@ Security properties:
    npx supabase db push
    ```
 
-5. Set secrets without writing them to a tracked file:
+5. Set secrets without writing them to a tracked file. Use an independent
+   random `ACTIVATION_CODE_PEPPER`; changing it invalidates unsold FunPay codes:
 
    ```powershell
-   npx supabase secrets set TELEGRAM_BOT_TOKEN=... TELEGRAM_ADMIN_CHAT_ID=... TELEGRAM_WEBHOOK_SECRET=... BOT_KEY_ENCRYPTION_KEY=... LICENSE_PEPPER=... DISPLAY_TIME_ZONE=Asia/Yekaterinburg PAYMENT_PROVIDER=telegram_stars
+   npx supabase secrets set TELEGRAM_BOT_TOKEN=... TELEGRAM_ADMIN_CHAT_ID=... TELEGRAM_WEBHOOK_SECRET=... BOT_KEY_ENCRYPTION_KEY=... LICENSE_PEPPER=... ACTIVATION_CODE_PEPPER=... DISPLAY_TIME_ZONE=Asia/Yekaterinburg PAYMENT_PROVIDER=disabled
    npx supabase functions deploy axiom-bot --no-verify-jwt
    ```
 
@@ -103,7 +104,7 @@ Security properties:
 
 The bot supports Russian and English and stores the selected language on the
 server. Its Telegram command menu contains `/download`, `/buy`, `/language`,
-`/keys`, `/trial`, `/guide`, and `/support`. Every user response includes an
+`/keys`, `/activate`, `/trial`, `/guide`, and `/support`. Every user response includes an
 inline keyboard tailored to the current section and a route back to the main
 menu. `AXIOM_DOWNLOAD_URL` and `AXIOM_SUPPORT_URL` are optional server-side
 configuration values; the defaults use the tracked launcher executable and the
@@ -112,39 +113,41 @@ Telegram owner account respectively.
 Alternatively, add the following GitHub Actions repository secrets and run
 the manual **Deploy Axiom Telegram bot** workflow: `SUPABASE_ACCESS_TOKEN`,
 `SUPABASE_DB_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_CHAT_ID`,
-`TELEGRAM_WEBHOOK_SECRET`, `BOT_KEY_ENCRYPTION_KEY`, and `LICENSE_PEPPER`.
+`TELEGRAM_WEBHOOK_SECRET`, `BOT_KEY_ENCRYPTION_KEY`, `LICENSE_PEPPER`, and
+`ACTIVATION_CODE_PEPPER`.
 The workflow applies migrations, sets Edge secrets, deploys the function,
 registers the Telegram webhook, and checks the health endpoint. It is manual
 only, so pushing code cannot unexpectedly mutate production.
 
-### Payments
+### FunPay fulfillment
 
-`TelegramStarsPaymentProvider` creates native Telegram invoices in `XTR`. The
-catalog remains denominated in RUB. `axiom_create_star_order` reads the current
-`axiom_payment_settings.rub_per_star`, rounds up to a whole Star, and snapshots
-the RUB price, rate, and XTR amount on the order. The initial manually maintained
-display rate is 1.25 RUB/Star; StarFall does not publish a supported rate API, so
-the bot never scrapes another Telegram bot or stores a Telegram user session.
+The bot does not use an unofficial FunPay API, browser cookies, or a seller
+userbot. FunPay's native auto-delivery gives the buyer a pre-generated one-time
+`AXF-...` code. `/activate CODE` exchanges it for the separate `AXM-...` launcher
+key. Redemption uses an advisory lock and one database transaction. A retry by
+the same Telegram account returns the original key; another account cannot reuse
+the code. Only an HMAC digest of each activation code is stored in Supabase.
 
-Update the display/conversion rate without redeploying:
+Create one FunPay lot for every active plan, enable automatic delivery, then put
+the exact offer links in `axiom_plans` (never guess an offer URL):
 
 ```sql
-update public.axiom_payment_settings
-set rub_per_star = 1.2500,
-    rate_source = 'manual_starfall',
-    updated_at = now()
-where singleton;
+update public.axiom_plans set purchase_url = 'https://funpay.com/your-exact-offer-url'
+where code = 'three_days';
 ```
 
-The StarFall button is only a user convenience for topping up Stars. It is not a
-payment authority. The order is fulfilled only after the authenticated Telegram
-webhook delivers `successful_payment`; `pre_checkout_query` rechecks the owner,
-order status, currency, and exact amount. Telegram update ids and payment charge
-ids are stored uniquely, and fulfillment remains transactionally idempotent.
+Generate stock only on a trusted administrator machine. The output file contains
+bearer credentials: upload it to the matching FunPay lot, verify the stock count,
+then store it encrypted or delete it. `.private/` is ignored by Git.
 
-`DisabledPaymentProvider` remains available as a fail-closed maintenance mode.
-Any future external adapter must verify its provider signature before returning
-immutable payment identifiers to `axiom_fulfill_paid_order`.
+```powershell
+python tools/admin.py generate-activation-codes --plan three_days --count 50 --output .private/funpay-three-days.txt
+python tools/admin.py generate-activation-codes --plan week --count 50 --output .private/funpay-week.txt
+```
+
+The command inserts only digests into Supabase and refuses to overwrite an
+existing export. Keep `PAYMENT_PROVIDER=disabled`. Legacy Telegram Stars webhook
+handling remains solely so invoices created before the switch can still settle.
 
 ### Operations
 

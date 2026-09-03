@@ -1,9 +1,11 @@
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import {
   decryptLicense,
+  digestActivationCode,
   digestLicense,
   encryptLicense,
   generateLicenseKey,
+  normalizeActivationCode,
 } from "./license.ts";
 import {
   configuredPaymentProvider,
@@ -14,6 +16,7 @@ import {
   VerifiedPayment,
 } from "./payment.ts";
 import {
+  commandDefinitions,
   commandFromText,
   InlineButton,
   Locale,
@@ -66,6 +69,7 @@ type Plan = {
   duration_days: number;
   amount_minor: number;
   currency: string;
+  purchase_url: string | null;
 };
 
 type StarSettings = {
@@ -77,6 +81,14 @@ type Fulfillment = {
   idempotent?: boolean;
   reason?: string;
   order?: Record<string, unknown>;
+  license?: Record<string, unknown>;
+};
+
+type ActivationFulfillment = {
+  accepted: boolean;
+  idempotent?: boolean;
+  reason?: string;
+  activation?: Record<string, unknown>;
   license?: Record<string, unknown>;
 };
 
@@ -133,11 +145,22 @@ async function telegramCall(
 function ensureTelegramWebhook(): Promise<void> {
   if (!telegramWebhookConfiguration) {
     const baseUrl = requiredSecret("SUPABASE_URL").replace(/\/$/, "");
-    telegramWebhookConfiguration = telegramCall("setWebhook", {
-      url: `${baseUrl}/functions/v1/axiom-bot/telegram`,
-      secret_token: requiredSecret("TELEGRAM_WEBHOOK_SECRET"),
-      allowed_updates: ["message", "callback_query", "pre_checkout_query"],
-    }).then(() => undefined).catch((error) => {
+    telegramWebhookConfiguration = Promise.all([
+      telegramCall("setWebhook", {
+        url: `${baseUrl}/functions/v1/axiom-bot/telegram`,
+        secret_token: requiredSecret("TELEGRAM_WEBHOOK_SECRET"),
+        allowed_updates: ["message", "callback_query", "pre_checkout_query"],
+      }),
+      telegramCall("setMyCommands", { commands: commandDefinitions("ru") }),
+      telegramCall("setMyCommands", {
+        commands: commandDefinitions("ru"),
+        language_code: "ru",
+      }),
+      telegramCall("setMyCommands", {
+        commands: commandDefinitions("en"),
+        language_code: "en",
+      }),
+    ]).then(() => undefined).catch((error) => {
       telegramWebhookConfiguration = null;
       throw error;
     });
@@ -253,7 +276,7 @@ async function setLocale(
 
 async function loadPlans(supabase: SupabaseClient): Promise<Plan[]> {
   const { data, error } = await supabase.from("axiom_plans")
-    .select("code,title,duration_days,amount_minor,currency")
+    .select("code,title,duration_days,amount_minor,currency,purchase_url")
     .eq("active", true).order("sort_order");
   if (error) throw error;
   return data as Plan[];
@@ -289,12 +312,11 @@ async function showBuy(
   locale: Locale,
 ): Promise<void> {
   const plans = await loadPlans(supabase);
-  const rubPerStar = await loadRubPerStar(supabase);
   const planButtons = plans.map((plan) => [{
     text: `${planTitle(plan, locale)} — ${
       formatMoney(plan.amount_minor, plan.currency, locale)
-    } · ${rubMinorToStars(plan.amount_minor, rubPerStar)} ⭐`,
-    callback_data: `buy:${plan.code}`,
+    }`,
+    callback_data: `offer:${plan.code}`,
   }]);
   await sendUserMessage(
     chatId,
@@ -306,6 +328,70 @@ async function showBuy(
     locale,
     "buy",
     planButtons,
+  );
+}
+
+async function showFunPayOffer(
+  supabase: SupabaseClient,
+  chatId: number,
+  locale: Locale,
+  planCode: string,
+): Promise<void> {
+  const plan = (await loadPlans(supabase)).find((item) =>
+    item.code === planCode
+  );
+  if (!plan?.purchase_url) {
+    return await sendUserMessage(
+      chatId,
+      tr(
+        locale,
+        "Этот тариф пока недоступен на FunPay. Попробуйте позже или обратитесь в поддержку.",
+        "This plan is not available on FunPay yet. Try later or contact support.",
+      ),
+      locale,
+      "buy",
+    );
+  }
+  await sendUserMessage(
+    chatId,
+    `<b>${tr(locale, "Покупка через FunPay", "Purchase via FunPay")}</b>\n\n${
+      tr(locale, "Тариф", "Plan")
+    }: ${escapeHtml(planTitle(plan, locale))}\n${
+      tr(locale, "Цена", "Price")
+    }: ${
+      escapeHtml(formatMoney(plan.amount_minor, plan.currency, locale))
+    }\n\n${
+      tr(
+        locale,
+        "1. Откройте предложение на FunPay и оплатите его.\n2. FunPay автоматически выдаст одноразовый код активации.\n3. Вернитесь в бот и отправьте <code>/activate КОД</code>.\n4. Бот выдаст отдельный лицензионный ключ Axiom.",
+        "1. Open the FunPay offer and pay for it.\n2. FunPay will automatically deliver a one-time activation code.\n3. Return to the bot and send <code>/activate CODE</code>.\n4. The bot will issue a separate Axiom license key.",
+      )
+    }`,
+    locale,
+    "buy",
+    [
+      [{
+        text: tr(locale, "🛒 Открыть FunPay", "🛒 Open FunPay"),
+        url: plan.purchase_url,
+      }],
+      [{
+        text: tr(locale, "🔐 Ввести код", "🔐 Enter code"),
+        callback_data: "nav:activate",
+      }],
+    ],
+  );
+}
+
+async function showActivate(chatId: number, locale: Locale): Promise<void> {
+  await sendUserMessage(
+    chatId,
+    tr(
+      locale,
+      "<b>🔐 Активация покупки FunPay</b>\n\nПосле оплаты скопируйте код, выданный FunPay, и отправьте его так:\n<code>/activate AXF-XXXXX-XXXXX-XXXXX-XXXXX</code>\n\nКод одноразовый. Не передавайте его другим людям.",
+      "<b>🔐 Activate a FunPay purchase</b>\n\nAfter payment, copy the code delivered by FunPay and send it like this:\n<code>/activate AXF-XXXXX-XXXXX-XXXXX-XXXXX</code>\n\nThe code is one-time. Do not share it.",
+    ),
+    locale,
+    "activate",
   );
 }
 
@@ -475,6 +561,92 @@ async function showLicenses(
     );
   }
   await sendUserMessage(chatId, lines.join("\n"), locale, "keys");
+}
+
+function activationCodeFromMessage(text: string | undefined): string | null {
+  if (!text) return null;
+  const match = text.trim().match(/^\/activate(?:@[A-Za-z0-9_]+)?\s+(.+)$/i);
+  return match ? normalizeActivationCode(match[1]) : null;
+}
+
+async function redeemActivationCode(
+  supabase: SupabaseClient,
+  user: TelegramUser,
+  chatId: number,
+  locale: Locale,
+  code: string,
+): Promise<void> {
+  const generatedKey = generateLicenseKey();
+  const encryptionKey = requiredSecret("BOT_KEY_ENCRYPTION_KEY");
+  const { data, error } = await supabase.rpc("axiom_redeem_activation_code", {
+    p_telegram_user_id: user.id,
+    p_code_hash: await digestActivationCode(
+      code,
+      requiredSecret("ACTIVATION_CODE_PEPPER"),
+    ),
+    p_key_hash: await digestLicense(
+      generatedKey,
+      requiredSecret("LICENSE_PEPPER"),
+    ),
+    p_key_ciphertext: await encryptLicense(generatedKey, encryptionKey),
+  });
+  if (error) throw error;
+  const result = data as ActivationFulfillment;
+  if (!result.accepted || !result.license || !result.activation) {
+    return await sendUserMessage(
+      chatId,
+      tr(
+        locale,
+        "Код недействителен или уже был использован другим аккаунтом. Проверьте код в заказе FunPay либо обратитесь в поддержку.",
+        "The code is invalid or was already used by another account. Check your FunPay order or contact support.",
+      ),
+      locale,
+      "activate",
+    );
+  }
+  const license = result.license;
+  const activation = result.activation;
+  const key = result.idempotent
+    ? await decryptLicense(String(license.key_ciphertext), encryptionKey)
+    : generatedKey;
+  const { data: plan, error: planError } = await supabase.from("axiom_plans")
+    .select("title,amount_minor,currency").eq("code", activation.plan_code)
+    .single();
+  if (planError) throw planError;
+
+  await sendUserMessage(
+    chatId,
+    `<b>${
+      tr(locale, "✅ Подписка активирована", "✅ Subscription activated")
+    }</b>\n\n${tr(locale, "Ключ Axiom", "Axiom key")}: <code>${
+      escapeHtml(key)
+    }</code>\n${tr(locale, "Действует до", "Valid until")}: ${
+      escapeHtml(formatDate(license.expires_at, locale))
+    }`,
+    locale,
+    "keys",
+  );
+
+  if (!activation.admin_notified_at) {
+    const username = user.username ? `@${escapeHtml(user.username)}` : "—";
+    await sendMessage(
+      requiredSecret("TELEGRAM_ADMIN_CHAT_ID"),
+      `<b>Новая активация FunPay</b>\nTelegram: <code>${user.id}</code> (${username})\nТариф: ${
+        escapeHtml(plan.title)
+      } (${escapeHtml(activation.plan_code)})\nСумма: ${
+        escapeHtml(
+          formatMoney(Number(plan.amount_minor), String(plan.currency), "ru"),
+        )
+      }\nActivation ID: <code>${
+        escapeHtml(activation.id)
+      }</code>\nКлюч: <code>${escapeHtml(key)}</code>\nДействует до: ${
+        escapeHtml(formatDate(license.expires_at, "ru"))
+      }`,
+    );
+    await supabase.from("axiom_activation_codes").update({
+      admin_notified_at: new Date().toISOString(),
+    }).eq("id", activation.id).is("admin_notified_at", null);
+  }
 }
 
 async function createOrder(
@@ -797,15 +969,14 @@ async function handleTelegram(
       locale,
       "language",
     );
-  } else if (callbackAction?.startsWith("buy:")) {
-    await createOrder(
+  } else if (
+    callbackAction?.startsWith("offer:") || callbackAction?.startsWith("buy:")
+  ) {
+    await showFunPayOffer(
       supabase,
-      provider,
-      callbackAction.slice(4),
-      update.update_id,
-      user,
       chatId,
       locale,
+      callbackAction.split(":", 2)[1],
     );
   } else {
     const action = callbackAction?.startsWith("nav:")
@@ -815,7 +986,12 @@ async function handleTelegram(
       : callbackAction ?? command ?? "menu";
     if (action === "download") await showDownload(chatId, locale);
     else if (action === "buy") await showBuy(supabase, chatId, locale);
-    else if (action === "language") await showLanguage(chatId, locale);
+    else if (action === "activate") {
+      const code = activationCodeFromMessage(message?.text);
+      if (code) {
+        await redeemActivationCode(supabase, user, chatId, locale, code);
+      } else await showActivate(chatId, locale);
+    } else if (action === "language") await showLanguage(chatId, locale);
     else if (action === "keys") {
       await showLicenses(supabase, user, chatId, locale);
     } else if (action === "trial:confirm") {

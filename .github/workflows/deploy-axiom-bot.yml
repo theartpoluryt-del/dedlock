@@ -25,6 +25,7 @@ jobs:
       TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
       BOT_KEY_ENCRYPTION_KEY: ${{ secrets.BOT_KEY_ENCRYPTION_KEY }}
       LICENSE_PEPPER: ${{ secrets.LICENSE_PEPPER }}
+      ACTIVATION_CODE_PEPPER: ${{ secrets.ACTIVATION_CODE_PEPPER }}
 
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +37,7 @@ jobs:
       - name: Validate required secrets
         shell: bash
         run: |
-          for name in SUPABASE_ACCESS_TOKEN SUPABASE_DB_PASSWORD TELEGRAM_BOT_TOKEN TELEGRAM_ADMIN_CHAT_ID TELEGRAM_WEBHOOK_SECRET BOT_KEY_ENCRYPTION_KEY LICENSE_PEPPER; do
+          for name in SUPABASE_ACCESS_TOKEN SUPABASE_DB_PASSWORD TELEGRAM_BOT_TOKEN TELEGRAM_ADMIN_CHAT_ID TELEGRAM_WEBHOOK_SECRET BOT_KEY_ENCRYPTION_KEY LICENSE_PEPPER ACTIVATION_CODE_PEPPER; do
             if [ -z "${!name}" ]; then
               echo "Missing GitHub Actions secret: ${name}" >&2
               exit 1
@@ -57,8 +58,9 @@ jobs:
             TELEGRAM_WEBHOOK_SECRET="$TELEGRAM_WEBHOOK_SECRET" \
             BOT_KEY_ENCRYPTION_KEY="$BOT_KEY_ENCRYPTION_KEY" \
             LICENSE_PEPPER="$LICENSE_PEPPER" \
+            ACTIVATION_CODE_PEPPER="$ACTIVATION_CODE_PEPPER" \
             DISPLAY_TIME_ZONE="Asia/Yekaterinburg" \
-            PAYMENT_PROVIDER="telegram_stars" \
+            PAYMENT_PROVIDER="disabled" \
             --project-ref "$PROJECT_REF"
 
       - name: Deploy Edge Function
@@ -83,6 +85,7 @@ jobs:
           ru_commands='[
             {"command":"download","description":"⬇️ скачать загрузчик"},
             {"command":"buy","description":"💲 купить подписку"},
+            {"command":"activate","description":"🔐 активировать код FunPay"},
             {"command":"language","description":"🇺🇸 выбрать язык"},
             {"command":"keys","description":"🔑 мои ключи"},
             {"command":"trial","description":"🎁 бесплатный период на 3 дня"},
@@ -92,6 +95,7 @@ jobs:
           en_commands='[
             {"command":"download","description":"⬇️ download launcher"},
             {"command":"buy","description":"💲 buy a subscription"},
+            {"command":"activate","description":"🔐 activate a FunPay code"},
             {"command":"language","description":"🇷🇺 choose language"},
             {"command":"keys","description":"🔑 my license keys"},
             {"command":"trial","description":"🎁 free 3-day trial"},

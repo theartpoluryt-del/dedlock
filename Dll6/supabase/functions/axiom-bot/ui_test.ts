@@ -21,6 +21,7 @@ Deno.test("publishes all requested commands in both languages", () => {
   const expected = [
     "download",
     "buy",
+    "activate",
     "language",
     "keys",
     "trial",
@@ -36,6 +37,7 @@ Deno.test("context keyboards always include a route back to the menu", () => {
     const section of [
       "download",
       "buy",
+      "activate",
       "language",
       "keys",
       "trial",

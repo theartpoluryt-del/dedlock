@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -19,6 +20,7 @@ from pathlib import Path
 
 
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+ACTIVATION_PATTERN = re.compile(r"^AXF-(?:[A-HJ-NP-Z2-9]{5}-){3}[A-HJ-NP-Z2-9]{5}$")
 
 
 def setting(name: str) -> str:
@@ -67,6 +69,47 @@ def generated_key() -> str:
     return "AXM-" + "-".join(
         "".join(secrets.choice(ALPHABET) for _ in range(5)) for _ in range(4)
     )
+
+
+def generated_activation_code() -> str:
+    return "AXF-" + "-".join(
+        "".join(secrets.choice(ALPHABET) for _ in range(5)) for _ in range(4)
+    )
+
+
+def activation_digest(value: str) -> str:
+    normalized = value.strip().upper()
+    if not ACTIVATION_PATTERN.fullmatch(normalized):
+        raise SystemExit("Invalid FunPay activation code format")
+    pepper = setting("ACTIVATION_CODE_PEPPER")
+    if len(pepper) < 32:
+        raise SystemExit("ACTIVATION_CODE_PEPPER must contain at least 32 characters")
+    return hmac.new(pepper.encode(), normalized.encode(), hashlib.sha256).hexdigest()
+
+
+def generate_activation_codes(args: argparse.Namespace) -> None:
+    if not 1 <= args.count <= 10000:
+        raise SystemExit("--count must be between 1 and 10000")
+    output = Path(args.output).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    codes = list(dict.fromkeys(generated_activation_code() for _ in range(args.count)))
+    while len(codes) < args.count:
+        candidate = generated_activation_code()
+        if candidate not in codes:
+            codes.append(candidate)
+    batch_id = str(uuid.uuid4())
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    descriptor = os.open(output, flags, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+        stream.write("\n".join(codes) + "\n")
+    records = [{
+        "code_hash": activation_digest(code),
+        "plan_code": args.plan,
+        "batch_id": batch_id,
+    } for code in codes]
+    request("POST", "/rest/v1/axiom_activation_codes", json.dumps(records).encode())
+    print(f"created batch {batch_id}: {len(codes)} codes for {args.plan}")
+    print(f"FunPay inventory file: {output}")
 
 
 def create_license(args: argparse.Namespace) -> None:
@@ -209,6 +252,11 @@ def main() -> None:
     revoke.set_defaults(run=revoke_license)
     listing = commands.add_parser("list-licenses")
     listing.set_defaults(run=list_licenses)
+    activations = commands.add_parser("generate-activation-codes")
+    activations.add_argument("--plan", required=True)
+    activations.add_argument("--count", required=True, type=int)
+    activations.add_argument("--output", required=True)
+    activations.set_defaults(run=generate_activation_codes)
     release = commands.add_parser("publish")
     release.add_argument("module")
     release.add_argument("--version", required=True)

@@ -1,6 +1,7 @@
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const activationPattern = /^AXF-(?:[A-HJ-NP-Z2-9]{5}-){3}[A-HJ-NP-Z2-9]{5}$/;
 
 function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
@@ -26,10 +27,28 @@ export function generateLicenseKey(): string {
   return `AXM-${groups.join("-")}`;
 }
 
-export async function digestLicense(
-  key: string,
-  pepper: string,
-): Promise<string> {
+export function generateActivationCode(): string {
+  const random = crypto.getRandomValues(new Uint8Array(20));
+  const groups: string[] = [];
+  for (let group = 0; group < 4; group++) {
+    let part = "";
+    for (let index = 0; index < 5; index++) {
+      part += alphabet[random[group * 5 + index] % alphabet.length];
+    }
+    groups.push(part);
+  }
+  return `AXF-${groups.join("-")}`;
+}
+
+export function normalizeActivationCode(value: string): string | null {
+  const normalized = value.trim().toUpperCase();
+  return activationPattern.test(normalized) ? normalized : null;
+}
+
+async function hmacDigest(value: string, pepper: string): Promise<string> {
+  if (pepper.length < 32) {
+    throw new Error("HMAC pepper must be at least 32 characters");
+  }
   const cryptoKey = await crypto.subtle.importKey(
     "raw",
     encoder.encode(pepper),
@@ -38,14 +57,27 @@ export async function digestLicense(
     ["sign"],
   );
   const digest = new Uint8Array(
-    await crypto.subtle.sign(
-      "HMAC",
-      cryptoKey,
-      encoder.encode(key.trim().toUpperCase()),
-    ),
+    await crypto.subtle.sign("HMAC", cryptoKey, encoder.encode(value)),
   );
-  return Array.from(digest, (value) => value.toString(16).padStart(2, "0"))
-    .join("");
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join(
+    "",
+  );
+}
+
+export async function digestActivationCode(
+  code: string,
+  pepper: string,
+): Promise<string> {
+  const normalized = normalizeActivationCode(code);
+  if (!normalized) throw new Error("Invalid activation code");
+  return await hmacDigest(normalized, pepper);
+}
+
+export async function digestLicense(
+  key: string,
+  pepper: string,
+): Promise<string> {
+  return await hmacDigest(key.trim().toUpperCase(), pepper);
 }
 
 function encryptionKey(base64Key: string): Promise<CryptoKey> {
