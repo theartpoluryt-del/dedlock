@@ -68,8 +68,5 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved) {
 
 extern "C" __declspec(dllexport)
 DWORD WINAPI AxiomManualMapInitialize(LPVOID) {
-    // Resource APIs need the PE resource directory. Preserve every embedded
-    // asset before the launcher intentionally erases the mapped PE headers.
-    CacheEmbeddedResources();
     return InitializeThread(nullptr);
 }

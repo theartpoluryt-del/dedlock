@@ -4037,10 +4037,6 @@ void SetupHooks() {
 }
 
 DWORD WINAPI InitializeThread(LPVOID) {
-    // The manual-map launcher clears PE headers after this entry point
-    // returns. Keep an owned copy of RCDATA for all deferred UI loads.
-    CacheEmbeddedResources();
-
     // A second mapped copy would install another set of detours over the
     // first one. Keep one active instance per game process, but release this
     // guard during the orderly hot-unload so reinjection remains possible.
