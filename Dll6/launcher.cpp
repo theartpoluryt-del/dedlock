@@ -39,7 +39,8 @@ constexpr int kWindowHeight = 285 + kChromeHeight - kContentLift;
 constexpr UINT kLaunchFinished = WM_APP + 1;
 constexpr UINT kLaunchProgress = WM_APP + 2;
 constexpr DWORD kRemoteCallTimeoutMs = 20000;
-constexpr DWORD kInitializerTimeoutMs = 30000;
+// Covers the DLL's 180-second cold-start wait plus schema/hook setup.
+constexpr DWORD kInitializerTimeoutMs = 240000;
 
 HWND g_keyEdit{};
 HWND g_launchButton{};
@@ -116,6 +117,25 @@ uintptr_t FindRemoteModule(DWORD processId, std::wstring_view moduleName) {
 
 bool FitsIn(size_t offset, size_t size, size_t total) {
     return offset <= total && size <= total - offset;
+}
+
+bool ErasePEHeaders(HANDLE process, uintptr_t baseAddress) {
+    DWORD oldProtect;
+    if (!VirtualProtectEx(process, reinterpret_cast<void*>(baseAddress), 0x1000,
+        PAGE_READWRITE, &oldProtect)) {
+        return false;
+    }
+
+    uint8_t zero[0x1000] = {};
+    SIZE_T bytesWritten = 0;
+    BOOL result = WriteProcessMemory(process, reinterpret_cast<void*>(baseAddress),
+        zero, sizeof(zero), &bytesWritten);
+
+    DWORD dummy;
+    VirtualProtectEx(process, reinterpret_cast<void*>(baseAddress), 0x1000,
+        oldProtect, &dummy);
+
+    return result && bytesWritten == sizeof(zero);
 }
 
 struct RemoteCallContext {
@@ -653,7 +673,7 @@ bool ManualMapInject(HANDLE process, const uint8_t* dllData, size_t dllSize,
             // Do not unmap code that the timed-out thread may still execute.
             baseAddress = 0;
             detail = waitResult == WAIT_TIMEOUT
-                ? L"Manual Map: инициализация DLL (таймаут 30 с)"
+                ? L"Игра не завершила подготовку Axiom за 240 секунд."
                 : L"Manual Map: ошибка ожидания инициализации DLL";
             return false;
         }
@@ -664,6 +684,12 @@ bool ManualMapInject(HANDLE process, const uint8_t* dllData, size_t dllSize,
             swprintf_s(code, L" (0x%08X)", initializeCode);
             stage += code;
             return fail();
+        }
+        if (initializeCode != ERROR_SUCCESS) {
+            detail = initializeCode == ERROR_NOT_READY
+                ? L"Система объектов игры не готова. Подробности: Axiom/offset_resolution_failed.log."
+                : L"DLL не смогла завершить подготовку. Перезапустите игру и попробуйте снова.";
+            return false;
         }
     }
 
@@ -906,6 +932,8 @@ bool LoadPayload(DWORD processId, const std::filesystem::path& dllPath,
         return false;
     }
 
+    ErasePEHeaders(process, baseAddress);
+
     // Ждём готовности DLL (по событию)
     const ULONGLONG readyDeadline = GetTickCount64() + 20000;
     while (GetTickCount64() < readyDeadline && !IsPayloadReady(processId))
@@ -1144,6 +1172,19 @@ void PaintLauncher(HWND window) {
                         Gdiplus::RectF(24, 248.0f + kChromeHeight - kContentLift,
                                        width - 48, 22),
                         &centered, &statusBrush);
+
+    Gdiplus::Font versionFont(&textFamily, 10.0f,
+                              Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    Gdiplus::SolidBrush versionBrush(Gdiplus::Color(255, 91, 97, 109));
+    Gdiplus::StringFormat versionFormat;
+    versionFormat.SetAlignment(Gdiplus::StringAlignmentFar);
+    versionFormat.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    const std::wstring versionText =
+        std::wstring(L"v") + AxiomAuth::kLauncherVersion;
+    graphics.DrawString(versionText.c_str(), -1, &versionFont,
+                        Gdiplus::RectF(width - 90.0f, height - 17.0f,
+                                       78.0f, 13.0f),
+                        &versionFormat, &versionBrush);
 
     Gdiplus::Pen frame(Gdiplus::Color(255, 48, 53, 64), 1.0f);
     graphics.DrawRectangle(&frame, 0.5f, 0.5f, width - 1.0f, height - 1.0f);

@@ -117,7 +117,10 @@ bool ResolveEntitySystemLayout(uintptr_t system) {
         for (const uintptr_t stride : strideCandidates) {
             for (const uintptr_t handleOffset : handleCandidates) {
                 int score = 0;
-                for (uint32_t slot = 0; slot < 64; ++slot) {
+                // Early slots can be sparse while the menu/map is loading.
+                // Validate the entire first chunk, keeping the four matching
+                // identities requirement instead of accepting an empty table.
+                for (uint32_t slot = 0; slot <= Offsets::HandleChunkMask; ++slot) {
                     const uintptr_t identity = chunk + stride * slot;
                     const uintptr_t entity = Read<uintptr_t>(identity);
                     const uint32_t handle = Read<uint32_t>(

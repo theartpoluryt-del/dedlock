@@ -25,7 +25,15 @@ constexpr bool kSilentMoveDataYawIsolation = false;
 constexpr bool kRuntimeDiagnostics = false;
 
 uintptr_t FindLocalPawnFromController() {
-    if (!clientBase) return 0;
+    if (!clientBase) {
+        if (moduleReadyEvent) {
+            CloseHandle(moduleReadyEvent);
+            moduleReadyEvent = nullptr;
+        }
+        CloseHandle(moduleInstanceGuard);
+        moduleInstanceGuard = nullptr;
+        return ERROR_MOD_NOT_FOUND;
+    }
     const uintptr_t entityRoot = Read<uintptr_t>(
         clientBase + Offsets::GameEntitySystem);
     if (!entityRoot) return 0;
@@ -4071,10 +4079,14 @@ DWORD WINAPI InitializeThread(LPVOID) {
     // any entity worker starts. This is the pattern-based finder used by the
     // reference project; the brittle live-schema walker stays disabled.
     bool patternOffsetsReady = false;
-    for (int attempt = 0; attempt < 50 && !patternOffsetsReady; ++attempt) {
+    // A visible window and loaded client.dll do not imply that entity
+    // identities exist yet during a cold Steam launch. Keep validation, but
+    // allow the game to finish creating its entity system before giving up.
+    const ULONGLONG patternDeadline = GetTickCount64() + 180000;
+    do {
         patternOffsetsReady = InitializePatternOffsets();
-        if (!patternOffsetsReady) Sleep(100);
-    }
+        if (!patternOffsetsReady) Sleep(250);
+    } while (!patternOffsetsReady && GetTickCount64() < patternDeadline);
     printf("[+] Pattern offsets: %s\n", patternOffsetsReady ? "ready" : "fallback");
 
     // Update schema-backed member offsets before entity discovery starts.
@@ -4101,7 +4113,15 @@ DWORD WINAPI InitializeThread(LPVOID) {
                     << "schema=" << schemaOffsetsReady << '\n';
         }
         printf("[!] Runtime resolution failed; hooks and workers are disabled\n");
-        return 0;
+        // No hooks or workers have started. Do not leave the instance guard
+        // behind: a later launch must be allowed to try initialization again.
+        if (moduleReadyEvent) {
+            CloseHandle(moduleReadyEvent);
+            moduleReadyEvent = nullptr;
+        }
+        CloseHandle(moduleInstanceGuard);
+        moduleInstanceGuard = nullptr;
+        return ERROR_NOT_READY;
     }
 
 #ifndef DLL6_MOVEMENT_ONLY
@@ -4116,7 +4136,7 @@ DWORD WINAPI InitializeThread(LPVOID) {
         std::ofstream marker(
             Dll6Paths::DataFileA("Dll6_runtime.marker"),
             std::ios::trunc);
-        if (marker) marker << "axiom-server-module-1.0.47\nclientBase=0x"
+        if (marker) marker << "axiom-server-module-1.0.48\nclientBase=0x"
                            << std::hex << clientBase << "\n";
     }
     printf("[+] client.dll: 0x%p\n", reinterpret_cast<void*>(clientBase));
