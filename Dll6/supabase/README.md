@@ -168,10 +168,12 @@ Or set a validated exact offer URL through the DPAPI-backed admin tool:
 ```
 
 Generate stock only on a trusted administrator machine. Each physical output
-line is one FunPay product containing the styled activation guide and its unique
-code; literal `\\n` sequences become line breaks in the buyer chat. The file
-contains bearer credentials: upload it to the matching FunPay lot, verify the
-stock count, then store it encrypted or delete it. `.private/` is ignored by Git.
+line is one FunPay product containing only its unique activation code. Put the
+full styled guide in FunPay's separate **Message to buyer after payment** field;
+FunPay then sends the guide as the first automatic message and the code as the
+second one. The file contains bearer credentials: upload it to the matching
+FunPay lot, verify the stock count, then store it encrypted or delete it.
+`.private/` is ignored by Git.
 
 ```powershell
 python tools/admin.py generate-activation-codes --plan three_days --count 50 --output .private/funpay-three-days.txt

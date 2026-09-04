@@ -22,11 +22,6 @@ from pathlib import Path
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 ACTIVATION_PATTERN = re.compile(r"^[A-HJ-NP-Z2-9]{16}$")
 LEGACY_ACTIVATION_PATTERN = re.compile(r"^AXF-(?:[A-HJ-NP-Z2-9]{5}-){3}[A-HJ-NP-Z2-9]{5}$")
-FUNPAY_DELIVERY_TEMPLATE = """Спасибо за покупку!
-Код: {code}
-Активация: /activate КОД
-Лаунчер: /download
-Поддержка: /support"""
 
 
 def setting(name: str) -> str:
@@ -82,11 +77,8 @@ def generated_activation_code() -> str:
 
 
 def funpay_delivery_item(code: str) -> str:
-    """One physical line per FunPay product; literal \\n creates chat line breaks."""
-    item = FUNPAY_DELIVERY_TEMPLATE.format(code=code).replace("\n", r"\n")
-    if len(item.encode("utf-8")) > 200:
-        raise SystemExit("FunPay automatic-delivery item exceeds 200 UTF-8 bytes")
-    return item
+    """One physical line per FunPay product; the offer payment message is sent first."""
+    return code
 
 
 def activation_digest(value: str) -> str:
