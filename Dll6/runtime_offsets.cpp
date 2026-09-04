@@ -333,6 +333,7 @@ bool SetRuntimeField(const char* className, const char* fieldName, uintptr_t& de
 bool InitializeLiveSchemaOffsets(size_t& loaded, size_t required) {
     loaded = 0;
     loaded += SetRuntimeField("CBasePlayerController", "m_hPawn", Offsets::ControllerPawn);
+    loaded += SetRuntimeField("CCitadelPlayerController", "m_hHeroPawn", Offsets::ControllerHeroPawn);
     loaded += SetRuntimeField("CBasePlayerController", "m_bIsLocalPlayerController", Offsets::IsLocalPlayerController);
     loaded += SetRuntimeField("C_BasePlayerPawn", "m_hController", Offsets::PawnController);
     loaded += SetRuntimeField("C_BaseEntity", "m_pGameSceneNode", Offsets::GameSceneNode);
@@ -590,6 +591,7 @@ bool WriteResolvedOffsetSnapshot() {
     DLL6_SNAPSHOT_OFFSET(ViewMatrixProjection);
     DLL6_SNAPSHOT_OFFSET(CameraOrigin);
     DLL6_SNAPSHOT_OFFSET(ControllerPawn);
+    DLL6_SNAPSHOT_OFFSET(ControllerHeroPawn);
     DLL6_SNAPSHOT_OFFSET(IsLocalPlayerController);
     DLL6_SNAPSHOT_OFFSET(PawnController);
     DLL6_SNAPSHOT_OFFSET(HeroComponent);
@@ -767,6 +769,7 @@ bool InitializeRuntimeOffsets() {
     if (!liveSchemaReady) {
         loaded = 0;
         loaded += SetField(fields, "CBasePlayerController.m_hPawn", Offsets::ControllerPawn);
+        loaded += SetField(fields, "CCitadelPlayerController.m_hHeroPawn", Offsets::ControllerHeroPawn);
         loaded += SetField(fields, "CBasePlayerController.m_bIsLocalPlayerController", Offsets::IsLocalPlayerController);
         loaded += SetField(fields, "C_BasePlayerPawn.m_hController", Offsets::PawnController);
         loaded += SetField(fields, "C_BaseEntity.m_pGameSceneNode", Offsets::GameSceneNode);

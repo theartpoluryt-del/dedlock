@@ -651,17 +651,26 @@ std::vector<SpectatorEntry> CollectCurrentSpectators() {
 
     const uint32_t localBaseHandle = Read<uint32_t>(
         localController + Offsets::ControllerPawn);
+    const uint32_t localHeroHandle = Offsets::ControllerHeroPawn
+        ? Read<uint32_t>(localController + Offsets::ControllerHeroPawn)
+        : 0;
     const int localHeroIndex =
-        currentLocalPawnHandle && currentLocalPawnHandle != 0xFFFFFFFFu
-        ? static_cast<int>(currentLocalPawnHandle & Offsets::HandleIndexMask)
-        : currentLocalPawn
-            ? static_cast<int>(FindClientEntityIndex(currentLocalPawn))
-            : -1;
+        localHeroHandle && localHeroHandle != 0xFFFFFFFFu
+        ? static_cast<int>(localHeroHandle & Offsets::HandleIndexMask)
+        : currentLocalPawnHandle && currentLocalPawnHandle != 0xFFFFFFFFu
+            ? static_cast<int>(currentLocalPawnHandle & Offsets::HandleIndexMask)
+            : currentLocalPawn
+                ? static_cast<int>(FindClientEntityIndex(currentLocalPawn))
+                : -1;
     const int localBaseIndex =
         localBaseHandle && localBaseHandle != 0xFFFFFFFFu
         ? static_cast<int>(localBaseHandle & Offsets::HandleIndexMask)
         : -1;
-    const uintptr_t localHeroPawn = currentLocalPawn;
+    // m_hPawn changes to the local observer pawn on death. m_hHeroPawn stays
+    // bound to the player's own hero and is the identity needed here.
+    const uintptr_t resolvedLocalHeroPawn = ResolveEntity(localHeroHandle);
+    const uintptr_t localHeroPawn = resolvedLocalHeroPawn
+        ? resolvedLocalHeroPawn : currentLocalPawn.load(std::memory_order_acquire);
     const uintptr_t localBasePawn = ResolveEntity(localBaseHandle);
     const uint8_t localTeam = Read<uint8_t>(
         localController + Offsets::Team);

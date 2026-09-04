@@ -4136,7 +4136,7 @@ DWORD WINAPI InitializeThread(LPVOID) {
         std::ofstream marker(
             Dll6Paths::DataFileA("Dll6_runtime.marker"),
             std::ios::trunc);
-        if (marker) marker << "axiom-server-module-1.0.53\nclientBase=0x"
+        if (marker) marker << "axiom-server-module-1.0.54\nclientBase=0x"
                            << std::hex << clientBase << "\n";
     }
     printf("[+] client.dll: 0x%p\n", reinterpret_cast<void*>(clientBase));
