@@ -32,8 +32,10 @@ constexpr wchar_t kWindowClass[] = L"AxiomLauncherWindow";
 constexpr wchar_t kWindowTitle[] = L"Axiom Launcher";
 constexpr wchar_t kTargetProcess[] = L"deadlock.exe";
 constexpr wchar_t kSteamLaunchUri[] = L"steam://rungameid/1422450";
+constexpr int kWindowWidth = 460;
 constexpr int kChromeHeight = 38;
 constexpr int kContentLift = 28;
+constexpr int kWindowHeight = 285 + kChromeHeight - kContentLift;
 constexpr UINT kLaunchFinished = WM_APP + 1;
 constexpr UINT kLaunchProgress = WM_APP + 2;
 constexpr DWORD kRemoteCallTimeoutMs = 20000;
@@ -57,6 +59,17 @@ COLORREF g_statusColor{RGB(152, 158, 172)};
 bool g_launching{};
 DWORD g_remoteCallExitCode{};
 bool g_remoteCallTimedOut{};
+UINT g_windowDpi{USER_DEFAULT_SCREEN_DPI};
+
+int ScaleForDpi(int value) {
+    return MulDiv(value, static_cast<int>(g_windowDpi),
+                  USER_DEFAULT_SCREEN_DPI);
+}
+
+float UiScale() {
+    return static_cast<float>(g_windowDpi) /
+           static_cast<float>(USER_DEFAULT_SCREEN_DPI);
+}
 
 struct ScopedHandle {
     HANDLE value{ INVALID_HANDLE_VALUE };
@@ -1023,8 +1036,9 @@ void PaintLauncher(HWND window) {
     HDC targetDc = BeginPaint(window, &paint);
     RECT client{};
     GetClientRect(window, &client);
-    const float width = static_cast<float>(client.right);
-    const float height = static_cast<float>(client.bottom);
+    const float scale = UiScale();
+    const float width = static_cast<float>(client.right) / scale;
+    const float height = static_cast<float>(client.bottom) / scale;
 
     HDC dc = CreateCompatibleDC(targetDc);
     HBITMAP surface = CreateCompatibleBitmap(targetDc, client.right,
@@ -1033,6 +1047,7 @@ void PaintLauncher(HWND window) {
 
     {
     Gdiplus::Graphics graphics(dc);
+    graphics.ScaleTransform(scale, scale);
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     Gdiplus::SolidBrush background(Gdiplus::Color(255, 10, 13, 19));
     graphics.FillRectangle(&background, 0.0f, 0.0f, width, height);
@@ -1132,9 +1147,13 @@ void DrawLaunchButton(const DRAWITEMSTRUCT& item) {
     FillRect(item.hDC, &item.rcItem, backdrop);
     DeleteObject(backdrop);
     Gdiplus::Graphics graphics(item.hDC);
+    const float scale = UiScale();
+    graphics.ScaleTransform(scale, scale);
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    const float width = static_cast<float>(item.rcItem.right - item.rcItem.left);
-    const float height = static_cast<float>(item.rcItem.bottom - item.rcItem.top);
+    const float width =
+        static_cast<float>(item.rcItem.right - item.rcItem.left) / scale;
+    const float height =
+        static_cast<float>(item.rcItem.bottom - item.rcItem.top) / scale;
     Gdiplus::GraphicsPath shape;
     AddRoundedRect(shape, Gdiplus::RectF(0.5f, 0.5f, width - 1.0f,
                                         height - 1.0f), 8.0f);
@@ -1186,6 +1205,10 @@ LRESULT CALLBACK KeyEditWindowProc(HWND control, UINT message, WPARAM wParam,
 int ChromeButtonAt(HWND window, POINT point) {
     RECT client{};
     GetClientRect(window, &client);
+    const float scale = UiScale();
+    point.x = static_cast<LONG>(point.x / scale);
+    point.y = static_cast<LONG>(point.y / scale);
+    client.right = static_cast<LONG>(client.right / scale);
     if (point.y < 0 || point.y >= kChromeHeight) return 0;
     if (point.x >= client.right - 40) return 2;
     if (point.x >= client.right - 80) return 1;
@@ -1195,15 +1218,60 @@ int ChromeButtonAt(HWND window, POINT point) {
 void InvalidateChromeButtons(HWND window) {
     RECT client{};
     GetClientRect(window, &client);
-    RECT buttons{client.right - 80, 0, client.right, kChromeHeight};
+    RECT buttons{client.right - ScaleForDpi(80), 0, client.right,
+                 ScaleForDpi(kChromeHeight)};
     InvalidateRect(window, &buttons, FALSE);
+}
+
+void ApplyLauncherScale(HWND window, UINT dpi) {
+    g_windowDpi = dpi ? dpi : USER_DEFAULT_SCREEN_DPI;
+    HFONT previousFont = g_bodyFont;
+    HFONT scaledFont = CreateFontW(-ScaleForDpi(16), 0, 0, 0, FW_MEDIUM, FALSE,
+        FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    if (scaledFont) g_bodyFont = scaledFont;
+    if (g_keyEdit) {
+        MoveWindow(g_keyEdit, ScaleForDpi(28),
+                   ScaleForDpi(131 + kChromeHeight - kContentLift),
+                   ScaleForDpi(404), ScaleForDpi(36), TRUE);
+        SendMessageW(g_keyEdit, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(g_bodyFont), TRUE);
+        SendMessageW(g_keyEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                     MAKELPARAM(ScaleForDpi(12), ScaleForDpi(12)));
+        RECT keyTextArea{ScaleForDpi(12), ScaleForDpi(7), ScaleForDpi(392),
+                         ScaleForDpi(30)};
+        SendMessageW(g_keyEdit, EM_SETRECTNP, 0,
+                     reinterpret_cast<LPARAM>(&keyTextArea));
+        SetWindowRgn(g_keyEdit, CreateRoundRectRgn(
+            0, 0, ScaleForDpi(404), ScaleForDpi(36), ScaleForDpi(8),
+            ScaleForDpi(8)), TRUE);
+    }
+    if (g_launchButton) {
+        MoveWindow(g_launchButton, ScaleForDpi(24),
+                   ScaleForDpi(190 + kChromeHeight - kContentLift),
+                   ScaleForDpi(412), ScaleForDpi(44), TRUE);
+        SendMessageW(g_launchButton, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(g_bodyFont), TRUE);
+        SetWindowRgn(g_launchButton, CreateRoundRectRgn(
+            0, 0, ScaleForDpi(412), ScaleForDpi(44), ScaleForDpi(10),
+            ScaleForDpi(10)), TRUE);
+    }
+    if (scaledFont && previousFont) DeleteObject(previousFont);
+    RECT client{};
+    GetClientRect(window, &client);
+    SetWindowRgn(window, CreateRoundRectRgn(
+        0, 0, client.right, client.bottom, ScaleForDpi(12), ScaleForDpi(12)),
+        TRUE);
+    InvalidateRect(window, nullptr, TRUE);
 }
 
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
                             LPARAM lParam) {
     switch (message) {
         case WM_CREATE: {
-            g_bodyFont = CreateFontW(-16, 0, 0, 0, FW_MEDIUM, FALSE, FALSE,
+            g_windowDpi = GetDpiForWindow(window);
+            g_bodyFont = CreateFontW(-ScaleForDpi(16), 0, 0, 0, FW_MEDIUM,
+                FALSE, FALSE,
                 FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                 CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
             g_backgroundBrush = CreateSolidBrush(RGB(10, 13, 19));
@@ -1212,7 +1280,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
             g_keyEdit = CreateWindowExW(0, L"EDIT", savedLicense.c_str(),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE |
                     ES_AUTOHSCROLL,
-                28, 131 + kChromeHeight - kContentLift, 404, 36, window,
+                ScaleForDpi(28),
+                ScaleForDpi(131 + kChromeHeight - kContentLift),
+                ScaleForDpi(404), ScaleForDpi(36), window,
                 reinterpret_cast<HMENU>(1001),
                 nullptr, nullptr);
             SendMessageW(g_keyEdit, WM_SETFONT,
@@ -1220,23 +1290,39 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
             SendMessageW(g_keyEdit, EM_SETCUEBANNER, TRUE,
                          reinterpret_cast<LPARAM>(L"XXXX-XXXX-XXXX"));
             SendMessageW(g_keyEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
-                          MAKELPARAM(12, 12));
-            RECT keyTextArea{12, 7, 392, 30};
+                          MAKELPARAM(ScaleForDpi(12), ScaleForDpi(12)));
+            RECT keyTextArea{ScaleForDpi(12), ScaleForDpi(7),
+                             ScaleForDpi(392), ScaleForDpi(30)};
             SendMessageW(g_keyEdit, EM_SETRECTNP, 0,
                          reinterpret_cast<LPARAM>(&keyTextArea));
             g_keyEditProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
                 g_keyEdit, GWLP_WNDPROC,
                 reinterpret_cast<LONG_PTR>(KeyEditWindowProc)));
-            SetWindowRgn(g_keyEdit, CreateRoundRectRgn(0, 0, 404, 36, 8, 8), TRUE);
+            SetWindowRgn(g_keyEdit, CreateRoundRectRgn(
+                0, 0, ScaleForDpi(404), ScaleForDpi(36), ScaleForDpi(8),
+                ScaleForDpi(8)), TRUE);
             g_launchButton = CreateWindowExW(0, L"BUTTON", L"Запустить Axiom",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                24, 190 + kChromeHeight - kContentLift, 412, 44, window,
+                ScaleForDpi(24),
+                ScaleForDpi(190 + kChromeHeight - kContentLift),
+                ScaleForDpi(412), ScaleForDpi(44), window,
                 reinterpret_cast<HMENU>(1002),
                 nullptr, nullptr);
             SendMessageW(g_launchButton, WM_SETFONT,
                           reinterpret_cast<WPARAM>(g_bodyFont), TRUE);
             SetWindowRgn(g_launchButton,
-                         CreateRoundRectRgn(0, 0, 412, 44, 10, 10), TRUE);
+                         CreateRoundRectRgn(0, 0, ScaleForDpi(412),
+                             ScaleForDpi(44), ScaleForDpi(10),
+                             ScaleForDpi(10)), TRUE);
+            return 0;
+        }
+        case WM_DPICHANGED: {
+            const auto* suggested = reinterpret_cast<const RECT*>(lParam);
+            SetWindowPos(window, nullptr, suggested->left, suggested->top,
+                         suggested->right - suggested->left,
+                         suggested->bottom - suggested->top,
+                         SWP_NOACTIVATE | SWP_NOZORDER);
+            ApplyLauncherScale(window, HIWORD(wParam));
             return 0;
         }
         case WM_COMMAND:
@@ -1304,6 +1390,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
             ScreenToClient(window, &point);
             RECT client{};
             GetClientRect(window, &client);
+            const float scale = UiScale();
+            point.x = static_cast<LONG>(point.x / scale);
+            point.y = static_cast<LONG>(point.y / scale);
+            client.right = static_cast<LONG>(client.right / scale);
             if (point.y >= 0 && point.y < kChromeHeight &&
                 point.x < client.right - 80)
                 return HTCAPTION;
@@ -1350,6 +1440,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    g_windowDpi = GetDpiForSystem();
     Gdiplus::GdiplusStartupInput gdiplusInput;
     if (Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr) !=
         Gdiplus::Ok) return 1;
@@ -1373,8 +1464,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         return 1;
     }
 
-    constexpr int width = 460;
-    constexpr int height = 285 + kChromeHeight - kContentLift;
+    const int width = ScaleForDpi(kWindowWidth);
+    const int height = ScaleForDpi(kWindowHeight);
     const int x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
     const int y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
     HWND window = CreateWindowExW(WS_EX_APPWINDOW, kWindowClass, kWindowTitle,
@@ -1384,7 +1475,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         ShutdownBrandGraphics();
         return 1;
     }
-    SetWindowRgn(window, CreateRoundRectRgn(0, 0, width, height, 12, 12), TRUE);
+    SetWindowRgn(window, CreateRoundRectRgn(
+        0, 0, width, height, ScaleForDpi(12), ScaleForDpi(12)), TRUE);
     ShowWindow(window, showCommand);
     UpdateWindow(window);
 
