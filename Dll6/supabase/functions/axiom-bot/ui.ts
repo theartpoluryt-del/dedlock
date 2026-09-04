@@ -56,19 +56,18 @@ const callbacks: Record<Section, string> = {
 const contextSections: Record<Section, Section[][]> = {
   menu: [
     ["download", "buy"],
-    ["activate", "keys"],
-    ["trial"],
+    ["keys", "trial"],
     ["guide", "support"],
     ["language"],
   ],
-  download: [["guide", "keys"], ["support", "menu"]],
-  buy: [["activate", "keys"], ["trial", "menu"]],
-  activate: [["buy", "keys"], ["support", "menu"]],
+  download: [["guide", "menu"]],
+  buy: [["keys", "menu"]],
+  activate: [["keys", "menu"]],
   language: [["menu"]],
-  keys: [["buy", "trial"], ["download", "menu"]],
-  trial: [["keys", "buy"], ["download", "guide"], ["menu"]],
+  keys: [["buy", "download"], ["menu"]],
+  trial: [["download", "menu"]],
   guide: [["download", "keys"], ["support", "menu"]],
-  support: [["guide", "download"], ["menu"]],
+  support: [["guide", "menu"]],
 };
 
 export function normalizeLocale(value: unknown): Locale {

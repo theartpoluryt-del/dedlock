@@ -439,10 +439,6 @@ async function showFunPayOffer(
         text: tr(locale, "🛒 Открыть FunPay", "🛒 Open FunPay"),
         url: plan.purchase_url,
       }],
-      [{
-        text: tr(locale, "🔐 Ввести код", "🔐 Enter code"),
-        callback_data: "nav:activate",
-      }],
     ],
   );
 }
@@ -1059,8 +1055,8 @@ async function showTrialWarning(chatId: number, locale: Locale): Promise<void> {
     chatId,
     tr(
       locale,
-      "<b>⚠️ Перед активацией Trial</b>\n\nПробный период действует <b>3 дня</b> с момента подтверждения. Он доступен один раз для Telegram-аккаунта и один раз для одного ПК. При первом вводе ключа AxiomLauncher безопасно закрепит trial за хешем устройства. Повторный trial с другого аккаунта на том же ПК работать не будет.\n\nОтсчёт начнётся сразу после нажатия кнопки ниже, поэтому сначала рекомендуем скачать и подготовить Axiom Launcher.",
-      "<b>⚠️ Before activating the Trial</b>\n\nThe trial lasts for <b>3 days</b> from confirmation. It is available once per Telegram account and once per PC. When the key is first entered, AxiomLauncher securely binds the trial to a device hash. A trial from another account will not work on the same PC.\n\nThe countdown starts immediately, so we recommend downloading and preparing Axiom Launcher first.",
+      "<b>⚠️ Перед активацией Trial</b>\n\nПробный период можно активировать один раз. Он действует <b>3 дня</b>, а отсчёт начнётся сразу после подтверждения.\n\nПеред продолжением рекомендуем скачать и подготовить лаунчер.",
+      "<b>⚠️ Before activating the Trial</b>\n\nThe trial can be activated once. It lasts for <b>3 days</b>, starting immediately after confirmation.\n\nWe recommend downloading and preparing the launcher first.",
     ),
     locale,
     "trial",

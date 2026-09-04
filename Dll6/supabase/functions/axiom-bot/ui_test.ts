@@ -59,3 +59,22 @@ Deno.test("trial navigation opens the warning, not activation", () => {
   assertEquals(callbacks.includes("nav:trial"), true);
   assertEquals(callbacks.includes("trial:confirm"), false);
 });
+
+Deno.test("navigation does not duplicate the FunPay activation action", () => {
+  for (
+    const section of [
+      "menu",
+      "download",
+      "buy",
+      "keys",
+      "trial",
+      "guide",
+      "support",
+    ] as const
+  ) {
+    const callbacks = navigationKeyboard("ru", section).flat().map((button) =>
+      button.callback_data
+    );
+    assertEquals(callbacks.includes("nav:activate"), false);
+  }
+});
