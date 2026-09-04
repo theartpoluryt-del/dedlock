@@ -457,21 +457,17 @@ async function showActivate(chatId: number, locale: Locale): Promise<void> {
 }
 
 async function showDownload(chatId: number, locale: Locale): Promise<void> {
-  const url = configuredUrl("AXIOM_DOWNLOAD_URL", defaultDownloadUrl);
-  await sendUserMessage(
-    chatId,
-    tr(
+  await telegramCall("sendDocument", {
+    chat_id: chatId,
+    document: requiredSecret("AXIOM_LAUNCHER_FILE_ID"),
+    caption: tr(
       locale,
-      "<b>⬇️ Скачать Axiom Launcher</b>\n\nНажмите кнопку ниже — актуальный лаунчер откроется для скачивания в браузере.",
-      "<b>⬇️ Download Axiom Launcher</b>\n\nTap the button below to download the latest launcher in your browser.",
+      "<b>⬇️ Axiom Launcher</b>\n\nСкачайте прикреплённый файл и следуйте инструкции по запуску.",
+      "<b>⬇️ Axiom Launcher</b>\n\nDownload the attached file and follow the launch guide.",
     ),
-    locale,
-    "download",
-    [[{
-      text: tr(locale, "⬇️ Скачать лаунчер", "⬇️ Download launcher"),
-      url,
-    }]],
-  );
+    parse_mode: "HTML",
+    ...controls(locale, "download"),
+  });
 }
 
 async function showLanguage(chatId: number, locale: Locale): Promise<void> {
