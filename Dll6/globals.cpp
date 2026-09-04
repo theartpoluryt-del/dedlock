@@ -7,6 +7,58 @@
 #include <fstream>
 #include <iterator>
 #include <sstream>
+
+namespace {
+std::mutex embeddedResourceMutex;
+std::unordered_map<UINT, std::vector<unsigned char>> embeddedResources;
+bool embeddedResourcesCached = false;
+
+BOOL CALLBACK CacheResourceName(HMODULE module, LPCWSTR type, LPWSTR name,
+                                LONG_PTR parameter) {
+    if (!IS_INTRESOURCE(name)) return TRUE;
+    auto* resources = reinterpret_cast<
+        std::unordered_map<UINT, std::vector<unsigned char>>*>(parameter);
+    const HRSRC resource = FindResourceW(module, name, type);
+    const HGLOBAL loaded = resource ? LoadResource(module, resource) : nullptr;
+    const DWORD size = resource ? SizeofResource(module, resource) : 0;
+    const auto* bytes = loaded
+        ? static_cast<const unsigned char*>(LockResource(loaded)) : nullptr;
+    if (bytes && size) {
+        (*resources)[static_cast<UINT>(reinterpret_cast<ULONG_PTR>(name))]
+            .assign(bytes, bytes + size);
+    }
+    return TRUE;
+}
+}
+
+bool CacheEmbeddedResources() {
+    std::lock_guard<std::mutex> lock(embeddedResourceMutex);
+    if (embeddedResourcesCached) return !embeddedResources.empty();
+    if (!moduleHandle) return false;
+
+    std::unordered_map<UINT, std::vector<unsigned char>> resources;
+    if (!EnumResourceNamesW(moduleHandle, RT_RCDATA, CacheResourceName,
+                            reinterpret_cast<LONG_PTR>(&resources)) ||
+        resources.empty()) {
+        return false;
+    }
+    embeddedResources.swap(resources);
+    embeddedResourcesCached = true;
+    return true;
+}
+
+bool GetEmbeddedResource(UINT resourceId, const void*& bytes, DWORD& size) {
+    bytes = nullptr;
+    size = 0;
+    std::lock_guard<std::mutex> lock(embeddedResourceMutex);
+    const auto resource = embeddedResources.find(resourceId);
+    if (resource == embeddedResources.end() || resource->second.empty())
+        return false;
+    bytes = resource->second.data();
+    size = static_cast<DWORD>(resource->second.size());
+    return true;
+}
+
 bool freeCam=false;
 bool disableDrifterDarkness=false;
 bool autoActiveReload=false;
@@ -399,12 +451,9 @@ void ApplyPendingConfigRestore(const std::string& destination) {
 }
 
 bool ExtractBundledDefaultConfig(const std::string& path) {
-    const HRSRC resource = FindResourceW(
-        moduleHandle, MAKEINTRESOURCEW(IDR_DEFAULT_CONFIG), RT_RCDATA);
-    const HGLOBAL loaded = resource ? LoadResource(moduleHandle, resource) : nullptr;
-    const DWORD size = resource ? SizeofResource(moduleHandle, resource) : 0;
-    const void* bytes = loaded ? LockResource(loaded) : nullptr;
-    if (!bytes || !size) return false;
+    const void* bytes = nullptr;
+    DWORD size = 0;
+    if (!GetEmbeddedResource(IDR_DEFAULT_CONFIG, bytes, size)) return false;
 
     const HANDLE file = CreateFileA(
         path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW,

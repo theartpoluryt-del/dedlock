@@ -1558,16 +1558,13 @@ bool EnsureFactories() {
 bool LoadEmbeddedBitmap(UINT resourceId, ComPtr<ID2D1Bitmap>& output,
                         bool tintBlack = false) {
     if (output) return true;
-    if (!moduleHandle || !g.wicFactory || !g.target) return false;
+    if (!g.wicFactory || !g.target) return false;
 
-    HRSRC resource = FindResourceW(moduleHandle, MAKEINTRESOURCEW(resourceId),
-                                   MAKEINTRESOURCEW(10));
-    if (!resource) return false;
-    HGLOBAL loaded = LoadResource(moduleHandle, resource);
-    if (!loaded) return false;
-    void* bytes = LockResource(loaded);
-    const DWORD size = SizeofResource(moduleHandle, resource);
-    if (!bytes || !size) return false;
+    const void* resourceBytes = nullptr;
+    DWORD size = 0;
+    if (!GetEmbeddedResource(resourceId, resourceBytes, size)) return false;
+    auto* bytes = const_cast<BYTE*>(
+        static_cast<const BYTE*>(resourceBytes));
 
     ComPtr<IWICStream> stream;
     ComPtr<IWICBitmapDecoder> decoder;
