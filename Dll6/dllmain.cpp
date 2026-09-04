@@ -68,5 +68,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved) {
 
 extern "C" __declspec(dllexport)
 DWORD WINAPI AxiomManualMapInitialize(LPVOID) {
+    if (!CacheEmbeddedResources()) return ERROR_RESOURCE_DATA_NOT_FOUND;
     return InitializeThread(nullptr);
 }
