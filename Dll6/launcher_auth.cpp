@@ -28,7 +28,6 @@ namespace {
 
 constexpr wchar_t kDefaultApiBase[] =
     L"https://vljgmubfztmxsyiwrity.supabase.co/functions/v1/axiom-license";
-constexpr wchar_t kLauncherVersion[] = L"1.0.2";
 constexpr size_t kMaximumResponseBytes = 32u * 1024u * 1024u;
 constexpr std::array<unsigned char, 64> kServerPublicKey{
     0xc2,0x77,0xec,0x30,0xa5,0x9c,0x5e,0x87,
