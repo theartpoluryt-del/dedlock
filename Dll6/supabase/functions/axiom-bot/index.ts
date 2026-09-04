@@ -150,7 +150,14 @@ async function botCall(
 ): Promise<unknown> {
   const response = await botApi(token, method, body);
   const payload = await response.json();
-  if (!response.ok || !payload.ok) throw new Error(`Telegram ${method} failed`);
+  if (!response.ok || !payload.ok) {
+    const description = typeof payload.description === "string"
+      ? payload.description
+      : "unknown Telegram error";
+    throw new Error(
+      `Telegram ${method} failed (${response.status}): ${description}`,
+    );
+  }
   return payload.result;
 }
 
@@ -457,17 +464,31 @@ async function showActivate(chatId: number, locale: Locale): Promise<void> {
 }
 
 async function showDownload(chatId: number, locale: Locale): Promise<void> {
-  await telegramCall("sendDocument", {
-    chat_id: chatId,
-    document: requiredSecret("AXIOM_LAUNCHER_FILE_ID"),
-    caption: tr(
+  try {
+    await telegramCall("sendDocument", {
+      chat_id: chatId,
+      document: requiredSecret("AXIOM_LAUNCHER_FILE_ID"),
+      caption: tr(
+        locale,
+        "<b>⬇️ Axiom Launcher</b>\n\nСкачайте прикреплённый файл и следуйте инструкции по запуску.",
+        "<b>⬇️ Axiom Launcher</b>\n\nDownload the attached file and follow the launch guide.",
+      ),
+      parse_mode: "HTML",
+      ...controls(locale, "download"),
+    });
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : error);
+    await sendUserMessage(
+      chatId,
+      tr(
+        locale,
+        "<b>⚠️ Файл временно недоступен</b>\n\nПопробуйте /download немного позже.",
+        "<b>⚠️ File temporarily unavailable</b>\n\nPlease try /download again later.",
+      ),
       locale,
-      "<b>⬇️ Axiom Launcher</b>\n\nСкачайте прикреплённый файл и следуйте инструкции по запуску.",
-      "<b>⬇️ Axiom Launcher</b>\n\nDownload the attached file and follow the launch guide.",
-    ),
-    parse_mode: "HTML",
-    ...controls(locale, "download"),
-  });
+      "download",
+    );
+  }
 }
 
 async function showLanguage(chatId: number, locale: Locale): Promise<void> {
