@@ -3628,19 +3628,6 @@ void RenderD2DMenu(std::size_t playerCount) {
             DrawSlider(l, leftX, firstY + 214, columnWidth, L"Freecam speed",
                        &freeCamSpeed, 50.0f, 5000.0f, L"%.0f u/s");
         }
-        DrawSectionHeading(leftX, firstY + 300, columnWidth, L"Movement Lab");
-        DrawToggle(l, leftX, firstY + 340, columnWidth, L"Record Bot2 pass",
-                   L"Save one completed Bot2 route automatically",
-                   &movementProbeEnabled);
-        DrawToggle(l, leftX, firstY + 394, columnWidth, L"Replay last pass",
-                   L"Calibrate and repeat the latest saved route",
-                   &movementReplayEnabled);
-        if (movementReplayEnabled) {
-            DrawKeyBind(l, leftX, firstY + 448, columnWidth,
-                        movementReplayKeyCapture, movementReplayKey,
-                        &movementReplayKeyCapture);
-        }
-
         DrawToggle(l, rightX, firstY, rightColumnWidth, L"FOV Changer",
                    L"Override the normal camera field of view", &fovChangerEnabled);
         DrawSlider(l, rightX, firstY + 54, rightColumnWidth, L"Camera FOV",
