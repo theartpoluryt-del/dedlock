@@ -14,9 +14,11 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "launcher_auth.h"
@@ -58,6 +60,15 @@ COLORREF g_statusColor{RGB(152, 158, 172)};
 bool g_launching{};
 DWORD g_remoteCallExitCode{};
 bool g_remoteCallTimedOut{};
+
+// Kept only in the launcher process for the current run. It is never written
+// into the mapped image or any named object in the target process.
+struct ManualMapAllocation {
+    uintptr_t base{};
+    uintptr_t exceptionTable{};
+};
+std::mutex g_manualMapAllocationsMutex;
+std::unordered_map<DWORD, ManualMapAllocation> g_manualMapAllocations;
 
 struct ScopedHandle {
     HANDLE value{ INVALID_HANDLE_VALUE };
@@ -481,8 +492,10 @@ DWORD SectionProtection(DWORD characteristics) {
 }
 
 bool ManualMapInject(HANDLE process, const uint8_t* dllData, size_t dllSize,
-                     uintptr_t& baseAddress, std::wstring& detail) {
+                     uintptr_t& baseAddress, uintptr_t& exceptionTableOut,
+                     std::wstring& detail) {
     baseAddress = 0;
+    exceptionTableOut = 0;
     detail.clear();
     const auto reject = [&](const wchar_t* stage) {
         detail = L"Manual Map: " + std::wstring(stage);
@@ -805,6 +818,7 @@ bool ManualMapInject(HANDLE process, const uint8_t* dllData, size_t dllSize,
         }
     }
 
+    exceptionTableOut = exceptionTable;
     return true;
 }
 
@@ -892,23 +906,13 @@ uintptr_t ReadManualMapBase(DWORD processId, ScopedHandle& mapping) {
     return base;
 }
 
-bool ReleaseManualMappedImage(DWORD processId, uintptr_t baseAddress) {
+bool ReleaseManualMappedImage(DWORD processId, uintptr_t baseAddress,
+                              uintptr_t exceptionTable) {
     ScopedHandle process(OpenProcess(PROCESS_CREATE_THREAD |
         PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
         PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, processId));
     if (!process.valid()) return false;
-    IMAGE_DOS_HEADER dos{};
-    IMAGE_NT_HEADERS64 nt{};
-    if (!ReadProcessMemory(process, reinterpret_cast<void*>(baseAddress),
-                           &dos, sizeof(dos), nullptr) ||
-        dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 0 ||
-        !ReadProcessMemory(process,
-            reinterpret_cast<void*>(baseAddress + dos.e_lfanew),
-            &nt, sizeof(nt), nullptr) || nt.Signature != IMAGE_NT_SIGNATURE)
-        return false;
-    const auto& exceptionDirectory =
-        nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
-    if (exceptionDirectory.VirtualAddress && exceptionDirectory.Size) {
+    if (exceptionTable) {
         const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         const FARPROC deleteFunctionTable = ntdll
             ? GetProcAddress(ntdll, "RtlDeleteFunctionTable") : nullptr;
@@ -916,7 +920,7 @@ bool ReleaseManualMappedImage(DWORD processId, uintptr_t baseAddress) {
             ? RemoteAddressForLocal(processId, deleteFunctionTable) : 0;
         uintptr_t removed = 0;
         if (!remoteDelete || !RemoteCall3(process, remoteDelete,
-                baseAddress + exceptionDirectory.VirtualAddress,
+                exceptionTable,
                 0, 0, removed) || !removed) return false;
     }
     return VirtualFreeEx(process, reinterpret_cast<void*>(baseAddress), 0,
@@ -950,6 +954,17 @@ bool UnloadPayload(DWORD processId, std::wstring& error) {
     if (!IsPayloadLoaded(processId)) return true;
     ScopedHandle manualMapInfo;
     const uintptr_t manualMapBase = ReadManualMapBase(processId, manualMapInfo);
+    ManualMapAllocation allocation{};
+    bool allocationOwned = false;
+    {
+        std::scoped_lock lock(g_manualMapAllocationsMutex);
+        const auto found = g_manualMapAllocations.find(processId);
+        if (found != g_manualMapAllocations.end() &&
+            found->second.base == manualMapBase) {
+            allocation = found->second;
+            allocationOwned = true;
+        }
+    }
     const HWND window = FindGameWindow(processId);
     if (!window) {
         error = L"Не удалось найти окно Deadlock для выгрузки DLL.";
@@ -966,9 +981,19 @@ bool UnloadPayload(DWORD processId, std::wstring& error) {
         if (!IsPayloadLoaded(processId)) {
             if (manualMapBase) {
                 Sleep(100);
-                if (!ReleaseManualMappedImage(processId, manualMapBase)) {
+                // A payload injected by a prior launcher instance has already
+                // shut down, but its headers are intentionally unavailable.
+                // Leave that inert allocation alone instead of reading or
+                // recreating PE metadata. The current launcher tracks only
+                // allocations it created and can release those safely.
+                if (allocationOwned && !ReleaseManualMappedImage(
+                        processId, manualMapBase, allocation.exceptionTable)) {
                     error = L"DLL завершила работу, но её образ не удалось освободить.";
                     return false;
+                }
+                if (allocationOwned) {
+                    std::scoped_lock lock(g_manualMapAllocationsMutex);
+                    g_manualMapAllocations.erase(processId);
                 }
             }
             return true;
@@ -1045,13 +1070,19 @@ bool LoadPayload(DWORD processId, const std::filesystem::path& dllPath,
 
     // Manual Map инжект
     uintptr_t baseAddress = 0;
+    uintptr_t exceptionTable = 0;
     if (!ManualMapInject(process, dllData.data(), dllData.size(), baseAddress,
+                         exceptionTable,
                          error)) {
         if (error.empty()) error = L"Manual Map инжект не удался.";
         return false;
     }
 
     ErasePEHeaders(process, baseAddress);
+    {
+        std::scoped_lock lock(g_manualMapAllocationsMutex);
+        g_manualMapAllocations[processId] = { baseAddress, exceptionTable };
+    }
 
     // Ждём готовности DLL (по событию)
     const ULONGLONG readyDeadline = GetTickCount64() + 20000;
