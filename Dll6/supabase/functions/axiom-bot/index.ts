@@ -1536,7 +1536,6 @@ async function handleSupportTelegram(
   ) {
     return new Response("unauthorized", { status: 401 });
   }
-  await ensureSupportWebhook();
   const update = await request.json() as TelegramUpdate;
   const callback = update.callback_query;
   const message = update.message;
@@ -1594,7 +1593,6 @@ async function handleTelegram(
   if (request.headers.get("x-telegram-bot-api-secret-token") !== expected) {
     return new Response("unauthorized", { status: 401 });
   }
-  await ensureTelegramWebhook();
   const update = await request.json() as TelegramUpdate;
   if (update.pre_checkout_query) {
     await handlePreCheckout(supabase, update.pre_checkout_query);
@@ -1681,7 +1679,6 @@ Deno.serve(async (request) => {
   try {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname.endsWith("/health")) {
-      await Promise.all([ensureTelegramWebhook(), ensureSupportWebhook()]);
       return Response.json({
         ok: true,
         payment_provider: Deno.env.get("PAYMENT_PROVIDER") ?? "disabled",
