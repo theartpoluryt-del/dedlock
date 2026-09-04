@@ -33,8 +33,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved) {
                 void* view = MapViewOfFile(manualMapInfoHandle, FILE_MAP_WRITE,
                                            0, 0, sizeof(uintptr_t));
                 if (view) {
-                    *static_cast<uintptr_t*>(view) =
-                        reinterpret_cast<uintptr_t>(hModule);
+                    *static_cast<uintptr_t*>(view) = reinterpret_cast<uintptr_t>(hModule);
                     UnmapViewOfFile(view);
                 }
             }

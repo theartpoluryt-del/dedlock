@@ -32,10 +32,8 @@ constexpr wchar_t kWindowClass[] = L"AxiomLauncherWindow";
 constexpr wchar_t kWindowTitle[] = L"Axiom Launcher";
 constexpr wchar_t kTargetProcess[] = L"deadlock.exe";
 constexpr wchar_t kSteamLaunchUri[] = L"steam://rungameid/1422450";
-constexpr int kWindowWidth = 460;
 constexpr int kChromeHeight = 38;
 constexpr int kContentLift = 28;
-constexpr int kWindowHeight = 285 + kChromeHeight - kContentLift;
 constexpr UINT kLaunchFinished = WM_APP + 1;
 constexpr UINT kLaunchProgress = WM_APP + 2;
 constexpr DWORD kRemoteCallTimeoutMs = 20000;
@@ -60,33 +58,6 @@ COLORREF g_statusColor{RGB(152, 158, 172)};
 bool g_launching{};
 DWORD g_remoteCallExitCode{};
 bool g_remoteCallTimedOut{};
-UINT g_windowDpi{USER_DEFAULT_SCREEN_DPI};
-
-int ScaleForDpi(int value) {
-    return MulDiv(value, static_cast<int>(g_windowDpi),
-                  USER_DEFAULT_SCREEN_DPI);
-}
-
-float UiScale() {
-    return static_cast<float>(g_windowDpi) /
-           static_cast<float>(USER_DEFAULT_SCREEN_DPI);
-}
-
-UINT EffectiveUiDpi(UINT dpi, HMONITOR monitor) {
-    MONITORINFO info{sizeof(info)};
-    if (!monitor || !GetMonitorInfoW(monitor, &info)) {
-        return (std::max)(dpi, static_cast<UINT>(USER_DEFAULT_SCREEN_DPI));
-    }
-    const int width = info.rcMonitor.right - info.rcMonitor.left;
-    const int height = info.rcMonitor.bottom - info.rcMonitor.top;
-    const UINT resolutionDpi = static_cast<UINT>((std::min)(
-        MulDiv(width, USER_DEFAULT_SCREEN_DPI, 1920),
-        MulDiv(height, USER_DEFAULT_SCREEN_DPI, 1080)));
-    return std::clamp(
-        (std::max)(dpi, resolutionDpi),
-        static_cast<UINT>(USER_DEFAULT_SCREEN_DPI),
-        static_cast<UINT>(USER_DEFAULT_SCREEN_DPI * 3));
-}
 
 struct ScopedHandle {
     HANDLE value{ INVALID_HANDLE_VALUE };
@@ -117,6 +88,147 @@ uintptr_t FindRemoteModule(DWORD processId, std::wstring_view moduleName) {
 
 bool FitsIn(size_t offset, size_t size, size_t total) {
     return offset <= total && size <= total - offset;
+}
+
+bool RvaToFileOffset(const IMAGE_NT_HEADERS64& nt,
+                     const IMAGE_SECTION_HEADER* sections, size_t sectionCount,
+                     DWORD rva, size_t fileSize, size_t& offset) {
+    if (rva < nt.OptionalHeader.SizeOfHeaders) {
+        offset = rva;
+        return offset < fileSize;
+    }
+    for (size_t index = 0; index < sectionCount; ++index) {
+        const auto& section = sections[index];
+        const DWORD sectionSize = (std::max)(section.Misc.VirtualSize,
+                                             section.SizeOfRawData);
+        if (rva < section.VirtualAddress ||
+            rva - section.VirtualAddress >= sectionSize) continue;
+        const size_t relative = rva - section.VirtualAddress;
+        if (relative >= section.SizeOfRawData) return false;
+        offset = static_cast<size_t>(section.PointerToRawData) + relative;
+        return offset < fileSize;
+    }
+    return false;
+}
+
+bool ExtractPayloadResources(const std::vector<uint8_t>& dllData,
+                             std::wstring& error) {
+    if (!FitsIn(0, sizeof(IMAGE_DOS_HEADER), dllData.size())) return false;
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(dllData.data());
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0) return false;
+    const size_t ntOffset = static_cast<size_t>(dos->e_lfanew);
+    if (!FitsIn(ntOffset, sizeof(IMAGE_NT_HEADERS64), dllData.size())) return false;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(dllData.data() + ntOffset);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+    const size_t sectionOffset = ntOffset + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) +
+        nt->FileHeader.SizeOfOptionalHeader;
+    const size_t sectionCount = nt->FileHeader.NumberOfSections;
+    if (!FitsIn(sectionOffset, sectionCount * sizeof(IMAGE_SECTION_HEADER), dllData.size()))
+        return false;
+    const auto* sections = reinterpret_cast<const IMAGE_SECTION_HEADER*>(dllData.data() + sectionOffset);
+    const auto& resourceDirectory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE];
+    size_t resourceOffset = 0;
+    if (!resourceDirectory.VirtualAddress || !resourceDirectory.Size ||
+        !RvaToFileOffset(*nt, sections, sectionCount, resourceDirectory.VirtualAddress,
+                         dllData.size(), resourceOffset) ||
+        !FitsIn(resourceOffset, resourceDirectory.Size, dllData.size())) {
+        error = L"В загруженной DLL не найдены ресурсы интерфейса.";
+        return false;
+    }
+    const auto resourceAt = [&](DWORD offset, size_t size) -> const uint8_t* {
+        if (offset > resourceDirectory.Size || size > resourceDirectory.Size - offset)
+            return nullptr;
+        return dllData.data() + resourceOffset + offset;
+    };
+    const auto entriesOf = [&](DWORD offset, const IMAGE_RESOURCE_DIRECTORY*& directory,
+                               const IMAGE_RESOURCE_DIRECTORY_ENTRY*& entries,
+                               DWORD& count) -> bool {
+        directory = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY*>(
+            resourceAt(offset, sizeof(IMAGE_RESOURCE_DIRECTORY)));
+        if (!directory) return false;
+        count = directory->NumberOfNamedEntries + directory->NumberOfIdEntries;
+        entries = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY_ENTRY*>(resourceAt(
+            offset + sizeof(IMAGE_RESOURCE_DIRECTORY),
+            static_cast<size_t>(count) * sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY)));
+        return entries != nullptr;
+    };
+    const IMAGE_RESOURCE_DIRECTORY* root = nullptr;
+    const IMAGE_RESOURCE_DIRECTORY_ENTRY* rootEntries = nullptr;
+    DWORD rootCount = 0;
+    if (!entriesOf(0, root, rootEntries, rootCount)) return false;
+    const IMAGE_RESOURCE_DIRECTORY_ENTRY* rcdata = nullptr;
+    for (DWORD index = root->NumberOfNamedEntries; index < rootCount; ++index) {
+        if (!rootEntries[index].NameIsString && rootEntries[index].Id == 10 &&
+            rootEntries[index].DataIsDirectory) {
+            rcdata = &rootEntries[index];
+            break;
+        }
+    }
+    if (!rcdata) {
+        error = L"В загруженной DLL отсутствуют данные интерфейса.";
+        return false;
+    }
+    const IMAGE_RESOURCE_DIRECTORY* names = nullptr;
+    const IMAGE_RESOURCE_DIRECTORY_ENTRY* nameEntries = nullptr;
+    DWORD nameCount = 0;
+    if (!entriesOf(rcdata->OffsetToDirectory, names, nameEntries, nameCount)) return false;
+    wchar_t localAppData[MAX_PATH]{};
+    const DWORD localAppDataLength = GetEnvironmentVariableW(
+        L"LOCALAPPDATA", localAppData, static_cast<DWORD>(std::size(localAppData)));
+    const auto assetDirectory = std::filesystem::path(
+        localAppDataLength && localAppDataLength < std::size(localAppData)
+            ? std::wstring(localAppData, localAppDataLength) : std::wstring(L".")) /
+        L"Axiom" / L"assets";
+    std::error_code fsError;
+    std::filesystem::create_directories(assetDirectory, fsError);
+    if (fsError) {
+        error = L"Не удалось создать папку ресурсов Axiom.";
+        return false;
+    }
+    size_t extracted = 0;
+    bool required[4]{};
+    for (DWORD index = names->NumberOfNamedEntries; index < nameCount; ++index) {
+        const auto& name = nameEntries[index];
+        if (name.NameIsString || !name.DataIsDirectory) continue;
+        const IMAGE_RESOURCE_DIRECTORY* languages = nullptr;
+        const IMAGE_RESOURCE_DIRECTORY_ENTRY* languageEntries = nullptr;
+        DWORD languageCount = 0;
+        if (!entriesOf(name.OffsetToDirectory, languages, languageEntries, languageCount) ||
+            !languageCount || languageEntries[0].DataIsDirectory) continue;
+        const auto* data = reinterpret_cast<const IMAGE_RESOURCE_DATA_ENTRY*>(
+            resourceAt(languageEntries[0].OffsetToData, sizeof(IMAGE_RESOURCE_DATA_ENTRY)));
+        size_t dataOffset = 0;
+        if (!data || !data->Size || !RvaToFileOffset(*nt, sections, sectionCount,
+            data->OffsetToData, dllData.size(), dataOffset) ||
+            !FitsIn(dataOffset, data->Size, dllData.size())) continue;
+        const auto finalPath = assetDirectory / (L"res_" + std::to_wstring(name.Id) + L".bin");
+        const auto temporaryPath = finalPath.wstring() + L".tmp";
+        {
+            std::ofstream output(temporaryPath, std::ios::binary | std::ios::trunc);
+            if (!output.write(reinterpret_cast<const char*>(dllData.data() + dataOffset), data->Size)) {
+                DeleteFileW(temporaryPath.c_str());
+                error = L"Не удалось записать ресурс интерфейса.";
+                return false;
+            }
+        }
+        if (!MoveFileExW(temporaryPath.c_str(), finalPath.c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            DeleteFileW(temporaryPath.c_str());
+            error = L"Не удалось обновить ресурс интерфейса.";
+            return false;
+        }
+        ++extracted;
+        if (name.Id == 101) required[0] = true;
+        if (name.Id == 108) required[1] = true;
+        if (name.Id == 300) required[2] = true;
+        if (name.Id == 476) required[3] = true;
+    }
+    if (extracted < 4 || !required[0] || !required[1] || !required[2] || !required[3]) {
+        error = L"Не все ресурсы интерфейса удалось подготовить.";
+        return false;
+    }
+    return true;
 }
 
 bool ErasePEHeaders(HANDLE process, uintptr_t baseAddress) {
@@ -924,6 +1036,13 @@ bool LoadPayload(DWORD processId, const std::filesystem::path& dllPath,
         return false;
     }
 
+    // Ресурсы извлекаются из проверенной доставленной DLL до manual map.
+    // После очистки PE-заголовков DLL читает только эти внешние файлы.
+    if (!ExtractPayloadResources(dllData, error)) {
+        if (error.empty()) error = L"Не удалось подготовить ресурсы интерфейса.";
+        return false;
+    }
+
     // Manual Map инжект
     uintptr_t baseAddress = 0;
     if (!ManualMapInject(process, dllData.data(), dllData.size(), baseAddress,
@@ -1080,9 +1199,8 @@ void PaintLauncher(HWND window) {
     HDC targetDc = BeginPaint(window, &paint);
     RECT client{};
     GetClientRect(window, &client);
-    const float scale = UiScale();
-    const float width = static_cast<float>(client.right) / scale;
-    const float height = static_cast<float>(client.bottom) / scale;
+    const float width = static_cast<float>(client.right);
+    const float height = static_cast<float>(client.bottom);
 
     HDC dc = CreateCompatibleDC(targetDc);
     HBITMAP surface = CreateCompatibleBitmap(targetDc, client.right,
@@ -1091,7 +1209,6 @@ void PaintLauncher(HWND window) {
 
     {
     Gdiplus::Graphics graphics(dc);
-    graphics.ScaleTransform(scale, scale);
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     Gdiplus::SolidBrush background(Gdiplus::Color(255, 10, 13, 19));
     graphics.FillRectangle(&background, 0.0f, 0.0f, width, height);
@@ -1204,13 +1321,9 @@ void DrawLaunchButton(const DRAWITEMSTRUCT& item) {
     FillRect(item.hDC, &item.rcItem, backdrop);
     DeleteObject(backdrop);
     Gdiplus::Graphics graphics(item.hDC);
-    const float scale = UiScale();
-    graphics.ScaleTransform(scale, scale);
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    const float width =
-        static_cast<float>(item.rcItem.right - item.rcItem.left) / scale;
-    const float height =
-        static_cast<float>(item.rcItem.bottom - item.rcItem.top) / scale;
+    const float width = static_cast<float>(item.rcItem.right - item.rcItem.left);
+    const float height = static_cast<float>(item.rcItem.bottom - item.rcItem.top);
     Gdiplus::GraphicsPath shape;
     AddRoundedRect(shape, Gdiplus::RectF(0.5f, 0.5f, width - 1.0f,
                                         height - 1.0f), 8.0f);
@@ -1262,10 +1375,6 @@ LRESULT CALLBACK KeyEditWindowProc(HWND control, UINT message, WPARAM wParam,
 int ChromeButtonAt(HWND window, POINT point) {
     RECT client{};
     GetClientRect(window, &client);
-    const float scale = UiScale();
-    point.x = static_cast<LONG>(point.x / scale);
-    point.y = static_cast<LONG>(point.y / scale);
-    client.right = static_cast<LONG>(client.right / scale);
     if (point.y < 0 || point.y >= kChromeHeight) return 0;
     if (point.x >= client.right - 40) return 2;
     if (point.x >= client.right - 80) return 1;
@@ -1275,62 +1384,15 @@ int ChromeButtonAt(HWND window, POINT point) {
 void InvalidateChromeButtons(HWND window) {
     RECT client{};
     GetClientRect(window, &client);
-    RECT buttons{client.right - ScaleForDpi(80), 0, client.right,
-                 ScaleForDpi(kChromeHeight)};
+    RECT buttons{client.right - 80, 0, client.right, kChromeHeight};
     InvalidateRect(window, &buttons, FALSE);
-}
-
-void ApplyLauncherScale(HWND window, UINT dpi) {
-    g_windowDpi = dpi ? dpi : USER_DEFAULT_SCREEN_DPI;
-    HFONT previousFont = g_bodyFont;
-    HFONT scaledFont = CreateFontW(-ScaleForDpi(16), 0, 0, 0, FW_MEDIUM, FALSE,
-        FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    if (scaledFont) g_bodyFont = scaledFont;
-    if (g_keyEdit) {
-        MoveWindow(g_keyEdit, ScaleForDpi(28),
-                   ScaleForDpi(131 + kChromeHeight - kContentLift),
-                   ScaleForDpi(404), ScaleForDpi(36), TRUE);
-        SendMessageW(g_keyEdit, WM_SETFONT,
-                     reinterpret_cast<WPARAM>(g_bodyFont), TRUE);
-        SendMessageW(g_keyEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
-                     MAKELPARAM(ScaleForDpi(12), ScaleForDpi(12)));
-        RECT keyTextArea{ScaleForDpi(12), ScaleForDpi(7), ScaleForDpi(392),
-                         ScaleForDpi(30)};
-        SendMessageW(g_keyEdit, EM_SETRECTNP, 0,
-                     reinterpret_cast<LPARAM>(&keyTextArea));
-        SetWindowRgn(g_keyEdit, CreateRoundRectRgn(
-            0, 0, ScaleForDpi(404), ScaleForDpi(36), ScaleForDpi(8),
-            ScaleForDpi(8)), TRUE);
-    }
-    if (g_launchButton) {
-        MoveWindow(g_launchButton, ScaleForDpi(24),
-                   ScaleForDpi(190 + kChromeHeight - kContentLift),
-                   ScaleForDpi(412), ScaleForDpi(44), TRUE);
-        SendMessageW(g_launchButton, WM_SETFONT,
-                     reinterpret_cast<WPARAM>(g_bodyFont), TRUE);
-        SetWindowRgn(g_launchButton, CreateRoundRectRgn(
-            0, 0, ScaleForDpi(412), ScaleForDpi(44), ScaleForDpi(10),
-            ScaleForDpi(10)), TRUE);
-    }
-    if (scaledFont && previousFont) DeleteObject(previousFont);
-    RECT client{};
-    GetClientRect(window, &client);
-    SetWindowRgn(window, CreateRoundRectRgn(
-        0, 0, client.right, client.bottom, ScaleForDpi(12), ScaleForDpi(12)),
-        TRUE);
-    InvalidateRect(window, nullptr, TRUE);
 }
 
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
                             LPARAM lParam) {
     switch (message) {
         case WM_CREATE: {
-            g_windowDpi = EffectiveUiDpi(
-                GetDpiForWindow(window),
-                MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST));
-            g_bodyFont = CreateFontW(-ScaleForDpi(16), 0, 0, 0, FW_MEDIUM,
-                FALSE, FALSE,
+            g_bodyFont = CreateFontW(-16, 0, 0, 0, FW_MEDIUM, FALSE, FALSE,
                 FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                 CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
             g_backgroundBrush = CreateSolidBrush(RGB(10, 13, 19));
@@ -1339,9 +1401,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
             g_keyEdit = CreateWindowExW(0, L"EDIT", savedLicense.c_str(),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE |
                     ES_AUTOHSCROLL,
-                ScaleForDpi(28),
-                ScaleForDpi(131 + kChromeHeight - kContentLift),
-                ScaleForDpi(404), ScaleForDpi(36), window,
+                28, 131 + kChromeHeight - kContentLift, 404, 36, window,
                 reinterpret_cast<HMENU>(1001),
                 nullptr, nullptr);
             SendMessageW(g_keyEdit, WM_SETFONT,
@@ -1349,43 +1409,23 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
             SendMessageW(g_keyEdit, EM_SETCUEBANNER, TRUE,
                          reinterpret_cast<LPARAM>(L"XXXX-XXXX-XXXX"));
             SendMessageW(g_keyEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
-                          MAKELPARAM(ScaleForDpi(12), ScaleForDpi(12)));
-            RECT keyTextArea{ScaleForDpi(12), ScaleForDpi(7),
-                             ScaleForDpi(392), ScaleForDpi(30)};
+                          MAKELPARAM(12, 12));
+            RECT keyTextArea{12, 7, 392, 30};
             SendMessageW(g_keyEdit, EM_SETRECTNP, 0,
                          reinterpret_cast<LPARAM>(&keyTextArea));
             g_keyEditProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
                 g_keyEdit, GWLP_WNDPROC,
                 reinterpret_cast<LONG_PTR>(KeyEditWindowProc)));
-            SetWindowRgn(g_keyEdit, CreateRoundRectRgn(
-                0, 0, ScaleForDpi(404), ScaleForDpi(36), ScaleForDpi(8),
-                ScaleForDpi(8)), TRUE);
+            SetWindowRgn(g_keyEdit, CreateRoundRectRgn(0, 0, 404, 36, 8, 8), TRUE);
             g_launchButton = CreateWindowExW(0, L"BUTTON", L"Запустить Axiom",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                ScaleForDpi(24),
-                ScaleForDpi(190 + kChromeHeight - kContentLift),
-                ScaleForDpi(412), ScaleForDpi(44), window,
+                24, 190 + kChromeHeight - kContentLift, 412, 44, window,
                 reinterpret_cast<HMENU>(1002),
                 nullptr, nullptr);
             SendMessageW(g_launchButton, WM_SETFONT,
                           reinterpret_cast<WPARAM>(g_bodyFont), TRUE);
             SetWindowRgn(g_launchButton,
-                         CreateRoundRectRgn(0, 0, ScaleForDpi(412),
-                             ScaleForDpi(44), ScaleForDpi(10),
-                             ScaleForDpi(10)), TRUE);
-            return 0;
-        }
-        case WM_DPICHANGED: {
-            const auto* suggested = reinterpret_cast<const RECT*>(lParam);
-            const UINT uiDpi = EffectiveUiDpi(
-                HIWORD(wParam),
-                MonitorFromRect(suggested, MONITOR_DEFAULTTONEAREST));
-            g_windowDpi = uiDpi;
-            SetWindowPos(window, nullptr, suggested->left, suggested->top,
-                         ScaleForDpi(kWindowWidth),
-                         ScaleForDpi(kWindowHeight),
-                         SWP_NOACTIVATE | SWP_NOZORDER);
-            ApplyLauncherScale(window, uiDpi);
+                         CreateRoundRectRgn(0, 0, 412, 44, 10, 10), TRUE);
             return 0;
         }
         case WM_COMMAND:
@@ -1453,10 +1493,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
             ScreenToClient(window, &point);
             RECT client{};
             GetClientRect(window, &client);
-            const float scale = UiScale();
-            point.x = static_cast<LONG>(point.x / scale);
-            point.y = static_cast<LONG>(point.y / scale);
-            client.right = static_cast<LONG>(client.right / scale);
             if (point.y >= 0 && point.y < kChromeHeight &&
                 point.x < client.right - 80)
                 return HTCAPTION;
@@ -1503,10 +1539,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    const POINT primaryPoint{};
-    g_windowDpi = EffectiveUiDpi(
-        GetDpiForSystem(),
-        MonitorFromPoint(primaryPoint, MONITOR_DEFAULTTOPRIMARY));
     Gdiplus::GdiplusStartupInput gdiplusInput;
     if (Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr) !=
         Gdiplus::Ok) return 1;
@@ -1530,8 +1562,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         return 1;
     }
 
-    const int width = ScaleForDpi(kWindowWidth);
-    const int height = ScaleForDpi(kWindowHeight);
+    constexpr int width = 460;
+    constexpr int height = 285 + kChromeHeight - kContentLift;
     const int x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
     const int y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
     HWND window = CreateWindowExW(WS_EX_APPWINDOW, kWindowClass, kWindowTitle,
@@ -1541,8 +1573,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         ShutdownBrandGraphics();
         return 1;
     }
-    SetWindowRgn(window, CreateRoundRectRgn(
-        0, 0, width, height, ScaleForDpi(12), ScaleForDpi(12)), TRUE);
+    SetWindowRgn(window, CreateRoundRectRgn(0, 0, width, height, 12, 12), TRUE);
     ShowWindow(window, showCommand);
     UpdateWindow(window);
 

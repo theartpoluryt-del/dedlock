@@ -76,6 +76,7 @@ constexpr int AimBoneAll = AimBoneHead | AimBoneNeck | AimBoneTorso |
 enum class AimSelectionMode : int { Crosshair = 0, Distance = 1, Health = 2 };
 struct EspStatus { bool entitySystemReady=false, localPawnFound=false, heroPawnsFound=false, heroScanComplete=false; };
 struct WindowSearchData { DWORD processId; HWND window; };
+bool ReadPayloadAsset(WORD resourceId, std::vector<uint8_t>& bytes);
 typedef HRESULT(__stdcall* PresentFn)(IDXGISwapChain*, UINT, UINT);
 constexpr UINT ApplyGlowMessage = WM_APP + 0x4D;
 constexpr UINT PanoramaPreviewUiMessage = WM_APP + 0x4E;

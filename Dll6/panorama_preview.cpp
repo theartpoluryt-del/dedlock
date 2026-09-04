@@ -125,17 +125,13 @@ void ProcessPendingUiWork(uintptr_t engine, uintptr_t contextPanel);
 void Log(const char* message);
 
 bool DeployRadarStyleResources() {
-    HRSRC resource = FindResourceW(moduleHandle,
-                                   MAKEINTRESOURCEW(IDR_RADAR_MINIMAP_STYLE),
-                                   RT_RCDATA);
-    HGLOBAL loaded = resource ? LoadResource(moduleHandle, resource) : nullptr;
-    const DWORD size = resource ? SizeofResource(moduleHandle, resource) : 0;
-    const auto* bytes = loaded
-        ? static_cast<const uint8_t*>(LockResource(loaded)) : nullptr;
-    if (!bytes || !size) {
+    std::vector<uint8_t> resourceBytes;
+    if (!ReadPayloadAsset(IDR_RADAR_MINIMAP_STYLE, resourceBytes)) {
         Log("[RADAR] embedded minimap stylesheet is missing");
         return false;
     }
+    const auto* bytes = resourceBytes.data();
+    const DWORD size = static_cast<DWORD>(resourceBytes.size());
 
     wchar_t clientPath[MAX_PATH]{};
     const HMODULE client = GetModuleHandleW(L"client.dll");
@@ -1106,12 +1102,8 @@ int PanoramaFallbackResourceIndex(int heroId) {
 
 bool ExtractPanoramaFallbackResource(int resourceId,
                                      const std::wstring& outputPath) {
-    const HRSRC resource = FindResourceW(
-        moduleHandle, MAKEINTRESOURCEW(resourceId), RT_RCDATA);
-    const HGLOBAL loaded = resource ? LoadResource(moduleHandle, resource) : nullptr;
-    const DWORD size = resource ? SizeofResource(moduleHandle, resource) : 0;
-    const void* bytes = loaded ? LockResource(loaded) : nullptr;
-    if (!bytes || !size) return false;
+    std::vector<uint8_t> bytes;
+    if (!ReadPayloadAsset(static_cast<WORD>(resourceId), bytes)) return false;
 
     // Packaged fallback frames are the immutable source of truth. Always
     // redeploy them before loading so a stale/bad capture from an older DLL
@@ -1121,8 +1113,8 @@ bool ExtractPanoramaFallbackResource(int resourceId,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
     DWORD written = 0;
-    const bool success = WriteFile(file, bytes, size, &written, nullptr) &&
-                         written == size;
+    const bool success = WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()),
+                                   &written, nullptr) && written == bytes.size();
     CloseHandle(file);
     if (!success) DeleteFileW(outputPath.c_str());
     return success;

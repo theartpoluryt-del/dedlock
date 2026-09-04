@@ -25,15 +25,7 @@ constexpr bool kSilentMoveDataYawIsolation = false;
 constexpr bool kRuntimeDiagnostics = false;
 
 uintptr_t FindLocalPawnFromController() {
-    if (!clientBase) {
-        if (moduleReadyEvent) {
-            CloseHandle(moduleReadyEvent);
-            moduleReadyEvent = nullptr;
-        }
-        CloseHandle(moduleInstanceGuard);
-        moduleInstanceGuard = nullptr;
-        return ERROR_MOD_NOT_FOUND;
-    }
+    if (!clientBase) return 0;
     const uintptr_t entityRoot = Read<uintptr_t>(
         clientBase + Offsets::GameEntitySystem);
     if (!entityRoot) return 0;
@@ -4073,7 +4065,15 @@ DWORD WINAPI InitializeThread(LPVOID) {
         Sleep(100);
     }
 
-    if (!clientBase) return 0;
+    if (!clientBase) {
+        if (moduleReadyEvent) {
+            CloseHandle(moduleReadyEvent);
+            moduleReadyEvent = nullptr;
+        }
+        CloseHandle(moduleInstanceGuard);
+        moduleInstanceGuard = nullptr;
+        return ERROR_MOD_NOT_FOUND;
+    }
 
     // Resolve build-dependent globals from the current client image before
     // any entity worker starts. This is the pattern-based finder used by the
@@ -4136,7 +4136,7 @@ DWORD WINAPI InitializeThread(LPVOID) {
         std::ofstream marker(
             Dll6Paths::DataFileA("Dll6_runtime.marker"),
             std::ios::trunc);
-        if (marker) marker << "axiom-server-module-1.0.48\nclientBase=0x"
+        if (marker) marker << "axiom-server-module-1.0.51\nclientBase=0x"
                            << std::hex << clientBase << "\n";
     }
     printf("[+] client.dll: 0x%p\n", reinterpret_cast<void*>(clientBase));

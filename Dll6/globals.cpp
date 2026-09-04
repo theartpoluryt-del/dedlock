@@ -4,9 +4,29 @@
 #include "portable_paths.h"
 #include "resource.h"
 #include <cwctype>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <sstream>
+
+bool ReadPayloadAsset(WORD resourceId, std::vector<uint8_t>& bytes) {
+    bytes.clear();
+    const std::filesystem::path path = std::filesystem::path(
+        Dll6Paths::DataDirectoryW()) / L"assets" /
+        (L"res_" + std::to_wstring(resourceId) + L".bin");
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input) return false;
+    const std::streamsize size = input.tellg();
+    if (size <= 0 || size > 64ll * 1024 * 1024) return false;
+    input.seekg(0, std::ios::beg);
+    bytes.resize(static_cast<size_t>(size));
+    if (!input.read(reinterpret_cast<char*>(bytes.data()), size)) {
+        bytes.clear();
+        return false;
+    }
+    return true;
+}
+
 bool freeCam=false;
 bool disableDrifterDarkness=false;
 bool autoActiveReload=false;
@@ -399,20 +419,16 @@ void ApplyPendingConfigRestore(const std::string& destination) {
 }
 
 bool ExtractBundledDefaultConfig(const std::string& path) {
-    const HRSRC resource = FindResourceW(
-        moduleHandle, MAKEINTRESOURCEW(IDR_DEFAULT_CONFIG), RT_RCDATA);
-    const HGLOBAL loaded = resource ? LoadResource(moduleHandle, resource) : nullptr;
-    const DWORD size = resource ? SizeofResource(moduleHandle, resource) : 0;
-    const void* bytes = loaded ? LockResource(loaded) : nullptr;
-    if (!bytes || !size) return false;
+    std::vector<uint8_t> bytes;
+    if (!ReadPayloadAsset(IDR_DEFAULT_CONFIG, bytes)) return false;
 
     const HANDLE file = CreateFileA(
         path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW,
         FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
     DWORD written = 0;
-    const bool success = WriteFile(file, bytes, size, &written, nullptr) &&
-                         written == size;
+    const bool success = WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()),
+                                   &written, nullptr) && written == bytes.size();
     CloseHandle(file);
     if (!success) DeleteFileA(path.c_str());
     return success;

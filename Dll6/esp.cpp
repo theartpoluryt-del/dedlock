@@ -1848,16 +1848,16 @@ std::shared_ptr<const VisualFrameSnapshot> AcquireVisualFrameSnapshot() {
 ID3D11ShaderResourceView* GetAbilityIconSrv(const std::string& heroName, int slot) {
     static constexpr std::array<const char*, 38> heroNames = { "Infernus", "Seven", "Vindicta", "Lady Geist", "Abrams", "Wraith", "McGinnis", "Paradox", "Dynamo", "Kelvin", "Haze", "Holliday", "Bebop", "Calico", "Grey Talon", "Mo & Krill", "Shiv", "Ivy", "Warden", "Yamato", "Lash", "Viscous", "Pocket", "Mirage", "Vyper", "Sinclair", "Mina", "Drifter", "Venator", "Victor", "Paige", "The Doorman", "Billy", "Graves", "Apollo", "Rem", "Silver", "Celeste" };
     const auto hero = std::find_if(heroNames.begin(), heroNames.end(), [&](const char* name) { return heroName == name; });
-    if (slot < 0 || slot >= 4 || hero == heroNames.end() || !pDevice || !moduleHandle) return nullptr;
+    if (slot < 0 || slot >= 4 || hero == heroNames.end() || !pDevice) return nullptr;
     const size_t index = static_cast<size_t>(hero - heroNames.begin()) * 4 + static_cast<size_t>(slot);
     static std::array<ID3D11ShaderResourceView*, 152> icons{};
     static std::array<bool, 152> attempted{};
     if (icons[index] || attempted[index]) return icons[index];
     attempted[index] = true;
-    HRSRC resource = FindResourceW(moduleHandle, MAKEINTRESOURCEW(108 + static_cast<UINT>(index)), MAKEINTRESOURCEW(10));
-    HGLOBAL data = resource ? LoadResource(moduleHandle, resource) : nullptr;
-    BYTE* bytes = data ? static_cast<BYTE*>(LockResource(data)) : nullptr;
-    const DWORD size = resource ? SizeofResource(moduleHandle, resource) : 0;
+    std::vector<uint8_t> resourceBytes;
+    ReadPayloadAsset(static_cast<WORD>(108 + index), resourceBytes);
+    BYTE* bytes = resourceBytes.data();
+    const DWORD size = static_cast<DWORD>(resourceBytes.size());
     IWICImagingFactory* factory{}; IWICStream* stream{}; IWICBitmapDecoder* decoder{};
     IWICBitmapFrameDecode* frame{}; IWICFormatConverter* converter{};
     UINT width{}, height{}; std::vector<uint8_t> pixels; D3D11_TEXTURE2D_DESC desc{};
