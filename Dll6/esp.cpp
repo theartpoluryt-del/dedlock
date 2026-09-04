@@ -466,6 +466,21 @@ int GetObserverTargetIndex(uintptr_t pawn) {
     return static_cast<int>(handle & Offsets::HandleIndexMask);
 }
 
+uintptr_t GetActiveObserverTarget(uintptr_t pawn) {
+    if (!pawn) return 0;
+    const uintptr_t services = Read<uintptr_t>(
+        pawn + Offsets::ObserverServices);
+    if (!services || Read<uint8_t>(services + Offsets::ObserverMode) == 0)
+        return 0;
+    const uint32_t handle = Read<uint32_t>(
+        services + Offsets::ObserverTarget);
+    if (!handle || handle == 0xFFFFFFFFu) return 0;
+    // Comparing the resolved entity keeps the handle serial number in the
+    // decision. Comparing only its entry index can retain a spectator after
+    // Source 2 has reassigned that index to a different observed pawn.
+    return ResolveEntity(handle);
+}
+
 bool ObserverCameraTargetsLocal(uintptr_t observerPawn) {
     if (!observerPawn || !currentLocalPawn) return true;
     const uintptr_t services = Read<uintptr_t>(
@@ -646,6 +661,8 @@ std::vector<SpectatorEntry> CollectCurrentSpectators() {
         localBaseHandle && localBaseHandle != 0xFFFFFFFFu
         ? static_cast<int>(localBaseHandle & Offsets::HandleIndexMask)
         : -1;
+    const uintptr_t localHeroPawn = currentLocalPawn;
+    const uintptr_t localBasePawn = ResolveEntity(localBaseHandle);
     const uint8_t localTeam = Read<uint8_t>(
         localController + Offsets::Team);
 
@@ -689,15 +706,10 @@ std::vector<SpectatorEntry> CollectCurrentSpectators() {
         const uintptr_t observerPawn = activeObserverPawn
             ? activeObserverPawn
             : controllerPawn;
-        const int observerTargetIndex =
-            GetObserverTargetIndex(observerPawn);
-        if (observerTargetIndex < 0) continue;
-
-        const bool watchingHero = observerTargetIndex == localHeroIndex;
-        const bool watchingBase = observerTargetIndex == localBaseIndex;
-        if (!watchingHero && !watchingBase)
-            continue;
-        if (!ObserverCameraTargetsLocal(observerPawn))
+        const uintptr_t observerTarget = GetActiveObserverTarget(observerPawn);
+        if (!observerTarget ||
+            (observerTarget != localHeroPawn &&
+             observerTarget != localBasePawn))
             continue;
 
         std::string name = ReadPlayerName(controller);
@@ -2109,7 +2121,7 @@ void RenderESP(const std::vector<PlayerData>& players) {
         static std::vector<SpectatorEntry> cachedSpectators;
         static ULONGLONG lastSpectatorScan = 0;
         const ULONGLONG spectatorNow = GetTickCount64();
-        if (spectatorNow - lastSpectatorScan >= 250) {
+        if (spectatorNow - lastSpectatorScan >= 100) {
             cachedSpectators = CollectCurrentSpectators();
             lastSpectatorScan = spectatorNow;
         }
