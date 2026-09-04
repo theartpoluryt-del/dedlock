@@ -453,13 +453,13 @@ float4 PSMain(VSOutput input) : SV_TARGET {
 }
 
 bool Initialize(ID3D11Device* device) {
-    if (!device) return false;
-    const void* resourceBytes = nullptr;
-    DWORD resourceSize = 0;
-    if (!GetEmbeddedResource(IDR_ESP_PREVIEW_3D, resourceBytes, resourceSize))
-        return false;
-    const auto* bytes = static_cast<const uint8_t*>(resourceBytes);
-    const size_t size = resourceSize;
+    if (!device || !moduleHandle) return false;
+    HRSRC resource = FindResourceW(
+        moduleHandle, MAKEINTRESOURCEW(IDR_ESP_PREVIEW_3D), RT_RCDATA);
+    if (!resource) return false;
+    HGLOBAL loaded = LoadResource(moduleHandle, resource);
+    const auto* bytes = static_cast<const uint8_t*>(LockResource(loaded));
+    const size_t size = SizeofResource(moduleHandle, resource);
     if (!bytes || size < sizeof(AssetHeader)) return false;
 
     const uint8_t* cursor = bytes;

@@ -125,13 +125,17 @@ void ProcessPendingUiWork(uintptr_t engine, uintptr_t contextPanel);
 void Log(const char* message);
 
 bool DeployRadarStyleResources() {
-    const void* resourceBytes = nullptr;
-    DWORD size = 0;
-    if (!GetEmbeddedResource(IDR_RADAR_MINIMAP_STYLE, resourceBytes, size)) {
+    HRSRC resource = FindResourceW(moduleHandle,
+                                   MAKEINTRESOURCEW(IDR_RADAR_MINIMAP_STYLE),
+                                   RT_RCDATA);
+    HGLOBAL loaded = resource ? LoadResource(moduleHandle, resource) : nullptr;
+    const DWORD size = resource ? SizeofResource(moduleHandle, resource) : 0;
+    const auto* bytes = loaded
+        ? static_cast<const uint8_t*>(LockResource(loaded)) : nullptr;
+    if (!bytes || !size) {
         Log("[RADAR] embedded minimap stylesheet is missing");
         return false;
     }
-    const auto* bytes = static_cast<const uint8_t*>(resourceBytes);
 
     wchar_t clientPath[MAX_PATH]{};
     const HMODULE client = GetModuleHandleW(L"client.dll");
@@ -1102,10 +1106,12 @@ int PanoramaFallbackResourceIndex(int heroId) {
 
 bool ExtractPanoramaFallbackResource(int resourceId,
                                      const std::wstring& outputPath) {
-    const void* bytes = nullptr;
-    DWORD size = 0;
-    if (!GetEmbeddedResource(static_cast<UINT>(resourceId), bytes, size))
-        return false;
+    const HRSRC resource = FindResourceW(
+        moduleHandle, MAKEINTRESOURCEW(resourceId), RT_RCDATA);
+    const HGLOBAL loaded = resource ? LoadResource(moduleHandle, resource) : nullptr;
+    const DWORD size = resource ? SizeofResource(moduleHandle, resource) : 0;
+    const void* bytes = loaded ? LockResource(loaded) : nullptr;
+    if (!bytes || !size) return false;
 
     // Packaged fallback frames are the immutable source of truth. Always
     // redeploy them before loading so a stale/bad capture from an older DLL

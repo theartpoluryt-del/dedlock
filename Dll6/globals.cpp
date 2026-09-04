@@ -6,138 +6,7 @@
 #include <cwctype>
 #include <fstream>
 #include <iterator>
-#include <limits>
 #include <sstream>
-
-namespace {
-std::mutex embeddedResourceMutex;
-std::unordered_map<UINT, std::vector<unsigned char>> embeddedResources;
-bool embeddedResourcesCached = false;
-
-template <typename T>
-const T* ImageAt(const unsigned char* image, size_t imageSize,
-                 size_t offset, size_t count = 1) {
-    if (!image || count > (std::numeric_limits<size_t>::max)() / sizeof(T))
-        return nullptr;
-    const size_t byteCount = sizeof(T) * count;
-    if (offset > imageSize || byteCount > imageSize - offset) return nullptr;
-    return reinterpret_cast<const T*>(image + offset);
-}
-
-bool CacheRcDataFromMappedImage(
-    HMODULE module,
-    std::unordered_map<UINT, std::vector<unsigned char>>& resources) {
-    const auto* image = reinterpret_cast<const unsigned char*>(module);
-    if (!image) return false;
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 ||
-        dos->e_lfanew > 0x100000) return false;
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
-        image + static_cast<size_t>(dos->e_lfanew));
-    if (nt->Signature != IMAGE_NT_SIGNATURE ||
-        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-        return false;
-
-    const size_t imageSize = nt->OptionalHeader.SizeOfImage;
-    const auto& resourceData = nt->OptionalHeader.DataDirectory[
-        IMAGE_DIRECTORY_ENTRY_RESOURCE];
-    const size_t resourceRva = resourceData.VirtualAddress;
-    const size_t resourceSize = resourceData.Size;
-    if (!resourceRva || resourceSize < sizeof(IMAGE_RESOURCE_DIRECTORY) ||
-        resourceRva > imageSize || resourceSize > imageSize - resourceRva)
-        return false;
-
-    const auto directoryAt = [&](DWORD relativeOffset)
-        -> const IMAGE_RESOURCE_DIRECTORY* {
-        if (relativeOffset > resourceSize ||
-            sizeof(IMAGE_RESOURCE_DIRECTORY) > resourceSize - relativeOffset)
-            return nullptr;
-        return ImageAt<IMAGE_RESOURCE_DIRECTORY>(
-            image, imageSize, resourceRva + relativeOffset);
-    };
-    const auto entriesFor = [&](const IMAGE_RESOURCE_DIRECTORY* directory)
-        -> const IMAGE_RESOURCE_DIRECTORY_ENTRY* {
-        if (!directory) return nullptr;
-        const size_t count = static_cast<size_t>(directory->NumberOfNamedEntries) +
-            directory->NumberOfIdEntries;
-        const size_t offset = reinterpret_cast<const unsigned char*>(directory) -
-            image + sizeof(IMAGE_RESOURCE_DIRECTORY);
-        return ImageAt<IMAGE_RESOURCE_DIRECTORY_ENTRY>(
-            image, imageSize, offset, count);
-    };
-
-    const auto* root = directoryAt(0);
-    const auto* typeEntries = entriesFor(root);
-    if (!root || !typeEntries) return false;
-    const size_t typeCount = static_cast<size_t>(root->NumberOfNamedEntries) +
-        root->NumberOfIdEntries;
-    const IMAGE_RESOURCE_DIRECTORY* rcDataDirectory = nullptr;
-    for (size_t i = 0; i < typeCount; ++i) {
-        if (!typeEntries[i].NameIsString && typeEntries[i].Id == 10 &&
-            typeEntries[i].DataIsDirectory) {
-            rcDataDirectory = directoryAt(typeEntries[i].OffsetToDirectory);
-            break;
-        }
-    }
-    const auto* nameEntries = entriesFor(rcDataDirectory);
-    if (!rcDataDirectory || !nameEntries) return false;
-    const size_t nameCount =
-        static_cast<size_t>(rcDataDirectory->NumberOfNamedEntries) +
-        rcDataDirectory->NumberOfIdEntries;
-
-    for (size_t i = 0; i < nameCount; ++i) {
-        const auto& nameEntry = nameEntries[i];
-        if (nameEntry.NameIsString || !nameEntry.DataIsDirectory) continue;
-        const auto* languageDirectory = directoryAt(nameEntry.OffsetToDirectory);
-        const auto* languageEntries = entriesFor(languageDirectory);
-        if (!languageDirectory || !languageEntries) continue;
-        const size_t languageCount =
-            static_cast<size_t>(languageDirectory->NumberOfNamedEntries) +
-            languageDirectory->NumberOfIdEntries;
-        for (size_t language = 0; language < languageCount; ++language) {
-            if (languageEntries[language].DataIsDirectory) continue;
-            const DWORD dataOffset = languageEntries[language].OffsetToData;
-            if (dataOffset > resourceSize ||
-                sizeof(IMAGE_RESOURCE_DATA_ENTRY) > resourceSize - dataOffset)
-                continue;
-            const auto* data = ImageAt<IMAGE_RESOURCE_DATA_ENTRY>(
-                image, imageSize, resourceRva + dataOffset);
-            if (!data || !data->Size || data->OffsetToData > imageSize ||
-                data->Size > imageSize - data->OffsetToData)
-                continue;
-            const auto* bytes = image + data->OffsetToData;
-            resources[static_cast<UINT>(nameEntry.Id)].assign(
-                bytes, bytes + data->Size);
-            break;
-        }
-    }
-    return !resources.empty();
-}
-}
-
-bool CacheEmbeddedResources() {
-    std::lock_guard<std::mutex> lock(embeddedResourceMutex);
-    if (embeddedResourcesCached) return !embeddedResources.empty();
-    if (!moduleHandle) return false;
-    std::unordered_map<UINT, std::vector<unsigned char>> resources;
-    if (!CacheRcDataFromMappedImage(moduleHandle, resources)) return false;
-    embeddedResources.swap(resources);
-    embeddedResourcesCached = true;
-    return true;
-}
-
-bool GetEmbeddedResource(UINT resourceId, const void*& bytes, DWORD& size) {
-    bytes = nullptr;
-    size = 0;
-    std::lock_guard<std::mutex> lock(embeddedResourceMutex);
-    const auto resource = embeddedResources.find(resourceId);
-    if (resource == embeddedResources.end() || resource->second.empty())
-        return false;
-    bytes = resource->second.data();
-    size = static_cast<DWORD>(resource->second.size());
-    return true;
-}
-
 bool freeCam=false;
 bool disableDrifterDarkness=false;
 bool autoActiveReload=false;
@@ -530,9 +399,12 @@ void ApplyPendingConfigRestore(const std::string& destination) {
 }
 
 bool ExtractBundledDefaultConfig(const std::string& path) {
-    const void* bytes = nullptr;
-    DWORD size = 0;
-    if (!GetEmbeddedResource(IDR_DEFAULT_CONFIG, bytes, size)) return false;
+    const HRSRC resource = FindResourceW(
+        moduleHandle, MAKEINTRESOURCEW(IDR_DEFAULT_CONFIG), RT_RCDATA);
+    const HGLOBAL loaded = resource ? LoadResource(moduleHandle, resource) : nullptr;
+    const DWORD size = resource ? SizeofResource(moduleHandle, resource) : 0;
+    const void* bytes = loaded ? LockResource(loaded) : nullptr;
+    if (!bytes || !size) return false;
 
     const HANDLE file = CreateFileA(
         path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW,
