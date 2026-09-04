@@ -33,6 +33,32 @@ constexpr float kDesignHeight = 840.0f;
 constexpr float kMainWindowWidth = 996.0f;
 constexpr float kContentPanelBottom = 840.0f;
 
+std::mutex embeddedMenuAssetsMutex;
+std::unordered_map<UINT, std::vector<BYTE>> embeddedMenuAssets;
+bool embeddedMenuAssetsReady = false;
+
+bool CopyEmbeddedMenuAsset(UINT resourceId,
+                           std::unordered_map<UINT, std::vector<BYTE>>& target) {
+    const HRSRC resource = FindResourceW(
+        moduleHandle, MAKEINTRESOURCEW(resourceId), RT_RCDATA);
+    const HGLOBAL loaded = resource ? LoadResource(moduleHandle, resource) : nullptr;
+    const DWORD size = resource ? SizeofResource(moduleHandle, resource) : 0;
+    const auto* bytes = loaded
+        ? static_cast<const BYTE*>(LockResource(loaded)) : nullptr;
+    if (!bytes || !size) return false;
+    target[resourceId].assign(bytes, bytes + size);
+    return true;
+}
+
+bool GetCachedMenuAsset(UINT resourceId, const BYTE*& bytes, DWORD& size) {
+    std::lock_guard<std::mutex> lock(embeddedMenuAssetsMutex);
+    const auto asset = embeddedMenuAssets.find(resourceId);
+    if (asset == embeddedMenuAssets.end() || asset->second.empty()) return false;
+    bytes = asset->second.data();
+    size = static_cast<DWORD>(asset->second.size());
+    return true;
+}
+
 struct ColorPickerHsvState {
     float hue = 0.0f;
     float saturation = 0.0f;
@@ -1558,16 +1584,12 @@ bool EnsureFactories() {
 bool LoadEmbeddedBitmap(UINT resourceId, ComPtr<ID2D1Bitmap>& output,
                         bool tintBlack = false) {
     if (output) return true;
-    if (!moduleHandle || !g.wicFactory || !g.target) return false;
+    if (!g.wicFactory || !g.target) return false;
 
-    HRSRC resource = FindResourceW(moduleHandle, MAKEINTRESOURCEW(resourceId),
-                                   MAKEINTRESOURCEW(10));
-    if (!resource) return false;
-    HGLOBAL loaded = LoadResource(moduleHandle, resource);
-    if (!loaded) return false;
-    void* bytes = LockResource(loaded);
-    const DWORD size = SizeofResource(moduleHandle, resource);
-    if (!bytes || !size) return false;
+    const BYTE* cachedBytes = nullptr;
+    DWORD size = 0;
+    if (!GetCachedMenuAsset(resourceId, cachedBytes, size)) return false;
+    auto* bytes = const_cast<BYTE*>(cachedBytes);
 
     ComPtr<IWICStream> stream;
     ComPtr<IWICBitmapDecoder> decoder;
@@ -2530,6 +2552,27 @@ void DrawSearchPanel(const Layout& l) {
 
 } // namespace
 
+bool CacheD2DMenuEmbeddedAssets() {
+    std::lock_guard<std::mutex> lock(embeddedMenuAssetsMutex);
+    if (embeddedMenuAssetsReady) return true;
+    if (!moduleHandle) return false;
+
+    std::unordered_map<UINT, std::vector<BYTE>> assets;
+    for (UINT id = IDR_DEADLOCK_LOGO; id <= IDR_ICON_SETTINGS; ++id) {
+        if (!CopyEmbeddedMenuAsset(id, assets)) return false;
+    }
+    for (UINT id = IDR_ABILITY_INFERNUS_1; id <= 259; ++id) {
+        if (!CopyEmbeddedMenuAsset(id, assets)) return false;
+    }
+    for (UINT id = IDR_HERO_PORTRAIT_BASE;
+         id < IDR_HERO_PORTRAIT_BASE + 38; ++id) {
+        if (!CopyEmbeddedMenuAsset(id, assets)) return false;
+    }
+    embeddedMenuAssets.swap(assets);
+    embeddedMenuAssetsReady = true;
+    return true;
+}
+
 bool HandleD2DMenuTextInput(UINT message, WPARAM wParam) {
     if (!g.profileNameEditing && !g.searchOpen) return false;
     if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) {
@@ -2565,7 +2608,8 @@ bool HandleD2DMenuTextInput(UINT message, WPARAM wParam) {
 }
 
 bool PrepareD2DMenu(IDXGISwapChain* swapChain) {
-    if (!swapChain || !EnsureFactories()) return false;
+    if (!swapChain || !CacheD2DMenuEmbeddedAssets() || !EnsureFactories())
+        return false;
     const ImGuiIO& io = ImGui::GetIO();
     const UINT displayWidth = (std::max)(1u, static_cast<UINT>(io.DisplaySize.x));
     const UINT displayHeight = (std::max)(1u, static_cast<UINT>(io.DisplaySize.y));
