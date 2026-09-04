@@ -1,5 +1,4 @@
 #include "shared.h"
-#include "menu_d2d.h"
 
 // Fixed-size personalization slots. The release publisher uploads these
 // placeholders unchanged; the authenticated delivery service replaces all
@@ -69,9 +68,5 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved) {
 
 extern "C" __declspec(dllexport)
 DWORD WINAPI AxiomManualMapInitialize(LPVOID) {
-    // The launcher clears PE headers only after this entry point returns.
-    // Preserve menu images now so their later WIC upload does not depend on
-    // the resource directory. Panorama resources are intentionally untouched.
-    if (!CacheD2DMenuEmbeddedAssets()) return ERROR_RESOURCE_DATA_NOT_FOUND;
     return InitializeThread(nullptr);
 }

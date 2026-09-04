@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <dxgi.h>
 
-bool CacheD2DMenuEmbeddedAssets();
 bool PrepareD2DMenu(IDXGISwapChain* swapChain);
 bool UsesSoftwareD2DMenu();
 void RenderD2DMenu(std::size_t playerCount);
