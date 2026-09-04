@@ -28,7 +28,7 @@ namespace {
 
 constexpr wchar_t kDefaultApiBase[] =
     L"https://vljgmubfztmxsyiwrity.supabase.co/functions/v1/axiom-license";
-constexpr wchar_t kLauncherVersion[] = L"1.0.1";
+constexpr wchar_t kLauncherVersion[] = L"1.0.2";
 constexpr size_t kMaximumResponseBytes = 32u * 1024u * 1024u;
 constexpr std::array<unsigned char, 64> kServerPublicKey{
     0xc2,0x77,0xec,0x30,0xa5,0x9c,0x5e,0x87,
@@ -324,7 +324,7 @@ bool HttpRequest(const wchar_t* method, const std::wstring& endpoint,
     if (!absoluteUrl)
         while (!basePath.empty() && basePath.back() == L'/') basePath.pop_back();
     std::wstring path = absoluteUrl ? basePath + extraInfo : basePath + endpoint;
-    ScopedInternet session(WinHttpOpen(L"AxiomLauncher/1.0.1",
+    ScopedInternet session(WinHttpOpen(L"AxiomLauncher/1.0.2",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS, 0));
     if (!session.value) {
@@ -572,6 +572,8 @@ bool AuthenticateAndAcquireModule(const std::wstring& rawLicense,
             error = L"Лицензия заблокирована или уже привязана к другому ПК.";
         else if (status == 429)
             error = L"Слишком много попыток. Попробуйте через минуту.";
+        else if (status == 426)
+            error = L"Эта версия лаунчера устарела. Скачайте актуальную версию в Telegram-боте.";
         else
             error = L"Сервер лицензий временно недоступен.";
         return false;
