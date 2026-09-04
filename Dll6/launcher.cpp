@@ -71,6 +71,22 @@ float UiScale() {
            static_cast<float>(USER_DEFAULT_SCREEN_DPI);
 }
 
+UINT EffectiveUiDpi(UINT dpi, HMONITOR monitor) {
+    MONITORINFO info{sizeof(info)};
+    if (!monitor || !GetMonitorInfoW(monitor, &info)) {
+        return (std::max)(dpi, static_cast<UINT>(USER_DEFAULT_SCREEN_DPI));
+    }
+    const int width = info.rcMonitor.right - info.rcMonitor.left;
+    const int height = info.rcMonitor.bottom - info.rcMonitor.top;
+    const UINT resolutionDpi = static_cast<UINT>((std::min)(
+        MulDiv(width, USER_DEFAULT_SCREEN_DPI, 1920),
+        MulDiv(height, USER_DEFAULT_SCREEN_DPI, 1080)));
+    return std::clamp(
+        (std::max)(dpi, resolutionDpi),
+        static_cast<UINT>(USER_DEFAULT_SCREEN_DPI),
+        static_cast<UINT>(USER_DEFAULT_SCREEN_DPI * 3));
+}
+
 struct ScopedHandle {
     HANDLE value{ INVALID_HANDLE_VALUE };
     ScopedHandle() = default;
@@ -1269,7 +1285,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
                             LPARAM lParam) {
     switch (message) {
         case WM_CREATE: {
-            g_windowDpi = GetDpiForWindow(window);
+            g_windowDpi = EffectiveUiDpi(
+                GetDpiForWindow(window),
+                MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST));
             g_bodyFont = CreateFontW(-ScaleForDpi(16), 0, 0, 0, FW_MEDIUM,
                 FALSE, FALSE,
                 FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -1318,11 +1336,15 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
         }
         case WM_DPICHANGED: {
             const auto* suggested = reinterpret_cast<const RECT*>(lParam);
+            const UINT uiDpi = EffectiveUiDpi(
+                HIWORD(wParam),
+                MonitorFromRect(suggested, MONITOR_DEFAULTTONEAREST));
+            g_windowDpi = uiDpi;
             SetWindowPos(window, nullptr, suggested->left, suggested->top,
-                         suggested->right - suggested->left,
-                         suggested->bottom - suggested->top,
+                         ScaleForDpi(kWindowWidth),
+                         ScaleForDpi(kWindowHeight),
                          SWP_NOACTIVATE | SWP_NOZORDER);
-            ApplyLauncherScale(window, HIWORD(wParam));
+            ApplyLauncherScale(window, uiDpi);
             return 0;
         }
         case WM_COMMAND:
@@ -1440,7 +1462,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    g_windowDpi = GetDpiForSystem();
+    const POINT primaryPoint{};
+    g_windowDpi = EffectiveUiDpi(
+        GetDpiForSystem(),
+        MonitorFromPoint(primaryPoint, MONITOR_DEFAULTTOPRIMARY));
     Gdiplus::GdiplusStartupInput gdiplusInput;
     if (Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr) !=
         Gdiplus::Ok) return 1;
